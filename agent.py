@@ -2,14 +2,17 @@ import asyncio
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     PartDeltaEvent,
-    TextPartDelta,
     TextPart,
     ThinkingPart,
     PartStartEvent,
     ThinkingPartDelta,
 )
+from pydantic_ai.output import NativeOutput
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
+from schemas import ReviewResult
+from rendering import render_review
+from rich.console import Console
 
 model = OllamaModel(
     "gemma4:26b",
@@ -18,12 +21,19 @@ model = OllamaModel(
 
 agent = Agent(
     model,
-    instructions="You are a clever artificial construct",
+    instructions=(
+        "You are a careful code reviewer. "
+        "Provide specific and actionable feedback."
+        "Only flag real issues, don't nitpick."
+    ),
+    output_type=NativeOutput(ReviewResult),
 )
 
 
 async def main():
-    async with agent.iter("Explain MoE in one sentence.") as run:
+    with open("agent.py") as fh:
+        file_content: str = fh.read()
+    async with agent.iter(f"file_path: agent.py\ncontent:\n{file_content}") as run:
         async for node in run:
             if Agent.is_model_request_node(node):
                 async with node.stream(run.ctx) as stream:
@@ -33,12 +43,18 @@ async def main():
                             if isinstance(part, ThinkingPart):
                                 print(f"\n💭 {part.content}", end="", flush=True)
                             elif isinstance(part, TextPart):
-                                print(f"\n💬 {part.content}", end="", flush=True)
+                                pass
                         elif isinstance(event, PartDeltaEvent):
-                            if isinstance(
-                                event.delta, (ThinkingPartDelta, TextPartDelta)
-                            ):
+                            if isinstance(event.delta, ThinkingPartDelta):
                                 print(event.delta.content_delta, end="", flush=True)
+
+        result: ReviewResult | None = (
+            run.result.output if run.result is not None else None
+        )
+        if result is not None:
+            console = Console()
+            console.print()
+            render_review(result, console)
 
 
 asyncio.run(main())
