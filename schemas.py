@@ -22,3 +22,9 @@ class ReviewResult(BaseModel):
     summary: str = Field(description="Summary of the review result")
     findings: list[Finding]
     approve: bool = Field(description="True if safe to merge as-is")
+
+
+class FileContents(BaseModel):
+    path: str
+    content: str = Field(description="File contents with line numbers prefixed")
+    line_count: int
