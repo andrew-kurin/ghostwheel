@@ -3,7 +3,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from schemas import ReviewResult, Severity
+from ghostwheel.schemas import ReviewResult, Severity
 
 SEVERITY_STYLE = {
     Severity.SUGGESTION: ("dim cyan", ":bulb:"),
