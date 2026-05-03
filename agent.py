@@ -114,22 +114,25 @@ async def main():
             async for node in run:
                 if Agent.is_model_request_node(node):
                     async with node.stream(run.ctx) as stream:
-                        async for event in stream:
-                            if isinstance(event, PartStartEvent):
-                                part = event.part
-                                if isinstance(part, ThinkingPart):
-                                    console.print(f"\n💭 {part.content}", end="")
-                                elif isinstance(part, TextPart):
-                                    if not text_started:
-                                        text_started = True
-                                        status = console.status(
-                                            "[bold yellow]Writing review...[/bold yellow]",
-                                            spinner="dots",
-                                        )
-                                        status.start()
-                            elif isinstance(event, PartDeltaEvent):
-                                if isinstance(event.delta, ThinkingPartDelta):
-                                    console.print(event.delta.content_delta, end="")
+                        try:
+                            async for event in stream:
+                                if isinstance(event, PartStartEvent):
+                                    part = event.part
+                                    if isinstance(part, ThinkingPart):
+                                        console.print(f"\n💭 {part.content}", end="")
+                                    elif isinstance(part, TextPart):
+                                        if not text_started:
+                                            text_started = True
+                                            status = console.status(
+                                                "[bold yellow]Writing review...[/bold yellow]",
+                                                spinner="dots",
+                                            )
+                                            status.start()
+                                elif isinstance(event, PartDeltaEvent):
+                                    if isinstance(event.delta, ThinkingPartDelta):
+                                        console.print(event.delta.content_delta, end="")
+                        except StopAsyncIteration:
+                            pass
         finally:
             if status is not None:
                 status.stop()
