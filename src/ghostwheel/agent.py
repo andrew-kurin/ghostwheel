@@ -78,8 +78,7 @@ formatter = Agent(
 async def main():
     console = Console()
 
-    file_paths = ["agent.py", "rendering.py", "schemas.py"]
-    review_message = f"review the files at {", ".join(file_paths)}"
+    review_message = "review the code at current folder"
     deps = ToolDeps(cwd=Path.cwd(), allowed_roots=[Path.cwd()])
 
     status = None
