@@ -13,6 +13,10 @@ from pydantic_ai.messages import (
     PartStartEvent,
     ThinkingPartDelta,
     TextPartDelta,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ToolCallPart,
+    ToolReturnPart,
 )
 from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
 from ghostwheel.rendering import render_review
@@ -78,7 +82,7 @@ formatter = Agent(
 async def main():
     console = Console()
 
-    review_message = "review the code at current folder"
+    review_message = "review the code at current folder, cross-reference links between files to ensure consistency"
     deps = ToolDeps(cwd=Path.cwd(), allowed_roots=[Path.cwd()])
 
     status = None
@@ -95,7 +99,7 @@ async def main():
                                 part = event.part
 
                                 if isinstance(part, ThinkingPart):
-                                    console.print(part.content, end="")
+                                    console.print(f"\n💭 {part.content}", end="")
 
                                 elif isinstance(part, TextPart):
                                     if status is None:
@@ -116,9 +120,28 @@ async def main():
                                             spinner="dots",
                                         )
                                         status.start()
-                    node = await run.next(node)
-                else:
-                    node = await run.next(node)
+                elif Agent.is_call_tools_node(node):
+                    async with node.stream(run.ctx) as stream:
+                        async for event in stream:
+                            if isinstance(event, FunctionToolCallEvent):
+                                part = event.part
+                                if isinstance(part, ToolCallPart):
+                                    args_preview = str(part.args)
+                                    if len(args_preview) > 80:
+                                        args_preview = args_preview[:80] + "..."
+                                    console.print(
+                                        f"\n[yellow]🔧 {part.tool_name}({args_preview})[/yellow]"
+                                    )
+                            elif isinstance(event, FunctionToolResultEvent):
+                                result = event.result
+                                if isinstance(result, ToolReturnPart):
+                                    result_preview = str(result.content)
+                                    if len(result_preview) > 120:
+                                        result_preview = result_preview[:120] + "..."
+                                    console.print(
+                                        f"[green]← {result.tool_name}: {result_preview}[/green]"
+                                    )
+                node = await run.next(node)
     finally:
         if status is not None:
             status.stop()
