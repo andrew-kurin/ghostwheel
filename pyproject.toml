@@ -18,4 +18,4 @@ build-backend = "hatchling.build"
 package = true
 
 [project.scripts]
-ghostwheel = "ghostwheel.agent:run"
+ghostwheel = "ghostwheel.agent:main"

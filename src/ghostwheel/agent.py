@@ -19,7 +19,6 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
-from ghostwheel.rendering import render_review
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.tools import register_tools, READ_ONLY_TOOLS
 from rich.console import Console
@@ -37,18 +36,18 @@ model = OllamaModel(
     provider=OllamaProvider(base_url="http://localhost:11434/v1"),
 )
 
-reviewer = Agent(
+agent = Agent(
     model,
     instructions=(
-        "You are a careful code reviewer. "
-        "Provide specific and actionable feedback."
-        "Only flag real issues, don't invent nits."
-        "Don't invent the review if you haven't read the code."
-        "Use read_file tool to read the contents of a file before reviewing."
+        "You are a coding assistant. The user will ask you about their code, "
+        "and you have tools to read, list, and search the codebase. "
+        "Investigate before answering. When you don't know something about the code, "
+        "use tools to find out rather than guessing. "
+        "Be specific in your answers — cite file paths and line numbers when relevant."
     ),
     deps_type=ToolDeps,
 )
-register_tools(reviewer, READ_ONLY_TOOLS)
+register_tools(agent, READ_ONLY_TOOLS)
 
 formatter = Agent(
     model,
@@ -79,83 +78,114 @@ formatter = Agent(
 )
 
 
-async def main():
-    console = Console()
-
-    review_message = "review the code at current folder, cross-reference links between files to ensure consistency"
-    deps = ToolDeps(cwd=Path.cwd(), allowed_roots=[Path.cwd()])
-
+async def stream_to_console(run, console: Console, stream_output: bool = True) -> None:
     status = None
 
+    node = run.next_node
+
     try:
-        async with reviewer.iter(review_message, deps=deps) as run:
-            node = run.next_node
+        while not isinstance(node, End):
+            if Agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    async for event in stream:
+                        if isinstance(event, PartStartEvent):
+                            part = event.part
 
-            while not isinstance(node, End):
-                if Agent.is_model_request_node(node):
-                    async with node.stream(run.ctx) as stream:
-                        async for event in stream:
-                            if isinstance(event, PartStartEvent):
-                                part = event.part
+                            if isinstance(part, ThinkingPart):
+                                console.print(f"[dim]\n💭 {part.content}[/dim]", end="")
 
-                                if isinstance(part, ThinkingPart):
-                                    console.print(f"\n💭 {part.content}", end="")
-
-                                elif isinstance(part, TextPart):
-                                    if status is None:
-                                        status = console.status(
-                                            "[bold yellow]Writing review...[/bold yellow]",
-                                            spinner="dots",
-                                        )
-                                        status.start()
-                            elif isinstance(event, PartDeltaEvent):
-                                if isinstance(event.delta, ThinkingPartDelta):
-                                    content_delta = event.delta.content_delta
-                                    if content_delta:
-                                        console.print(content_delta, end="")
-                                elif isinstance(event.delta, TextPartDelta):
-                                    if event.delta.content_delta and status is None:
-                                        status = console.status(
-                                            "[bold yellow]Writing review...[/bold yellow]",
-                                            spinner="dots",
-                                        )
-                                        status.start()
-                elif Agent.is_call_tools_node(node):
-                    async with node.stream(run.ctx) as stream:
-                        async for event in stream:
-                            if isinstance(event, FunctionToolCallEvent):
-                                part = event.part
-                                if isinstance(part, ToolCallPart):
-                                    args_preview = str(part.args)
-                                    if len(args_preview) > 80:
-                                        args_preview = args_preview[:80] + "..."
-                                    console.print(
-                                        f"\n[yellow]🔧 {part.tool_name}({args_preview})[/yellow]"
+                            elif isinstance(part, TextPart):
+                                if stream_output:
+                                    console.print(f"\n💬 {part.content}", end="")
+                                elif status is None:
+                                    status = console.status(
+                                        "[bold yellow]Writing review...[/bold yellow]",
+                                        spinner="dots",
                                     )
-                            elif isinstance(event, FunctionToolResultEvent):
-                                result = event.result
-                                if isinstance(result, ToolReturnPart):
-                                    result_preview = str(result.content)
-                                    if len(result_preview) > 120:
-                                        result_preview = result_preview[:120] + "..."
-                                    console.print(
-                                        f"[green]← {result.tool_name}: {result_preview}[/green]"
+                                    status.start()
+                        elif isinstance(event, PartDeltaEvent):
+                            if isinstance(event.delta, ThinkingPartDelta):
+                                content_delta = event.delta.content_delta
+                                if content_delta:
+                                    console.print(f"[dim]{content_delta}[/dim]", end="")
+                            elif isinstance(event.delta, TextPartDelta):
+                                if stream_output:
+                                    console.print(event.delta.content_delta, end="")
+                                elif event.delta.content_delta and status is None:
+                                    status = console.status(
+                                        "[bold yellow]Writing review...[/bold yellow]",
+                                        spinner="dots",
                                     )
-                node = await run.next(node)
+                                    status.start()
+            elif Agent.is_call_tools_node(node):
+                async with node.stream(run.ctx) as stream:
+                    async for event in stream:
+                        if isinstance(event, FunctionToolCallEvent):
+                            part = event.part
+                            if isinstance(part, ToolCallPart):
+                                args_preview = str(part.args)
+                                if len(args_preview) > 80:
+                                    args_preview = args_preview[:80] + "..."
+                                console.print(
+                                    f"\n[yellow]🔧 {part.tool_name}({args_preview})[/yellow]"
+                                )
+                        elif isinstance(event, FunctionToolResultEvent):
+                            result = event.result
+                            if isinstance(result, ToolReturnPart):
+                                result_preview = str(result.content)
+                                if len(result_preview) > 120:
+                                    result_preview = result_preview[:120] + "..."
+                                console.print(
+                                    f"[green]← {result.tool_name}: {result_preview}[/green]"
+                                )
+            node = await run.next(node)
     finally:
         if status is not None:
             status.stop()
 
-    console.print()
 
-    if run.result is not None:
-        structured = await formatter.run(run.result.output)
-        render_review(structured.output, console)
+async def run_chat(console: Console, deps: ToolDeps) -> None:
+    """Interactive mode: persistent conversation"""
+    history = []
+    console.print(
+        "[dim]Ghostwheel chat. Type 'quit' to exit, '/review path' to review code.[/dim]"
+    )
+
+    while True:
+        try:
+            user_input = console.input("\n[bold cyan]> [/bold cyan]")
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Goodbye![/dim]")
+            break
+
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+
+        if user_input.lower() in ["/quit"]:
+            console.print("\n[dim]Goodbye![/dim]")
+            break
+
+        if user_input.lower() == "/clear":
+            history = []
+            console.print("[dim]History cleared.[/dim]")
+            continue
+
+        async with agent.iter(user_input, message_history=history, deps=deps) as run:
+            await stream_to_console(run, console)
+
+        if run.result is not None:
+            history = run.result.all_messages()
 
 
-def run() -> None:
-    asyncio.run(main())
+def main() -> None:
+    console = Console()
+    deps = ToolDeps(
+        cwd=Path.cwd(),
+        allowed_roots=[Path.cwd()],
+    )
+    asyncio.run(run_chat(console, deps))
 
 
 if __name__ == "__main__":
-    run()
+    main()
