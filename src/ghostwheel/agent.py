@@ -195,6 +195,7 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
                 prose = run.result.output
                 try:
                     structured = await formatter.run(run.result.output)
+                    console.print("\n\n")
                     render_review(structured.output, console)
                 except UnexpectedModelBehavior as e:
                     console.print(
