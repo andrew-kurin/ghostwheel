@@ -8,30 +8,51 @@ class FileContents(BaseModel):
     path: str
     content: str = Field(description="File contents with line numbers prefixed")
     line_count: int
+    truncated: bool = Field(
+        default=False, description="True if content was truncated due to size"
+    )
+    total_bytes: int | None = Field(
+        default=None, description="Full file size in bytes if truncation occurred"
+    )
 
 
 def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
-    """Read the contents of a file and return it with line numbers prefixed."""
+    """
+    Read the contents of a file and return it with line numbers prefixed.
+
+    Files larger than the configured max_output_bytes will be truncated.
+    The 'truncated' field indicates whether the returned content is partial.
+
+    Args:
+        path: Path to the file, relative to the working directory.
+    """
+
     target = Path(path).expanduser().resolve()
 
     if not any(target.is_relative_to(root) for root in ctx.deps.allowed_roots):
         raise ValueError(f"Path {target} is outside allowed roots")
-    try:
-        text = target.read_text()
-    except FileNotFoundError:
-        return FileContents(
-            path=str(target), content="Error: file not found", line_count=0
-        )
-    except PermissionError:
-        return FileContents(
-            path=str(target), content="Error: permission denied", line_count=0
-        )
-    except OSError as exc:
-        return FileContents(path=str(target), content=f"Error: {exc}", line_count=0)
+    if not target.exists():
+        raise FileNotFoundError(f"Path does not exist: {target}")
+    if not target.is_file():
+        raise ValueError(f"Not a file: {target}")
 
-    lines = text.splitlines()
+    file_size = target.stat().st_size
+    max_bytes = ctx.deps.max_output_bytes
+    truncated = file_size > max_bytes
+
+    with target.open("r", encoding="utf-8", errors="ignore") as f:
+        content = f.read(max_bytes)
+
+    lines = content.splitlines()
     numbered = "\n".join(f"{i:4d} | {line}" for i, line in enumerate(lines, 1))
-    return FileContents(path=str(target), content=numbered, line_count=len(lines))
+
+    return FileContents(
+        path=str(target),
+        content=numbered,
+        line_count=len(lines),
+        truncated=truncated,
+        total_bytes=file_size if truncated else None,
+    )
 
 
 class DirEntry(BaseModel):
