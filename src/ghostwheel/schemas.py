@@ -19,6 +19,9 @@ SEVERITY_VALUES = enum_values(Severity)
 class Finding(BaseModel):
     file: str = Field(description="Path to the file the findings applies to")
     line: int | None = Field(description="Line number if applicable", default=None)
+    line_end: int | None = Field(
+        description="If the issue spans a range, the last line", default=None
+    )
     severity: Severity = Field(
         description=f"Impact level. Must be exactly: {SEVERITY_VALUES}"
     )

@@ -2,6 +2,7 @@ import logfire
 import asyncio
 from pathlib import Path
 from pydantic_ai import Agent
+from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.models.openai import OpenAIChatModelSettings
@@ -19,9 +20,12 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
+from ghostwheel.rendering import render_review
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.tools import register_tools, READ_ONLY_TOOLS
+
 from rich.console import Console
+from rich.panel import Panel
 
 logfire.configure(console=False)
 logfire.instrument_pydantic_ai()
@@ -71,10 +75,13 @@ formatter = Agent(
         "proposed one, or be omitted if they did not.\n"
         "- Set 'approve' to true only if the prose explicitly approves the "
         "code or contains no blockers and no warnings.\n"
-        "- Write a two-sentence 'summary' that captures the overall verdict."
+        "- Write a two-sentence 'summary' that captures the overall verdict.\n"
+        "- The 'line' field is a single integer. If the prose cites a line range "
+        "like '35-38', use the first number (35) as the line.\n"
     ),
     model_settings=OpenAIChatModelSettings({"openai_reasoning_effort": "none"}),
     output_type=ReviewResult,
+    output_retries=5,
 )
 
 
@@ -144,6 +151,15 @@ async def stream_to_console(run, console: Console, stream_output: bool = True) -
             status.stop()
 
 
+REVIEW_PROMPT = (
+    "Perform a careful code review of the files at {paths}. "
+    "Use your tools to read each file. "
+    "Identify real issues — bugs, security concerns, design problems, dead code. "
+    "Don't flag stylistic nits. For each finding, cite file:line and explain why it's a problem. "
+    "End with an overall verdict: approve, or changes required."
+)
+
+
 async def run_chat(console: Console, deps: ToolDeps) -> None:
     """Interactive mode: persistent conversation"""
     history = []
@@ -161,14 +177,35 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
         user_input = user_input.strip()
         if not user_input:
             continue
-
-        if user_input.lower() in ["/quit"]:
+        elif user_input.lower() in ["/quit"]:
             console.print("\n[dim]Goodbye![/dim]")
             break
-
-        if user_input.lower() == "/clear":
+        elif user_input.lower() == "/clear":
             history = []
             console.print("[dim]History cleared.[/dim]")
+            continue
+        elif user_input.lower().startswith("/review"):
+            paths = user_input.removeprefix("/review").strip() or "."
+            prompt = REVIEW_PROMPT.format(paths=paths)
+            async with agent.iter(prompt, message_history=history, deps=deps) as run:
+                await stream_to_console(run, console)
+
+            if run.result:
+                history = run.result.all_messages()
+                prose = run.result.output
+                try:
+                    structured = await formatter.run(run.result.output)
+                    render_review(structured.output, console)
+                except UnexpectedModelBehavior as e:
+                    console.print(
+                        Panel(
+                            f"[yellow]Couldn't format review as a structured table.[/yellow]\n"
+                            f"[dim]Reason: {e}[/dim]\n\n"
+                            f"[bold]Showing the raw review instead:[/bold]\n\n{prose}",
+                            title="Formatter Failed",
+                            border_style="yellow",
+                        )
+                    )
             continue
 
         async with agent.iter(user_input, message_history=history, deps=deps) as run:
