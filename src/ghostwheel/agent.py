@@ -6,7 +6,6 @@ from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.models.openai import OpenAIChatModelSettings
-from pydantic_graph import End
 from pydantic_ai.messages import (
     PartDeltaEvent,
     TextPart,
@@ -85,45 +84,34 @@ formatter = Agent(
 )
 
 
-async def stream_to_console(run, console: Console, stream_output: bool = True) -> None:
-    status = None
-
-    node = run.next_node
-
+async def stream_to_console(run, console: Console) -> None:
     try:
-        while not isinstance(node, End):
+        async for node in run:
             if Agent.is_model_request_node(node):
                 async with node.stream(run.ctx) as stream:
-                    async for event in stream:
-                        if isinstance(event, PartStartEvent):
-                            part = event.part
+                    try:
+                        async for event in stream:
+                            if isinstance(event, PartStartEvent):
+                                part = event.part
 
-                            if isinstance(part, ThinkingPart):
-                                console.print(f"[dim]\n💭 {part.content}[/dim]", end="")
+                                if isinstance(part, ThinkingPart):
+                                    console.print(
+                                        f"[dim]\n💭 {part.content}[/dim]", end=""
+                                    )
 
-                            elif isinstance(part, TextPart):
-                                if stream_output:
+                                elif isinstance(part, TextPart):
                                     console.print(f"\n💬 {part.content}", end="")
-                                elif status is None:
-                                    status = console.status(
-                                        "[bold yellow]Writing review...[/bold yellow]",
-                                        spinner="dots",
-                                    )
-                                    status.start()
-                        elif isinstance(event, PartDeltaEvent):
-                            if isinstance(event.delta, ThinkingPartDelta):
-                                content_delta = event.delta.content_delta
-                                if content_delta:
-                                    console.print(f"[dim]{content_delta}[/dim]", end="")
-                            elif isinstance(event.delta, TextPartDelta):
-                                if stream_output:
+                            elif isinstance(event, PartDeltaEvent):
+                                if isinstance(event.delta, ThinkingPartDelta):
+                                    content_delta = event.delta.content_delta
+                                    if content_delta:
+                                        console.print(
+                                            f"[dim]{content_delta}[/dim]", end=""
+                                        )
+                                elif isinstance(event.delta, TextPartDelta):
                                     console.print(event.delta.content_delta, end="")
-                                elif event.delta.content_delta and status is None:
-                                    status = console.status(
-                                        "[bold yellow]Writing review...[/bold yellow]",
-                                        spinner="dots",
-                                    )
-                                    status.start()
+                    except StopAsyncIteration:
+                        pass
             elif Agent.is_call_tools_node(node):
                 async with node.stream(run.ctx) as stream:
                     async for event in stream:
@@ -145,10 +133,8 @@ async def stream_to_console(run, console: Console, stream_output: bool = True) -
                                 console.print(
                                     f"[green]← {result.tool_name}: {result_preview}[/green]"
                                 )
-            node = await run.next(node)
-    finally:
-        if status is not None:
-            status.stop()
+    except StopAsyncIteration:
+        pass
 
 
 REVIEW_PROMPT = (
@@ -194,8 +180,12 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
                 history = run.result.all_messages()
                 prose = run.result.output
                 try:
-                    structured = await formatter.run(run.result.output)
-                    console.print("\n\n")
+                    with console.status(
+                        "[bold yellow]Formatting review...[/bold yellow]",
+                        spinner="dots",
+                    ):
+                        structured = await formatter.run(run.result.output)
+                    console.print("\n")
                     render_review(structured.output, console)
                 except UnexpectedModelBehavior as e:
                     console.print(
