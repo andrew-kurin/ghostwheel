@@ -22,6 +22,7 @@ from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
 from ghostwheel.rendering import render_review
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.tools import register_tools, READ_ONLY_TOOLS
+from ghostwheel.config import Settings
 
 from rich.console import Console
 from rich.panel import Panel
@@ -29,14 +30,16 @@ from rich.panel import Panel
 logfire.configure(console=False)
 logfire.instrument_pydantic_ai()
 
-models = {
-    "gemma4": "gemma4:26b",
-    "glm-flash": "glm-4.7-flash:latest",
-}
+settings = Settings()
 
 model = OllamaModel(
-    models["gemma4"],
-    provider=OllamaProvider(base_url="http://localhost:11434/v1"),
+    settings.model,
+    provider=OllamaProvider(base_url=settings.ollama_url),
+)
+
+formatter_model = OllamaModel(
+    settings.formatter_model,
+    provider=OllamaProvider(base_url=settings.ollama_url),
 )
 
 agent = Agent(
@@ -53,7 +56,7 @@ agent = Agent(
 register_tools(agent, READ_ONLY_TOOLS)
 
 formatter = Agent(
-    model,
+    formatter_model,
     instructions=(
         "You convert a code review written in prose into a structured "
         "ReviewResult object. You are a transcriber, not a reviewer.\n"
@@ -80,7 +83,7 @@ formatter = Agent(
     ),
     model_settings=OpenAIChatModelSettings({"openai_reasoning_effort": "none"}),
     output_type=ReviewResult,
-    output_retries=5,
+    output_retries=settings.formatter_retries,
 )
 
 
@@ -211,6 +214,7 @@ def main() -> None:
     deps = ToolDeps(
         cwd=Path.cwd(),
         allowed_roots=[Path.cwd()],
+        max_output_bytes=settings.max_output_bytes,
     )
     asyncio.run(run_chat(console, deps))
 
