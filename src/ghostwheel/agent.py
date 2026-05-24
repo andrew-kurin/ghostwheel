@@ -21,7 +21,7 @@ from pydantic_ai.messages import (
 from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
 from ghostwheel.rendering import render_review
 from ghostwheel.tools.deps import ToolDeps
-from ghostwheel.tools import register_tools, READ_ONLY_TOOLS
+from ghostwheel.tools import register_tools, ALL_TOOLS
 from ghostwheel.config import Settings
 
 from rich.console import Console
@@ -50,10 +50,13 @@ agent = Agent(
         "Investigate before answering. When you don't know something about the code, "
         "use tools to find out rather than guessing. "
         "Be specific in your answers — cite file paths and line numbers when relevant."
+        "You may use bash for inspection and test commands. "
+        "Do not run destructive commands, install dependencies, "
+        "or modify files unless the user explicitly asks."
     ),
     deps_type=ToolDeps,
 )
-register_tools(agent, READ_ONLY_TOOLS)
+register_tools(agent, ALL_TOOLS)
 
 formatter = Agent(
     formatter_model,

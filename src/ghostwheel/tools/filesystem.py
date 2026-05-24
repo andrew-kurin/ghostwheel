@@ -40,8 +40,10 @@ def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
     max_bytes = ctx.deps.max_output_bytes
     truncated = file_size > max_bytes
 
-    with target.open("r", encoding="utf-8", errors="ignore") as f:
-        content = f.read(max_bytes)
+    with target.open("rb") as f:
+        raw_bytes = f.read(max_bytes)
+
+    content = raw_bytes.decode("utf-8", errors="ignore")
 
     lines = content.splitlines()
     numbered = "\n".join(f"{i:4d} | {line}" for i, line in enumerate(lines, 1))
