@@ -17,5 +17,10 @@ build-backend = "hatchling.build"
 [tool.uv]
 package = true
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
 [project.scripts]
 ghostwheel = "ghostwheel.agent:main"

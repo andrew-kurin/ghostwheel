@@ -1,4 +1,3 @@
-from pathlib import Path
 from pydantic import BaseModel, Field
 from pydantic_ai import RunContext
 from .deps import ToolDeps
@@ -27,7 +26,7 @@ def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
         path: Path to the file, relative to the working directory.
     """
 
-    target = Path(path).expanduser().resolve()
+    target = (ctx.deps.cwd / path).expanduser().resolve()
 
     if not any(target.is_relative_to(root) for root in ctx.deps.allowed_roots):
         raise ValueError(f"Path {target} is outside allowed roots")

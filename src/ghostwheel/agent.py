@@ -3,9 +3,6 @@ import asyncio
 from pathlib import Path
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
-from pydantic_ai.models.ollama import OllamaModel
-from pydantic_ai.providers.ollama import OllamaProvider
-from pydantic_ai.models.openai import OpenAIChatModelSettings
 from pydantic_ai.messages import (
     PartDeltaEvent,
     TextPart,
@@ -23,6 +20,7 @@ from ghostwheel.rendering import render_review
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.tools import register_tools, ALL_TOOLS
 from ghostwheel.config import Settings
+from ghostwheel.models import build_model, formatter_model_settings
 
 from rich.console import Console
 from rich.panel import Panel
@@ -30,17 +28,10 @@ from rich.panel import Panel
 logfire.configure(console=False)
 logfire.instrument_pydantic_ai()
 
-settings = Settings()
+config = Settings().resolve()
 
-model = OllamaModel(
-    settings.model,
-    provider=OllamaProvider(base_url=settings.ollama_url),
-)
-
-formatter_model = OllamaModel(
-    settings.formatter_model,
-    provider=OllamaProvider(base_url=settings.ollama_url),
-)
+model = build_model(config.chat_model)
+formatter_model = build_model(config.formatter.model)
 
 agent = Agent(
     model,
@@ -49,7 +40,7 @@ agent = Agent(
         "and you have tools to read, list, and search the codebase. "
         "Investigate before answering. When you don't know something about the code, "
         "use tools to find out rather than guessing. "
-        "Be specific in your answers — cite file paths and line numbers when relevant."
+        "Be specific in your answers — cite file paths and line numbers when relevant. "
         "You may use bash for inspection and test commands. "
         "Do not run destructive commands, install dependencies, "
         "or modify files unless the user explicitly asks."
@@ -84,9 +75,9 @@ formatter = Agent(
         "- The 'line' field is a single integer. If the prose cites a line range "
         "like '35-38', use the first number (35) as the line.\n"
     ),
-    model_settings=OpenAIChatModelSettings({"openai_reasoning_effort": "none"}),
+    model_settings=formatter_model_settings(config.formatter.model),
     output_type=ReviewResult,
-    output_retries=settings.formatter_retries,
+    output_retries=config.formatter.retries,
 )
 
 
@@ -217,9 +208,13 @@ def main() -> None:
     deps = ToolDeps(
         cwd=Path.cwd(),
         allowed_roots=[Path.cwd()],
-        max_output_bytes=settings.max_output_bytes,
+        max_output_bytes=config.tools.max_output_bytes,
     )
     asyncio.run(run_chat(console, deps))
+
+
+def run() -> None:
+    main()
 
 
 if __name__ == "__main__":

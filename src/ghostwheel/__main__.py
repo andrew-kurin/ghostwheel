@@ -1,3 +1,3 @@
-from ghostwheel.agent import run
+from ghostwheel.agent import main
 
-run()
+main()
