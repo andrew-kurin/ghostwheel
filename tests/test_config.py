@@ -68,3 +68,14 @@ def test_unknown_provider_fails_during_resolution() -> None:
 
     with pytest.raises(ValueError, match="Unknown model provider"):
         settings.resolve()
+
+
+def test_unknown_provider_fails_even_with_explicit_base_url() -> None:
+    settings = Settings(
+        model_provider="not-a-provider",
+        model_base_url="http://localhost:9999/v1",
+        _env_file=None,
+    )
+
+    with pytest.raises(ValueError, match="Unknown model provider"):
+        settings.resolve()

@@ -2,8 +2,7 @@ import asyncio
 from pathlib import Path
 
 import logfire
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai import Agent, AgentRunResult
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
@@ -167,6 +166,41 @@ async def stream_to_console(run, console: Console) -> None:
         pass
 
 
+async def run_agent_turn(
+    chat_agent: Agent,
+    prompt: str,
+    history: list,
+    deps: ToolDeps,
+    console: Console,
+) -> AgentRunResult[str] | None:
+    """Run one chat-agent turn and return its canonical result.
+
+    History is only updated from AgentRunResult.all_messages(), never by
+    manually appending user text. If the model run fails or completes without a
+    result, keep the previous history and tell the user explicitly.
+    """
+    try:
+        async with chat_agent.iter(prompt, message_history=history, deps=deps) as run:
+            await stream_to_console(run, console)
+
+        if run.result is None:
+            console.print(
+                "[yellow]Agent completed without a result; history was not updated.[/yellow]"
+            )
+            return None
+
+        return run.result
+    except Exception as error:
+        console.print(
+            Panel(
+                str(error),
+                title="Agent Failed",
+                border_style="red",
+            )
+        )
+        return None
+
+
 async def run_chat(
     console: Console,
     deps: ToolDeps,
@@ -199,37 +233,35 @@ async def run_chat(
         elif user_input.lower().startswith("/review"):
             paths = user_input.removeprefix("/review").strip() or "."
             prompt = REVIEW_PROMPT.format(paths=paths)
-            async with chat_agent.iter(prompt, message_history=history, deps=deps) as run:
-                await stream_to_console(run, console)
+            result = await run_agent_turn(chat_agent, prompt, history, deps, console)
+            if result is None:
+                continue
 
-            if run.result:
-                history = run.result.all_messages()
-                prose = run.result.output
-                try:
-                    with console.status(
-                        "[bold yellow]Formatting review...[/bold yellow]",
-                        spinner="dots",
-                    ):
-                        structured = await formatter.run(run.result.output)
-                    console.print("\n")
-                    render_review(structured.output, console)
-                except UnexpectedModelBehavior as e:
-                    console.print(
-                        Panel(
-                            f"[yellow]Couldn't format review as a structured table.[/yellow]\n"
-                            f"[dim]Reason: {e}[/dim]\n\n"
-                            f"[bold]Showing the raw review instead:[/bold]\n\n{prose}",
-                            title="Formatter Failed",
-                            border_style="yellow",
-                        )
+            history = result.all_messages()
+            prose = result.output
+            try:
+                with console.status(
+                    "[bold yellow]Formatting review...[/bold yellow]",
+                    spinner="dots",
+                ):
+                    structured = await formatter.run(prose)
+                console.print("\n")
+                render_review(structured.output, console)
+            except Exception as error:
+                console.print(
+                    Panel(
+                        f"[yellow]Couldn't format review as a structured table.[/yellow]\n"
+                        f"[dim]Reason: {error}[/dim]\n\n"
+                        f"[bold]Showing the raw review instead:[/bold]\n\n{prose}",
+                        title="Formatter Failed",
+                        border_style="yellow",
                     )
+                )
             continue
 
-        async with chat_agent.iter(user_input, message_history=history, deps=deps) as run:
-            await stream_to_console(run, console)
-
-        if run.result is not None:
-            history = run.result.all_messages()
+        result = await run_agent_turn(chat_agent, user_input, history, deps, console)
+        if result is not None:
+            history = result.all_messages()
 
 
 def main() -> None:

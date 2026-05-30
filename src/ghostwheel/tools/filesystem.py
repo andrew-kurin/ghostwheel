@@ -98,11 +98,11 @@ def ls(
     entries: list[DirEntry] = []
     truncated = False
 
-    for i, child in enumerate(sorted(target.iterdir())):
+    for child in sorted(target.iterdir()):
         if not show_hidden and child.name.startswith("."):
             continue
 
-        if i >= MAX_ENTRIES:
+        if len(entries) >= MAX_ENTRIES:
             truncated = True
             break
 

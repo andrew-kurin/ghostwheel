@@ -82,11 +82,7 @@ def grep(
                             )
                         matches.append(
                             GrepMatch(
-                                file=str(
-                                    file_path.relative_to(
-                                        target if target.is_dir() else target.parent
-                                    )
-                                ),
+                                file=str(file_path.relative_to(ctx.deps.cwd)),
                                 line=line_num,
                                 text=line.rstrip("\n"),
                             )

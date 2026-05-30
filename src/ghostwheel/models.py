@@ -44,19 +44,22 @@ def normalize_provider(provider: str) -> str:
     return _PROVIDER_ALIASES.get(normalized, normalized)
 
 
-def default_base_url(provider: str) -> str:
+def validate_provider(provider: str) -> str:
     normalized = normalize_provider(provider)
-    try:
-        return _DEFAULT_BASE_URLS[normalized]
-    except KeyError as exc:
+    if normalized not in _DEFAULT_BASE_URLS:
         supported = ", ".join(SUPPORTED_PROVIDERS)
         raise ValueError(
             f"Unknown model provider '{provider}'. Supported providers: {supported}"
-        ) from exc
+        )
+    return normalized
+
+
+def default_base_url(provider: str) -> str:
+    return _DEFAULT_BASE_URLS[validate_provider(provider)]
 
 
 def build_model(spec: ModelSpec) -> Model:
-    provider = normalize_provider(spec.provider)
+    provider = validate_provider(spec.provider)
 
     if provider == "ollama":
         return OllamaModel(
@@ -78,7 +81,7 @@ def build_model(spec: ModelSpec) -> Model:
 
 
 def formatter_model_settings(spec: ModelSpec) -> OpenAIChatModelSettings | None:
-    provider = normalize_provider(spec.provider)
+    provider = validate_provider(spec.provider)
 
     if provider == "ollama":
         return OpenAIChatModelSettings(openai_reasoning_effort="none")

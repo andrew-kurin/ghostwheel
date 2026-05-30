@@ -23,6 +23,32 @@ def _to_text(value: str | bytes | None) -> str:
     return value
 
 
+def _truncate_to_bytes(value: str, max_bytes: int) -> str:
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _truncate_streams(stdout: str, stderr: str, max_bytes: int) -> tuple[str, str, bool]:
+    stdout_bytes = stdout.encode("utf-8")
+    stderr_bytes = stderr.encode("utf-8")
+
+    if len(stdout_bytes) + len(stderr_bytes) <= max_bytes:
+        return stdout, stderr, False
+    if max_bytes <= 0:
+        return "", "", True
+
+    stdout_budget = min(len(stdout_bytes), max_bytes)
+    stderr_budget = max_bytes - stdout_budget
+    if stderr_bytes and stderr_budget == 0:
+        stderr_budget = min(len(stderr_bytes), max_bytes // 2)
+        stdout_budget = max_bytes - stderr_budget
+
+    return (
+        _truncate_to_bytes(stdout, stdout_budget),
+        _truncate_to_bytes(stderr, stderr_budget),
+        True,
+    )
+
+
 def bash(ctx: RunContext[ToolDeps], command: str) -> BashResult:
     """Run a shell command in the project working directory.
 
@@ -57,13 +83,11 @@ def bash(ctx: RunContext[ToolDeps], command: str) -> BashResult:
         exit_code = None
         timed_out = True
 
-    max_bytes = ctx.deps.max_output_bytes
-    combined = stdout + stderr
-    truncated = len(combined.encode()) > max_bytes
-
-    if truncated:
-        stdout = stdout[:max_bytes]
-        stderr = stderr[:max_bytes]
+    stdout, stderr, truncated = _truncate_streams(
+        stdout,
+        stderr,
+        ctx.deps.max_output_bytes,
+    )
 
     return BashResult(
         command=command,

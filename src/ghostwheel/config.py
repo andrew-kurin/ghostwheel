@@ -2,7 +2,7 @@ from dataclasses import dataclass
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ghostwheel.models import ModelSpec, default_base_url, normalize_provider
+from ghostwheel.models import ModelSpec, default_base_url, validate_provider
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class Settings(BaseSettings):
         )
 
     def _chat_model_spec(self) -> ModelSpec:
-        provider = normalize_provider(self.model_provider)
+        provider = validate_provider(self.model_provider)
         return ModelSpec(
             provider=provider,
             model=self.model,
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
         )
 
     def _formatter_model_spec(self, chat_model: ModelSpec) -> ModelSpec:
-        provider = normalize_provider(self.formatter_provider or chat_model.provider)
+        provider = validate_provider(self.formatter_provider or chat_model.provider)
         model = self.formatter_model or chat_model.model
 
         if self.formatter_base_url:
@@ -83,6 +83,7 @@ class Settings(BaseSettings):
         return ModelSpec(provider=provider, model=model, base_url=base_url)
 
     def _base_url_for(self, provider: str, explicit_base_url: str | None) -> str:
+        provider = validate_provider(provider)
         if explicit_base_url:
             return explicit_base_url.rstrip("/")
 
