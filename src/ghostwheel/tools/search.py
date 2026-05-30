@@ -1,4 +1,6 @@
 import re
+from pathlib import Path
+
 from pydantic import BaseModel
 from pydantic_ai import RunContext
 from .deps import ToolDeps
@@ -15,6 +17,13 @@ class GrepResult(BaseModel):
     matches: list[GrepMatch]
     truncated: bool
     files_searched: int  # useful signal: "I searched 50 files and found 0" is different from "I searched 0 files"
+
+
+def _match_path(ctx: RunContext[ToolDeps], file_path: Path) -> str:
+    try:
+        return str(file_path.relative_to(ctx.deps.cwd))
+    except ValueError:
+        return str(file_path)
 
 
 def grep(
@@ -82,7 +91,7 @@ def grep(
                             )
                         matches.append(
                             GrepMatch(
-                                file=str(file_path.relative_to(ctx.deps.cwd)),
+                                file=_match_path(ctx, file_path),
                                 line=line_num,
                                 text=line.rstrip("\n"),
                             )

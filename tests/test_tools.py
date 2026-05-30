@@ -85,6 +85,24 @@ def test_grep_returns_paths_relative_to_tool_cwd_for_scoped_search(
     ]
 
 
+def test_grep_returns_readable_absolute_paths_for_allowed_roots_outside_cwd(
+    tmp_path: Path,
+) -> None:
+    cwd = (tmp_path / "repo").resolve()
+    outside_root = (tmp_path / "shared").resolve()
+    cwd.mkdir()
+    outside_root.mkdir()
+    (outside_root / "shared.py").write_text("needle\n", encoding="utf-8")
+    ctx = tool_ctx(cwd, allowed_roots=[cwd, outside_root])
+
+    result = grep(ctx, "needle", path=str(outside_root), file_glob="*.py")
+
+    assert [(match.file, match.line, match.text) for match in result.matches] == [
+        (str(outside_root / "shared.py"), 1, "needle")
+    ]
+    assert read(ctx, result.matches[0].file).path == str(outside_root / "shared.py")
+
+
 def test_ls_does_not_count_filtered_hidden_entries_toward_limit(
     tmp_path: Path,
 ) -> None:
