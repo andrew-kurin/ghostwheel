@@ -35,8 +35,11 @@ def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
     if not target.is_file():
         raise ValueError(f"Not a file: {target}")
 
-    file_size = target.stat().st_size
     max_bytes = ctx.deps.max_output_bytes
+    if max_bytes <= 0:
+        raise ValueError("max_output_bytes must be positive")
+
+    file_size = target.stat().st_size
     truncated = file_size > max_bytes
 
     with target.open("rb") as f:

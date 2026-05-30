@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ghostwheel.models import ModelSpec, default_base_url, validate_provider
@@ -46,7 +47,7 @@ class Settings(BaseSettings):
     formatter_base_url: str | None = None
     formatter_retries: int = 5
 
-    max_output_bytes: int = 100_000
+    max_output_bytes: int = Field(default=100_000, gt=0)
 
     def resolve(self) -> AppConfig:
         chat_model = self._chat_model_spec()

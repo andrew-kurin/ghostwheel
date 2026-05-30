@@ -1,6 +1,7 @@
 import os
 
 import pytest
+from pydantic import ValidationError
 
 from ghostwheel.config import Settings
 from ghostwheel.models import ModelSpec
@@ -79,3 +80,8 @@ def test_unknown_provider_fails_even_with_explicit_base_url() -> None:
 
     with pytest.raises(ValueError, match="Unknown model provider"):
         settings.resolve()
+
+
+def test_max_output_bytes_must_be_positive() -> None:
+    with pytest.raises(ValidationError, match="greater than 0"):
+        Settings(max_output_bytes=0, _env_file=None)

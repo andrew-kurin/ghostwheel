@@ -210,7 +210,7 @@ async def run_chat(
     """Interactive mode: persistent conversation"""
     history = []
     console.print(
-        "[dim]Ghostwheel chat. Type 'quit' to exit, '/review path' to review code.[/dim]"
+        "[dim]Ghostwheel chat. Type '/quit' to exit, '/review path' to review code.[/dim]"
     )
 
     while True:

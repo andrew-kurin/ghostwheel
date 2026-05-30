@@ -137,6 +137,15 @@ def test_run_agent_turn_reports_failures_without_updating_history(
     )
 
 
+def test_run_chat_startup_prompt_mentions_slash_quit() -> None:
+    agent_module = importlib.import_module("ghostwheel.agent")
+    console = FakeConsole(["/quit"])
+
+    asyncio.run(agent_module.run_chat(console, object(), object(), object()))
+
+    assert "Type '/quit' to exit" in str(console.printed[0][0][0])
+
+
 def test_run_chat_keeps_previous_history_after_missing_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

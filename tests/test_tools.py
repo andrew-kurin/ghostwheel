@@ -55,6 +55,14 @@ def test_filesystem_tools_reject_paths_outside_allowed_roots(tmp_path: Path) -> 
         ls(ctx, "..")
 
 
+def test_read_rejects_non_positive_max_output_bytes(tmp_path: Path) -> None:
+    root = tmp_path.resolve()
+    (root / "README.md").write_text("hello", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="max_output_bytes must be positive"):
+        read(tool_ctx(root, max_output_bytes=0), "README.md")
+
+
 def test_grep_finds_matches_and_skips_noise_directories(tmp_path: Path) -> None:
     root = tmp_path.resolve()
     (root / "src").mkdir()
@@ -101,6 +109,19 @@ def test_grep_returns_readable_absolute_paths_for_allowed_roots_outside_cwd(
         (str(outside_root / "shared.py"), 1, "needle")
     ]
     assert read(ctx, result.matches[0].file).path == str(outside_root / "shared.py")
+
+
+def test_grep_skips_symlinked_files_outside_allowed_roots(tmp_path: Path) -> None:
+    root = (tmp_path / "repo").resolve()
+    root.mkdir()
+    outside = (tmp_path / "secret.txt").resolve()
+    outside.write_text("needle\n", encoding="utf-8")
+    (root / "link.txt").symlink_to(outside)
+
+    result = grep(tool_ctx(root), "needle", file_glob="*.txt")
+
+    assert result.matches == []
+    assert result.files_searched == 0
 
 
 def test_ls_does_not_count_filtered_hidden_entries_toward_limit(

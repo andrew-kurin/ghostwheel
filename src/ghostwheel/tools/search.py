@@ -19,6 +19,17 @@ class GrepResult(BaseModel):
     files_searched: int  # useful signal: "I searched 50 files and found 0" is different from "I searched 0 files"
 
 
+_NOISE_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
+
+
+def _is_allowed(ctx: RunContext[ToolDeps], path: Path) -> bool:
+    return any(path.is_relative_to(root.resolve()) for root in ctx.deps.allowed_roots)
+
+
+def _is_noise_path(path: Path) -> bool:
+    return any(part in _NOISE_DIRS for part in path.parts)
+
+
 def _match_path(ctx: RunContext[ToolDeps], file_path: Path) -> str:
     try:
         return str(file_path.relative_to(ctx.deps.cwd))
@@ -46,7 +57,7 @@ def grep(
     """
     target = (ctx.deps.cwd / path).expanduser().resolve()
 
-    if not any(target.is_relative_to(root) for root in ctx.deps.allowed_roots):
+    if not _is_allowed(ctx, target):
         raise ValueError(f"Path {target} is outside allowed roots")
     if not target.exists():
         raise FileNotFoundError(f"Path does not exist: {target}")
@@ -65,20 +76,25 @@ def grep(
     files = [target] if target.is_file() else target.rglob(file_glob)
 
     for file_path in files:
-        if not file_path.is_file():
+        if _is_noise_path(file_path):
             continue
 
-        # Skip common noise directories
-        if any(
-            part in {".git", "node_modules", "__pycache__", ".venv"}
-            for part in file_path.parts
-        ):
+        try:
+            resolved_file_path = file_path.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        if not resolved_file_path.is_file():
+            continue
+        if not _is_allowed(ctx, resolved_file_path):
+            continue
+        if _is_noise_path(resolved_file_path):
             continue
 
         files_searched += 1
 
         try:
-            with file_path.open("r", encoding="utf-8", errors="ignore") as f:
+            with resolved_file_path.open("r", encoding="utf-8", errors="ignore") as f:
                 for line_num, line in enumerate(f, 1):
                     if regex.search(line):
                         if len(matches) >= MAX_MATCHES:
@@ -91,7 +107,7 @@ def grep(
                             )
                         matches.append(
                             GrepMatch(
-                                file=_match_path(ctx, file_path),
+                                file=_match_path(ctx, resolved_file_path),
                                 line=line_num,
                                 text=line.rstrip("\n"),
                             )
