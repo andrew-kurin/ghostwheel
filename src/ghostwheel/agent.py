@@ -1,84 +1,117 @@
-import logfire
 import asyncio
 from pathlib import Path
+
+import logfire
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import UnexpectedModelBehavior
 from pydantic_ai.messages import (
-    PartDeltaEvent,
-    TextPart,
-    ThinkingPart,
-    PartStartEvent,
-    ThinkingPartDelta,
-    TextPartDelta,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    PartDeltaEvent,
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
     ToolCallPart,
     ToolReturnPart,
 )
-from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
-from ghostwheel.rendering import render_review
-from ghostwheel.tools.deps import ToolDeps
-from ghostwheel.tools import register_tools, ALL_TOOLS
-from ghostwheel.config import Settings
-from ghostwheel.models import build_model, formatter_model_settings
-
 from rich.console import Console
 from rich.panel import Panel
 
-logfire.configure(console=False)
-logfire.instrument_pydantic_ai()
+from ghostwheel.config import AppConfig, Settings
+from ghostwheel.models import build_model, formatter_model_settings
+from ghostwheel.rendering import render_review
+from ghostwheel.schemas import ReviewResult, SEVERITY_VALUES
+from ghostwheel.tools import ALL_TOOLS, register_tools
+from ghostwheel.tools.deps import ToolDeps
 
-config = Settings().resolve()
-
-model = build_model(config.chat_model)
-formatter_model = build_model(config.formatter.model)
-
-agent = Agent(
-    model,
-    instructions=(
-        "You are a coding assistant. The user will ask you about their code, "
-        "and you have tools to read, list, and search the codebase. "
-        "Investigate before answering. When you don't know something about the code, "
-        "use tools to find out rather than guessing. "
-        "Be specific in your answers — cite file paths and line numbers when relevant. "
-        "You may use bash for inspection and test commands. "
-        "Do not run destructive commands, install dependencies, "
-        "or modify files unless the user explicitly asks."
-    ),
-    deps_type=ToolDeps,
+MAIN_INSTRUCTIONS = (
+    "You are a coding assistant. The user will ask you about their code, "
+    "and you have tools to read, list, and search the codebase. "
+    "Investigate before answering. When you don't know something about the code, "
+    "use tools to find out rather than guessing. "
+    "Be specific in your answers — cite file paths and line numbers when relevant. "
+    "You may use bash for inspection and test commands. "
+    "Do not run destructive commands, install dependencies, "
+    "or modify files unless the user explicitly asks."
 )
-register_tools(agent, ALL_TOOLS)
 
-formatter = Agent(
-    formatter_model,
-    instructions=(
-        "You convert a code review written in prose into a structured "
-        "ReviewResult object. You are a transcriber, not a reviewer.\n"
-        "\n"
-        "Rules:\n"
-        "- Include every finding from the prose. Do not omit any.\n"
-        "- Do not add findings that are not in the prose.\n"
-        "- Preserve the reviewer's severity assessments. If the reviewer "
-        "calls something a 'bug' or 'error', it is a blocker. If they say "
-        "'consider' or 'suggestion', it is a suggestion. Otherwise, warning.\n"
-        "- For every finding, set severity to exactly one of: \n"
-        f"{SEVERITY_VALUES}\n"
-        "- Do not put severity words in category. Category should be a short issue type "
-        "like 'bug', 'typing', 'runtime', 'security', 'style', or 'design'.\n"
-        "- Copy file paths and line numbers exactly as written in the prose.\n"
-        "- The 'message' field should restate the issue concisely.\n"
-        "- The 'suggestion' field should contain the fix if the reviewer "
-        "proposed one, or be omitted if they did not.\n"
-        "- Set 'approve' to true only if the prose explicitly approves the "
-        "code or contains no blockers and no warnings.\n"
-        "- Write a two-sentence 'summary' that captures the overall verdict.\n"
-        "- The 'line' field is a single integer. If the prose cites a line range "
-        "like '35-38', use the first number (35) as the line.\n"
-    ),
-    model_settings=formatter_model_settings(config.formatter.model),
-    output_type=ReviewResult,
-    output_retries=config.formatter.retries,
+FORMATTER_INSTRUCTIONS = (
+    "You convert a code review written in prose into a structured "
+    "ReviewResult object. You are a transcriber, not a reviewer.\n"
+    "\n"
+    "Rules:\n"
+    "- Include every finding from the prose. Do not omit any.\n"
+    "- Do not add findings that are not in the prose.\n"
+    "- Preserve the reviewer's severity assessments. If the reviewer "
+    "calls something a 'bug' or 'error', it is a blocker. If they say "
+    "'consider' or 'suggestion', it is a suggestion. Otherwise, warning.\n"
+    "- For every finding, set severity to exactly one of: \n"
+    f"{SEVERITY_VALUES}\n"
+    "- Do not put severity words in category. Category should be a short issue type "
+    "like 'bug', 'typing', 'runtime', 'security', 'style', or 'design'.\n"
+    "- Copy file paths and line numbers exactly as written in the prose.\n"
+    "- The 'message' field should restate the issue concisely.\n"
+    "- The 'suggestion' field should contain the fix if the reviewer "
+    "proposed one, or be omitted if they did not.\n"
+    "- Set 'approve' to true only if the prose explicitly approves the "
+    "code or contains no blockers and no warnings.\n"
+    "- Write a two-sentence 'summary' that captures the overall verdict.\n"
+    "- The 'line' field is a single integer. If the prose cites a line range "
+    "like '35-38', use the first number (35) as the line.\n"
 )
+
+REVIEW_PROMPT = (
+    "Perform a careful code review of the files at {paths}. "
+    "Use your tools to read each file. "
+    "Identify real issues — bugs, security concerns, design problems, dead code. "
+    "Don't flag stylistic nits. For each finding, cite file:line and explain why it's a problem. "
+    "End with an overall verdict: approve, or changes required."
+)
+
+_observability_configured = False
+
+
+def configure_observability() -> None:
+    """Configure telemetry only when the application is actually started."""
+    global _observability_configured
+
+    if _observability_configured:
+        return
+
+    logfire.configure(console=False)
+    logfire.instrument_pydantic_ai()
+    _observability_configured = True
+
+
+def create_chat_agent(config: AppConfig) -> Agent:
+    chat_agent = Agent(
+        build_model(config.chat_model),
+        instructions=MAIN_INSTRUCTIONS,
+        deps_type=ToolDeps,
+    )
+    register_tools(chat_agent, ALL_TOOLS)
+    return chat_agent
+
+
+def create_formatter(config: AppConfig) -> Agent:
+    return Agent(
+        build_model(config.formatter.model),
+        instructions=FORMATTER_INSTRUCTIONS,
+        model_settings=formatter_model_settings(config.formatter.model),
+        output_type=ReviewResult,
+        output_retries=config.formatter.retries,
+    )
+
+
+def create_tool_deps(config: AppConfig, cwd: Path | None = None) -> ToolDeps:
+    root = (cwd or Path.cwd()).resolve()
+    return ToolDeps(
+        cwd=root,
+        allowed_roots=[root],
+        max_output_bytes=config.tools.max_output_bytes,
+    )
 
 
 async def stream_to_console(run, console: Console) -> None:
@@ -134,16 +167,12 @@ async def stream_to_console(run, console: Console) -> None:
         pass
 
 
-REVIEW_PROMPT = (
-    "Perform a careful code review of the files at {paths}. "
-    "Use your tools to read each file. "
-    "Identify real issues — bugs, security concerns, design problems, dead code. "
-    "Don't flag stylistic nits. For each finding, cite file:line and explain why it's a problem. "
-    "End with an overall verdict: approve, or changes required."
-)
-
-
-async def run_chat(console: Console, deps: ToolDeps) -> None:
+async def run_chat(
+    console: Console,
+    deps: ToolDeps,
+    chat_agent: Agent,
+    formatter: Agent,
+) -> None:
     """Interactive mode: persistent conversation"""
     history = []
     console.print(
@@ -170,7 +199,7 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
         elif user_input.lower().startswith("/review"):
             paths = user_input.removeprefix("/review").strip() or "."
             prompt = REVIEW_PROMPT.format(paths=paths)
-            async with agent.iter(prompt, message_history=history, deps=deps) as run:
+            async with chat_agent.iter(prompt, message_history=history, deps=deps) as run:
                 await stream_to_console(run, console)
 
             if run.result:
@@ -196,7 +225,7 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
                     )
             continue
 
-        async with agent.iter(user_input, message_history=history, deps=deps) as run:
+        async with chat_agent.iter(user_input, message_history=history, deps=deps) as run:
             await stream_to_console(run, console)
 
         if run.result is not None:
@@ -204,13 +233,13 @@ async def run_chat(console: Console, deps: ToolDeps) -> None:
 
 
 def main() -> None:
+    configure_observability()
+    config = Settings().resolve()
     console = Console()
-    deps = ToolDeps(
-        cwd=Path.cwd(),
-        allowed_roots=[Path.cwd()],
-        max_output_bytes=config.tools.max_output_bytes,
-    )
-    asyncio.run(run_chat(console, deps))
+    deps = create_tool_deps(config)
+    chat_agent = create_chat_agent(config)
+    formatter = create_formatter(config)
+    asyncio.run(run_chat(console, deps, chat_agent, formatter))
 
 
 def run() -> None:
