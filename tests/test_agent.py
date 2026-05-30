@@ -155,6 +155,20 @@ def test_run_chat_keeps_previous_history_after_missing_result(
     ]
 
 
+def test_review_prefix_without_command_boundary_is_regular_chat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_module = importlib.import_module("ghostwheel.agent")
+    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
+    chat_agent = FakeAgent(FakeResult("ok", messages=["history"]))
+    console = FakeConsole(["/reviewer src", "/quit"])
+    deps = object()
+
+    asyncio.run(agent_module.run_chat(console, deps, chat_agent, object()))
+
+    assert chat_agent.calls == [("/reviewer src", [], deps)]
+
+
 def test_review_falls_back_to_raw_prose_when_formatter_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

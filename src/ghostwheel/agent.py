@@ -223,15 +223,19 @@ async def run_chat(
         user_input = user_input.strip()
         if not user_input:
             continue
-        elif user_input.lower() in ["/quit"]:
+
+        command, _, command_args = user_input.partition(" ")
+        command_lower = command.lower()
+
+        if command_lower == "/quit":
             console.print("\n[dim]Goodbye![/dim]")
             break
-        elif user_input.lower() == "/clear":
+        elif command_lower == "/clear":
             history = []
             console.print("[dim]History cleared.[/dim]")
             continue
-        elif user_input.lower().startswith("/review"):
-            paths = user_input.removeprefix("/review").strip() or "."
+        elif command_lower == "/review":
+            paths = command_args.strip() or "."
             prompt = REVIEW_PROMPT.format(paths=paths)
             result = await run_agent_turn(chat_agent, prompt, history, deps, console)
             if result is None:
