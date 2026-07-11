@@ -1,4 +1,4 @@
-from ghostwheel.agent import main
+from ghostwheel.cli import main
 
 
 if __name__ == "__main__":

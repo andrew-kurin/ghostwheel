@@ -1,9 +1,16 @@
-import re
+from collections import deque
+from collections.abc import Iterator
+import os
 from pathlib import Path
+import stat
 
+import regex
 from pydantic import BaseModel
 from pydantic_ai import RunContext
+
 from .deps import ToolDeps
+from .output import OutputBudget, normalize_utf8, truncate_utf8
+from .workspace import Workspace
 
 
 class GrepMatch(BaseModel):
@@ -16,25 +23,69 @@ class GrepResult(BaseModel):
     pattern: str
     matches: list[GrepMatch]
     truncated: bool
-    files_searched: int  # useful signal: "I searched 50 files and found 0" is different from "I searched 0 files"
+    files_searched: int
+    files_skipped: int = 0
 
 
 _NOISE_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
 
 
-def _is_allowed(ctx: RunContext[ToolDeps], path: Path) -> bool:
-    return any(path.is_relative_to(root.resolve()) for root in ctx.deps.allowed_roots)
+def _glob_matches(path: Path, pattern: str) -> bool:
+    return path.full_match(pattern) or path.full_match(f"**/{pattern}")
 
 
-def _is_noise_path(path: Path) -> bool:
-    return any(part in _NOISE_DIRS for part in path.parts)
-
-
-def _match_path(ctx: RunContext[ToolDeps], file_path: Path) -> str:
-    try:
-        return str(file_path.relative_to(ctx.deps.cwd))
-    except ValueError:
-        return str(file_path)
+def _walk_candidates(
+    workspace: Workspace,
+    root: Path,
+    file_glob: str,
+    max_entries: int,
+) -> Iterator[Path | None]:
+    pending_directories = deque([Path()])
+    entries_seen = 0
+    incomplete = False
+    while pending_directories:
+        relative_directory = pending_directories.popleft()
+        directory_candidates: list[Path] = []
+        limit_reached = False
+        try:
+            with workspace.open_directory(root / relative_directory) as opened:
+                with os.scandir(opened.fd) as iterator:
+                    for entry in iterator:
+                        entries_seen += 1
+                        if entries_seen > max_entries:
+                            limit_reached = True
+                            break
+                        if entry.name in _NOISE_DIRS:
+                            continue
+                        try:
+                            entry_stat = os.stat(
+                                entry.name,
+                                dir_fd=opened.fd,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            incomplete = True
+                            continue
+                        relative = relative_directory / entry.name
+                        if stat.S_ISDIR(entry_stat.st_mode):
+                            pending_directories.append(relative)
+                            continue
+                        if not stat.S_ISREG(entry_stat.st_mode):
+                            continue
+                        if _glob_matches(relative, file_glob):
+                            directory_candidates.append(root / relative)
+        except OSError:
+            # A subtree disappeared or became inaccessible while walking. The
+            # result is incomplete, so signal truncation rather than silently
+            # claiming a complete search.
+            yield None
+            return
+        yield from directory_candidates
+        if limit_reached:
+            yield None
+            return
+    if incomplete:
+        yield None
 
 
 def grep(
@@ -44,80 +95,125 @@ def grep(
     file_glob: str = "*",
     case_sensitive: bool = True,
 ) -> GrepResult:
-    """Search for a regex pattern across files.
+    """Search for a regular expression across bounded workspace files.
 
-    Args:
-        pattern: Regular expression to search for.
-        path: Directory to search in, relative to the working directory.
-        file_glob: Glob pattern for files to search (e.g., "*.py", "*.md"). Defaults to all files.
-        case_sensitive: Whether the pattern match is case-sensitive.
-
-    Returns matches with file path, line number, and matching line text.
-    Capped at 200 matches; if more exist, 'truncated' will be True.
+    Files, retained matches, payload bytes, and each regular-expression search
+    are bounded by ``ToolLimits``. Symlinks are never traversed.
     """
-    target = (ctx.deps.cwd / path).expanduser().resolve()
-
-    if not _is_allowed(ctx, target):
-        raise ValueError(f"Path {target} is outside allowed roots")
-    if not target.exists():
-        raise FileNotFoundError(f"Path does not exist: {target}")
-
-    flags = 0 if case_sensitive else re.IGNORECASE
+    flags = 0 if case_sensitive else regex.IGNORECASE
     try:
-        regex = re.compile(pattern, flags)
-    except re.error as e:
-        raise ValueError(f"Invalid regex: {e}")
+        compiled = regex.compile(pattern, flags)
+    except regex.error as error:
+        raise ValueError(f"Invalid regex: {error}") from error
 
-    MAX_MATCHES = 200
+    workspace = ctx.deps.workspace
+    target = workspace.locate(path)
+    if workspace.is_file(target.absolute):
+        candidates = iter((target.absolute,))
+    elif workspace.is_directory(target.absolute):
+        candidates = _walk_candidates(
+            workspace,
+            target.absolute,
+            file_glob,
+            ctx.deps.limits.max_search_files,
+        )
+    else:
+        raise FileNotFoundError(f"Path does not exist: {target.absolute}")
+
+    display_pattern, pattern_truncated = truncate_utf8(
+        pattern,
+        max(1, ctx.deps.limits.max_output_bytes // 4),
+    )
+    output_budget = OutputBudget(ctx.deps.limits.max_output_bytes)
+    output_budget.consume(display_pattern)
     matches: list[GrepMatch] = []
     files_searched = 0
-    truncated = False
+    files_skipped = 0
+    truncated = pattern_truncated
 
-    files = [target] if target.is_file() else target.rglob(file_glob)
-
-    for file_path in files:
-        if _is_noise_path(file_path):
-            continue
+    for candidate in candidates:
+        if candidate is None:
+            truncated = True
+            break
 
         try:
-            resolved_file_path = file_path.resolve()
-        except (OSError, RuntimeError):
-            continue
-
-        if not resolved_file_path.is_file():
-            continue
-        if not _is_allowed(ctx, resolved_file_path):
-            continue
-        if _is_noise_path(resolved_file_path):
+            with workspace.open_file(candidate) as opened:
+                if opened.stat.st_size > ctx.deps.limits.max_search_file_bytes:
+                    files_skipped += 1
+                    truncated = True
+                    continue
+                raw = opened.file.read(ctx.deps.limits.max_search_file_bytes + 1)
+                if len(raw) > ctx.deps.limits.max_search_file_bytes:
+                    files_skipped += 1
+                    truncated = True
+                    continue
+                display_path = normalize_utf8(
+                    workspace.display_path(opened.path.absolute)
+                )
+        except OSError, ValueError:
+            files_skipped += 1
+            truncated = True
             continue
 
         files_searched += 1
+        for line_number, line in enumerate(
+            raw.decode("utf-8", errors="replace").splitlines(),
+            1,
+        ):
+            try:
+                matched = compiled.search(
+                    line,
+                    timeout=ctx.deps.limits.regex_timeout_seconds,
+                )
+            except TimeoutError as error:
+                raise TimeoutError(
+                    "Regular expression exceeded the configured per-line timeout"
+                ) from error
+            if matched is None:
+                continue
+            if len(matches) >= ctx.deps.limits.max_matches:
+                return GrepResult(
+                    pattern=display_pattern,
+                    matches=matches,
+                    files_searched=files_searched,
+                    files_skipped=files_skipped,
+                    truncated=True,
+                )
 
-        try:
-            with resolved_file_path.open("r", encoding="utf-8", errors="ignore") as f:
-                for line_num, line in enumerate(f, 1):
-                    if regex.search(line):
-                        if len(matches) >= MAX_MATCHES:
-                            truncated = True
-                            return GrepResult(
-                                pattern=pattern,
-                                matches=matches,
-                                files_searched=files_searched,
-                                truncated=truncated,
-                            )
-                        matches.append(
-                            GrepMatch(
-                                file=_match_path(ctx, resolved_file_path),
-                                line=line_num,
-                                text=line.rstrip("\n"),
-                            )
-                        )
-        except OSError:
-            continue
+            metadata = f"{display_path}:{line_number}:"
+            if not output_budget.consume(metadata):
+                return GrepResult(
+                    pattern=display_pattern,
+                    matches=matches,
+                    files_searched=files_searched,
+                    files_skipped=files_skipped,
+                    truncated=True,
+                )
+            fitted_text, text_truncated = truncate_utf8(
+                line,
+                output_budget.remaining_bytes,
+            )
+            output_budget.consume(fitted_text)
+            matches.append(
+                GrepMatch(
+                    file=display_path,
+                    line=line_number,
+                    text=fitted_text,
+                )
+            )
+            if text_truncated:
+                return GrepResult(
+                    pattern=display_pattern,
+                    matches=matches,
+                    files_searched=files_searched,
+                    files_skipped=files_skipped,
+                    truncated=True,
+                )
 
     return GrepResult(
-        pattern=pattern,
+        pattern=display_pattern,
         matches=matches,
         files_searched=files_searched,
+        files_skipped=files_skipped,
         truncated=truncated,
     )

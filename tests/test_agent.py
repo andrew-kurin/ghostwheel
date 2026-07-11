@@ -1,25 +1,34 @@
 import asyncio
 import importlib
-from collections.abc import Iterable
-from contextlib import nullcontext
-from typing import Any
+from pathlib import Path
 
 import pytest
+from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.messages import FunctionToolResultEvent, RetryPromptPart
+from pydantic_ai.models.test import TestModel
+
+from ghostwheel.config import Settings
+from ghostwheel.events import ToolFailed
+from ghostwheel.pydantic_runner import (
+    PydanticAgentRunner,
+    _failure_kind,
+    _handle_tool_event,
+)
+from ghostwheel.schemas import ReviewResult
+from ghostwheel.session import FailureKind, TurnFailed, TurnNoResult, TurnSucceeded
+from ghostwheel.tools.bash import bash
+from ghostwheel.tools.command import CommandResult
+from ghostwheel.tools.deps import ToolDeps
 
 
-class FakeConsole:
-    def __init__(self, inputs: Iterable[str] = ()) -> None:
-        self._inputs = iter(inputs)
-        self.printed: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+class FakeResult:
+    def __init__(self, output: object, messages: list[object]) -> None:
+        self.output = output
+        self._messages = messages
 
-    def print(self, *args: Any, **kwargs: Any) -> None:
-        self.printed.append((args, kwargs))
-
-    def input(self, _prompt: str) -> str:
-        return next(self._inputs)
-
-    def status(self, *_args: Any, **_kwargs: Any):
-        return nullcontext()
+    def new_messages(self) -> list[object]:
+        return self._messages
 
 
 class FakeRun:
@@ -34,41 +43,26 @@ class FakeRun:
         return None
 
 
-class FakeResult:
-    def __init__(self, output: str, messages: list[object]) -> None:
-        self.output = output
-        self._messages = messages
-
-    def all_messages(self) -> list[object]:
-        return self._messages
-
-
 class FakeAgent:
-    def __init__(self, *results: object) -> None:
-        self._results = list(results)
-        self.calls: list[tuple[str, list[object], object]] = []
-
-    def iter(self, prompt: str, message_history: list[object], deps: object) -> FakeRun:
-        self.calls.append((prompt, list(message_history), deps))
-        result = self._results.pop(0)
-        if isinstance(result, Exception):
-            raise result
-        return FakeRun(result)
-
-
-class FakeFormatter:
-    def __init__(self, result: object) -> None:
+    def __init__(self, result: object | Exception | None) -> None:
         self.result = result
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, tuple[object, ...], object, type[object]]] = []
 
-    async def run(self, prose: str) -> object:
-        self.calls.append(prose)
+    def iter(
+        self,
+        prompt: str,
+        *,
+        message_history: tuple[object, ...],
+        deps: object,
+        output_type: type[object],
+    ) -> FakeRun:
+        self.calls.append((prompt, tuple(message_history), deps, output_type))
         if isinstance(self.result, Exception):
             raise self.result
-        return self.result
+        return FakeRun(self.result)
 
 
-async def noop_stream_to_console(_run: object, _console: object) -> None:
+async def noop_stream(_run: object, _sink: object) -> None:
     return None
 
 
@@ -76,124 +70,146 @@ def test_agent_module_import_does_not_create_runtime_singletons() -> None:
     module = importlib.import_module("ghostwheel.agent")
 
     assert not hasattr(module, "config")
-    assert not hasattr(module, "model")
-    assert not hasattr(module, "formatter_model")
-    assert not hasattr(module, "agent")
-    assert not hasattr(module, "formatter")
+    assert not hasattr(module, "chat_agent")
+    assert not hasattr(module, "review_agent")
 
 
-def test_run_agent_turn_returns_canonical_result(
+def test_pydantic_runner_returns_explicit_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    result = FakeResult("ok", messages=["new-history"])
-    chat_agent = FakeAgent(result)
-    history = ["old-history"]
+    runner_module = importlib.import_module("ghostwheel.pydantic_runner")
+    monkeypatch.setattr(runner_module, "stream_agent_run", noop_stream)
+    result = FakeResult("ok", messages=["new-message"])
     deps = object()
+    agent = FakeAgent(result)
 
-    actual = asyncio.run(
-        agent_module.run_agent_turn(chat_agent, "hello", history, deps, FakeConsole())
+    outcome = asyncio.run(
+        PydanticAgentRunner(agent, deps).run("hello", (), output_type=str)  # type: ignore[arg-type]
     )
 
-    assert actual is result
-    assert chat_agent.calls == [("hello", ["old-history"], deps)]
+    assert isinstance(outcome, TurnSucceeded)
+    assert outcome.output == "ok"
+    assert outcome.new_messages == ("new-message",)
+    assert agent.calls == [("hello", (), deps, str)]
 
 
-def test_run_agent_turn_warns_when_no_result(
+def test_pydantic_runner_distinguishes_no_result_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    console = FakeConsole()
+    runner_module = importlib.import_module("ghostwheel.pydantic_runner")
+    monkeypatch.setattr(runner_module, "stream_agent_run", noop_stream)
 
-    actual = asyncio.run(
-        agent_module.run_agent_turn(FakeAgent(None), "hello", [], object(), console)
+    no_result = asyncio.run(
+        PydanticAgentRunner(FakeAgent(None), object()).run("hello", (), output_type=str)  # type: ignore[arg-type]
     )
-
-    assert actual is None
-    assert any(
-        "history was not updated" in str(args[0]) for args, _kwargs in console.printed
-    )
-
-
-def test_run_agent_turn_reports_failures_without_updating_history(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    console = FakeConsole()
-
-    actual = asyncio.run(
-        agent_module.run_agent_turn(
-            FakeAgent(RuntimeError("model exploded")), "hello", [], object(), console
+    failure = asyncio.run(
+        PydanticAgentRunner(FakeAgent(RuntimeError("model exploded")), object()).run(  # type: ignore[arg-type]
+            "hello", (), output_type=str
         )
     )
 
-    assert actual is None
-    assert any(
-        getattr(args[0], "renderable", None) == "model exploded"
-        for args, _kwargs in console.printed
+    assert isinstance(no_result, TurnNoResult)
+    assert isinstance(failure, TurnFailed)
+    assert failure.message == "model exploded"
+
+
+def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
+    module = importlib.import_module("ghostwheel.agent")
+    config = Settings(
+        max_output_bytes=123,
+        max_entries=4,
+        max_directory_scan_entries=9,
+        max_matches=5,
+        bash_timeout_seconds=6,
+        max_search_file_bytes=7,
+        max_search_files=8,
+        regex_timeout_seconds=0.2,
+        _env_file=None,
+    ).resolve()
+
+    deps = module.create_tool_deps(config, tmp_path)
+
+    assert deps.cwd == tmp_path.resolve()
+    assert deps.filesystem_roots == (tmp_path.resolve(),)
+    assert deps.limits.max_output_bytes == 123
+    assert deps.limits.max_entries == 4
+    assert deps.limits.max_directory_scan_entries == 9
+    assert deps.limits.max_matches == 5
+    assert deps.limits.bash_timeout_seconds == 6
+    assert deps.limits.max_search_file_bytes == 7
+    assert deps.limits.max_search_files == 8
+    assert deps.limits.regex_timeout_seconds == 0.2
+
+
+def test_pydantic_runner_supports_per_run_structured_output() -> None:
+    outcome = asyncio.run(
+        PydanticAgentRunner(Agent(TestModel()), None).run(
+            "review",
+            (),
+            output_type=ReviewResult,
+        )
     )
 
-
-def test_run_chat_startup_prompt_mentions_slash_quit() -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    console = FakeConsole(["/quit"])
-
-    asyncio.run(agent_module.run_chat(console, object(), object(), object()))
-
-    assert "Type '/quit' to exit" in str(console.printed[0][0][0])
+    assert isinstance(outcome, TurnSucceeded)
+    assert isinstance(outcome.output, ReviewResult)
 
 
-def test_run_chat_keeps_previous_history_after_missing_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    successful_result = FakeResult("ok", messages=["successful-history"])
-    chat_agent = FakeAgent(None, successful_result)
-    console = FakeConsole(["first", "second", "/quit"])
-    deps = object()
+def test_runner_emits_failed_tool_results() -> None:
+    events: list[object] = []
+    event = FunctionToolResultEvent(
+        RetryPromptPart("outside workspace", tool_name="read")
+    )
 
-    asyncio.run(agent_module.run_chat(console, deps, chat_agent, object()))
+    asyncio.run(_handle_tool_event(event, events.append))
 
-    assert chat_agent.calls == [
-        ("first", [], deps),
-        ("second", [], deps),
-    ]
+    assert events == [ToolFailed("read", "outside workspace")]
 
 
-def test_review_prefix_without_command_boundary_is_regular_chat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    chat_agent = FakeAgent(FakeResult("ok", messages=["history"]))
-    console = FakeConsole(["/reviewer src", "/quit"])
-    deps = object()
+def test_pydantic_runner_awaits_async_tools(tmp_path: Path) -> None:
+    class FakeCommandRunner:
+        def __init__(self) -> None:
+            self.called = False
 
-    asyncio.run(agent_module.run_chat(console, deps, chat_agent, object()))
+        async def run(self, *args: object, **kwargs: object) -> CommandResult:
+            self.called = True
+            return CommandResult(0, "ok", "", False, False)
 
-    assert chat_agent.calls == [("/reviewer src", [], deps)]
+    command_runner = FakeCommandRunner()
+    agent = Agent(
+        TestModel(call_tools=["bash"]),
+        deps_type=ToolDeps,
+        tools=(bash,),
+    )
+    deps = ToolDeps(cwd=tmp_path, command_runner=command_runner)
+
+    outcome = asyncio.run(
+        PydanticAgentRunner(agent, deps).run("inspect", (), output_type=str)
+    )
+
+    assert isinstance(outcome, TurnSucceeded)
+    assert command_runner.called is True
 
 
-def test_review_falls_back_to_raw_prose_when_formatter_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent_module = importlib.import_module("ghostwheel.agent")
-    monkeypatch.setattr(agent_module, "stream_to_console", noop_stream_to_console)
-    review_result = FakeResult("raw review prose", messages=["review-history"])
-    chat_agent = FakeAgent(review_result)
-    formatter = FakeFormatter(RuntimeError("formatter unavailable"))
-    console = FakeConsole(["/review src", "/quit"])
-    deps = object()
-
-    asyncio.run(agent_module.run_chat(console, deps, chat_agent, formatter))
-
-    assert formatter.calls == ["raw review prose"]
-    assert any(
-        "formatter unavailable" in str(getattr(args[0], "renderable", ""))
-        and "raw review prose" in str(getattr(args[0], "renderable", ""))
-        for args, _kwargs in console.printed
+def test_runner_only_classifies_structured_output_failures_for_fallback() -> None:
+    assert (
+        _failure_kind(UnexpectedModelBehavior("output validation failed"))
+        is FailureKind.MODEL_OUTPUT
+    )
+    assert (
+        _failure_kind(UnexpectedModelBehavior("tool exceeded maximum retries"))
+        is FailureKind.TOOL
+    )
+    assert (
+        _failure_kind(
+            ModelHTTPError(
+                400,
+                "local",
+                {"error": "response_format json_schema is unsupported"},
+            )
+        )
+        is FailureKind.MODEL_OUTPUT
+    )
+    assert (
+        _failure_kind(ModelHTTPError(503, "local", {"error": "unavailable"}))
+        is FailureKind.PROVIDER
     )

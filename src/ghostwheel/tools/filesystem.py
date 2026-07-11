@@ -1,6 +1,12 @@
+import os
+import stat
+from enum import Enum
+
 from pydantic import BaseModel, Field
 from pydantic_ai import RunContext
+
 from .deps import ToolDeps
+from .output import OutputBudget, normalize_utf8, truncate_utf8
 
 
 class FileContents(BaseModel):
@@ -26,32 +32,26 @@ def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
         path: Path to the file, relative to the working directory.
     """
 
-    target = (ctx.deps.cwd / path).expanduser().resolve()
+    max_bytes = ctx.deps.limits.max_output_bytes
+    with ctx.deps.workspace.open_file(path) as opened:
+        file_size = opened.stat.st_size
+        raw_bytes = opened.file.read(max_bytes + 1)
+        display_path = normalize_utf8(
+            ctx.deps.workspace.display_path(opened.path.absolute)
+        )
 
-    if not any(target.is_relative_to(root) for root in ctx.deps.allowed_roots):
-        raise ValueError(f"Path {target} is outside allowed roots")
-    if not target.exists():
-        raise FileNotFoundError(f"Path does not exist: {target}")
-    if not target.is_file():
-        raise ValueError(f"Not a file: {target}")
+    raw_truncated = len(raw_bytes) > max_bytes
+    raw_bytes = raw_bytes[:max_bytes]
 
-    max_bytes = ctx.deps.max_output_bytes
-    if max_bytes <= 0:
-        raise ValueError("max_output_bytes must be positive")
-
-    file_size = target.stat().st_size
-    truncated = file_size > max_bytes
-
-    with target.open("rb") as f:
-        raw_bytes = f.read(max_bytes)
-
-    content = raw_bytes.decode("utf-8", errors="ignore")
+    content = raw_bytes.decode("utf-8", errors="replace")
 
     lines = content.splitlines()
     numbered = "\n".join(f"{i:4d} | {line}" for i, line in enumerate(lines, 1))
+    numbered, numbered_truncated = truncate_utf8(numbered, max_bytes)
+    truncated = raw_truncated or numbered_truncated
 
     return FileContents(
-        path=str(target),
+        path=display_path,
         content=numbered,
         line_count=len(lines),
         truncated=truncated,
@@ -59,16 +59,24 @@ def read(ctx: RunContext[ToolDeps], path: str) -> FileContents:
     )
 
 
+class FileKind(str, Enum):
+    FILE = "file"
+    DIRECTORY = "directory"
+    SYMLINK = "symlink"
+
+
 class DirEntry(BaseModel):
     name: str
-    type: str = Field(description="'file', 'dir', or 'symlink'")
+    type: FileKind = Field(description="'file', 'directory', or 'symlink'")
     size: int | None = Field(
         default=None, description="Size in bytes for files; None for directories"
     )
 
 
 class DirectoryListing(BaseModel):
-    path: str = Field(description="Absolute path that was listed")
+    path: str = Field(
+        description=("Workspace-relative path, or absolute path for an additional root")
+    )
     entries: list[DirEntry]
     truncated: bool = Field(default=False, description="True if results were capped")
 
@@ -83,45 +91,60 @@ def ls(
         show_hidden: If True, include entries starting with '.'. Defaults to False.
 
     Returns the directory's contents as a list of entries (name, type, size).
-    Results are capped at 200 entries; if the directory is larger,
-    the 'truncated' field will be True.
+    Results are capped by the configured max_entries limit; if the directory is
+    larger, the 'truncated' field will be True.
     """
-    target = (ctx.deps.cwd / path).expanduser().resolve()
-
-    # Path safety: must be inside an allowed root
-    if not any(target.is_relative_to(root) for root in ctx.deps.allowed_roots):
-        raise ValueError(f"Path {target} is outside allowed roots")
-
-    if not target.exists():
-        raise FileNotFoundError(f"Path does not exist: {target}")
-    if not target.is_dir():
-        raise NotADirectoryError(f"Not a directory: {target}")
-
-    MAX_ENTRIES = 200
     entries: list[DirEntry] = []
     truncated = False
+    scanned_entries = 0
+    output_budget = OutputBudget(ctx.deps.limits.max_output_bytes)
 
-    for child in sorted(target.iterdir()):
-        if not show_hidden and child.name.startswith("."):
-            continue
+    with ctx.deps.workspace.open_directory(path) as opened:
+        display_path = normalize_utf8(
+            ctx.deps.workspace.display_path(opened.path.absolute)
+        )
+        with os.scandir(opened.fd) as children:
+            for child in children:
+                scanned_entries += 1
+                if scanned_entries > ctx.deps.limits.max_directory_scan_entries:
+                    truncated = True
+                    break
+                if not show_hidden and child.name.startswith("."):
+                    continue
 
-        if len(entries) >= MAX_ENTRIES:
-            truncated = True
-            break
+                if len(entries) >= ctx.deps.limits.max_entries:
+                    truncated = True
+                    break
 
-        if child.is_symlink():
-            entry_type = "symlink"
-            size = None
-        elif child.is_dir():
-            entry_type = "directory"
-            size = None
-        else:
-            entry_type = "file"
-            try:
-                size = child.stat().st_size
-            except OSError:
-                size = None
+                try:
+                    child_stat = os.stat(
+                        child.name,
+                        dir_fd=opened.fd,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    truncated = True
+                    continue
+                if stat.S_ISLNK(child_stat.st_mode):
+                    entry_type = FileKind.SYMLINK
+                    size = None
+                elif stat.S_ISDIR(child_stat.st_mode):
+                    entry_type = FileKind.DIRECTORY
+                    size = None
+                else:
+                    entry_type = FileKind.FILE
+                    size = child_stat.st_size
 
-        entries.append(DirEntry(name=child.name, type=entry_type, size=size))
+                display_name = normalize_utf8(child.name)
+                if not output_budget.consume(
+                    f"{display_name}:{entry_type.value}:{size}"
+                ):
+                    truncated = True
+                    break
+                entries.append(DirEntry(name=display_name, type=entry_type, size=size))
 
-    return DirectoryListing(path=str(target), entries=entries, truncated=truncated)
+    return DirectoryListing(
+        path=display_path,
+        entries=entries,
+        truncated=truncated,
+    )

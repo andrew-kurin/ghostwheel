@@ -6,9 +6,9 @@ from rich.text import Text
 from ghostwheel.schemas import ReviewResult, Severity
 
 SEVERITY_STYLE = {
-    Severity.SUGGESTION: ("dim cyan", ":bulb:"),
-    Severity.WARNING: ("yellow", ":warning:"),
-    Severity.BLOCKER: ("bold red", ":stop_sign:"),
+    Severity.SUGGESTION: ("dim cyan", "💡"),
+    Severity.WARNING: ("yellow", "⚠"),
+    Severity.BLOCKER: ("bold red", "🛑"),
 }
 
 
@@ -22,14 +22,14 @@ def render_review(review: ReviewResult, console: Console | None = None) -> None:
     )
     console.print(
         Panel(
-            Text.assemble(verdict, "\n\n", review.summary),
+            Text.assemble(verdict, "\n\n", Text(review.summary)),
             title="Code Review",
             border_style="green" if review.approve else "red",
         )
     )
 
     if not review.findings:
-        console.print("[dim]No findings to report.[/dim]")
+        console.print(Text("No findings to report.", style="dim"))
         return
 
     # findings table sorted by severity
@@ -44,11 +44,20 @@ def render_review(review: ReviewResult, console: Console | None = None) -> None:
 
     for f in findings:
         style, icon = SEVERITY_STYLE[f.severity]
-        location = f"{f.file}:{f.line}" if f.line else f.file
+        location = f.file
+        if f.line is not None:
+            location += f":{f.line}"
+            if f.line_end is not None and f.line_end != f.line:
+                location += f"-{f.line_end}"
         issue = Text(f.message)
         if f.suggestion:
             issue.append("\n→ ", style="dim")
             issue.append(f.suggestion, style="dim italic")
-        table.add_row(Text.from_markup(icon, style=style), location, f.category, issue)
+        table.add_row(
+            Text(icon, style=style),
+            Text(location, style="cyan"),
+            Text(f.category, style="magenta"),
+            issue,
+        )
 
     console.print(table)
