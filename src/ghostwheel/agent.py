@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic_ai import Agent
+from pydantic_ai.settings import ModelSettings
 
 from ghostwheel.config import AppConfig, Settings
 from ghostwheel.models import build_model, structured_output_model_settings
@@ -43,6 +44,14 @@ FORMATTER_INSTRUCTIONS = (
     "verdict concisely; approval is derived from the resulting severities."
 )
 
+COMPACTION_INSTRUCTIONS = (
+    "You maintain a concise rolling checkpoint for a coding-assistant "
+    "conversation. Summarize only the serialized transcript supplied in the "
+    "prompt. Preserve user requirements, completed work, decisions, unresolved "
+    "issues, commands, errors, and exact file paths. Never use tools, continue "
+    "the conversation, or claim work that is not present in the transcript."
+)
+
 
 def _profile_tools(
     profile: str,
@@ -76,6 +85,19 @@ def create_review_agent(
         tools=_profile_tools(config.tools.review_profile, catalog),
         model_settings=structured_output_model_settings(config.review.model),
         retries=config.review.retries,
+    )
+
+
+def create_compaction_agent(config: AppConfig) -> Agent[None, str]:
+    """Create the isolated, tool-free model used for rolling summaries."""
+
+    return Agent(
+        build_model(config.chat_model),
+        instructions=COMPACTION_INSTRUCTIONS,
+        model_settings=ModelSettings(
+            max_tokens=config.history.compaction.summary_tokens,
+            temperature=0.1,
+        ),
     )
 
 

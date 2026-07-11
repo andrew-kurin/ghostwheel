@@ -147,6 +147,21 @@ def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
     assert deps.limits.regex_timeout_seconds == 0.2
 
 
+def test_compaction_agent_is_tool_free_and_caps_summary_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_module = importlib.import_module("ghostwheel.agent")
+    monkeypatch.setattr(agent_module, "build_model", lambda _spec: TestModel())
+    config = Settings(_env_file=None).resolve()
+
+    agent = agent_module.create_compaction_agent(config)
+
+    assert agent.deps_type is type(None)
+    assert agent._function_toolset.tools == {}
+    assert agent.model_settings == {"max_tokens": 2_048, "temperature": 0.1}
+    assert agent_module.COMPACTION_INSTRUCTIONS in agent._instructions
+
+
 def test_pydantic_runner_supports_per_run_structured_output() -> None:
     outcome = asyncio.run(
         PydanticAgentRunner(Agent(TestModel()), None).run(

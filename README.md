@@ -137,16 +137,33 @@ GHOSTWHEEL_REGEX_TIMEOUT_SECONDS=0.05
 GHOSTWHEEL_TOOL_PROFILE=full
 GHOSTWHEEL_REVIEW_TOOL_PROFILE=full
 
-GHOSTWHEEL_HISTORY_MAX_TURNS=20
-GHOSTWHEEL_HISTORY_MAX_MESSAGES=200
-GHOSTWHEEL_HISTORY_MAX_BYTES=400000
-GHOSTWHEEL_HISTORY_RESPONSE_RESERVE_BYTES=50000
+GHOSTWHEEL_HISTORY_CONTEXT_WINDOW_TOKENS=16384
+GHOSTWHEEL_COMPACTION_ENABLED=true
+GHOSTWHEEL_COMPACTION_RESERVE_TOKENS=4096
+GHOSTWHEEL_COMPACTION_KEEP_RECENT_TOKENS=4096
+GHOSTWHEEL_COMPACTION_SUMMARY_TOKENS=2048
 ```
 
 Filesystem tools share one canonical workspace policy and output budget. They open
 paths relative to allowed-root descriptors and do not traverse symlinks. Chat
-history is retained as whole turns and compacted when any configured history limit
-is reached; review transcripts do not enter chat history.
+history uses rolling summaries rather than a turn-count limit. Compaction starts
+when context usage exceeds `context window - reserve tokens`: older messages are
+summarized by a dedicated tool-free model call and the newest
+`keep recent tokens` remain verbatim. A cut may split a large tool-heavy turn,
+but tool calls and their results stay together. Each later compaction folds the
+previous summary into the next one.
+
+The context-window value must match the active model server setting. Ghostwheel
+uses usage reported by the provider when available; otherwise it estimates with
+`tiktoken` and marks the terminal value with `~`. Provider measurements also
+calibrate otherwise invisible system-instruction and tool-schema overhead after
+a summary is created; that static overhead remains visible after `/clear`. The
+4,096-token default reserve leaves response capacity;
+the 4,096-token recent target and 2,048-token summary cap leave working room in
+the default 16K window. Oversized summarizer inputs are processed as bounded
+rolling chunks. Review transcripts do not enter chat history. Set
+`GHOSTWHEEL_COMPACTION_ENABLED=false` to disable automatic summaries; no hidden
+turn-count limit is applied.
 
 `GHOSTWHEEL_MAX_OUTPUT_BYTES` limits retained variable payload (file content,
 matches, and process streams); the small structured result envelope is additional.

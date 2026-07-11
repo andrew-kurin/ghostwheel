@@ -36,10 +36,11 @@ def test_default_config_uses_ollama_and_formatter_inherits_chat_model() -> None:
     assert config.tools.regex_timeout_seconds == 0.05
     assert config.tools.profile == "full"
     assert config.tools.review_profile == "full"
-    assert config.history.max_turns == 20
-    assert config.history.max_messages == 200
-    assert config.history.max_bytes == 400_000
-    assert config.history.response_reserve_bytes == 50_000
+    assert config.history.context_window_tokens == 16_384
+    assert config.history.compaction.enabled is True
+    assert config.history.compaction.reserve_tokens == 4_096
+    assert config.history.compaction.keep_recent_tokens == 4_096
+    assert config.history.compaction.summary_tokens == 2_048
     assert config.observability.enabled is False
     assert config.observability.include_content is False
     assert config.observability.send_to_logfire == "if-token-present"
@@ -59,6 +60,24 @@ def test_llama_cpp_config_normalizes_provider_and_formatter_inherits() -> None:
         base_url="http://localhost:8080/v1",
     )
     assert config.formatter.model == config.chat_model
+
+
+def test_compaction_settings_load_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GHOSTWHEEL_HISTORY_CONTEXT_WINDOW_TOKENS", "32768")
+    monkeypatch.setenv("GHOSTWHEEL_COMPACTION_ENABLED", "false")
+    monkeypatch.setenv("GHOSTWHEEL_COMPACTION_RESERVE_TOKENS", "8192")
+    monkeypatch.setenv("GHOSTWHEEL_COMPACTION_KEEP_RECENT_TOKENS", "6144")
+    monkeypatch.setenv("GHOSTWHEEL_COMPACTION_SUMMARY_TOKENS", "3072")
+
+    config = Settings(_env_file=None).resolve()
+
+    assert config.history.context_window_tokens == 32_768
+    assert config.history.compaction.enabled is False
+    assert config.history.compaction.reserve_tokens == 8_192
+    assert config.history.compaction.keep_recent_tokens == 6_144
+    assert config.history.compaction.summary_tokens == 3_072
 
 
 def test_formatter_can_use_a_different_provider_default_base_url() -> None:
@@ -172,24 +191,77 @@ def test_regex_timeout_must_be_finite(value: float) -> None:
         Settings(regex_timeout_seconds=value, _env_file=None)
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["history_max_turns", "history_max_messages", "history_max_bytes"],
-)
-def test_history_limits_must_be_positive(field: str) -> None:
+def test_history_context_window_must_be_positive() -> None:
     with pytest.raises(ValidationError, match="greater than 0"):
-        Settings(**{field: 0}, _env_file=None)
+        Settings(history_context_window_tokens=0, _env_file=None)
 
 
-def test_history_response_reserve_must_fit_context_budget() -> None:
+def test_compaction_reserve_must_fit_context_budget() -> None:
     settings = Settings(
-        history_max_bytes=100,
-        history_response_reserve_bytes=100,
+        history_context_window_tokens=100,
+        compaction_reserve_tokens=100,
+        compaction_keep_recent_tokens=1,
         _env_file=None,
     )
 
     with pytest.raises(ValueError, match="reserve must be smaller"):
         settings.resolve()
+
+
+def test_compaction_recent_tokens_must_leave_room_for_summary() -> None:
+    settings = Settings(
+        history_context_window_tokens=100,
+        compaction_reserve_tokens=25,
+        compaction_keep_recent_tokens=75,
+        compaction_summary_tokens=1,
+        _env_file=None,
+    )
+
+    with pytest.raises(ValueError, match="must leave room for a summary"):
+        settings.resolve()
+
+
+def test_compaction_recent_and_summary_budgets_leave_working_room() -> None:
+    settings = Settings(
+        history_context_window_tokens=10_000,
+        compaction_reserve_tokens=1_000,
+        compaction_keep_recent_tokens=7_000,
+        compaction_summary_tokens=2_000,
+        _env_file=None,
+    )
+
+    with pytest.raises(ValueError, match="must leave working room"):
+        settings.resolve()
+
+
+def test_compaction_context_leaves_a_usable_summarizer_input_budget() -> None:
+    settings = Settings(
+        history_context_window_tokens=1_500,
+        compaction_reserve_tokens=100,
+        compaction_keep_recent_tokens=100,
+        compaction_summary_tokens=100,
+        _env_file=None,
+    )
+
+    with pytest.raises(ValueError, match="at least 1024 prompt tokens"):
+        settings.resolve()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("compaction_reserve_tokens", -1, "greater than or equal to 0"),
+        ("compaction_keep_recent_tokens", 0, "greater than 0"),
+        ("compaction_summary_tokens", 0, "greater than 0"),
+    ],
+)
+def test_compaction_token_settings_validate_individual_bounds(
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Settings(**{field: value}, _env_file=None)
 
 
 def test_tool_profiles_are_validated() -> None:

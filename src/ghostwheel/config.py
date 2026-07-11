@@ -13,6 +13,8 @@ from ghostwheel.model_config import (
 
 LogfireSendTo: TypeAlias = bool | Literal["if-token-present"]
 ToolProfileName: TypeAlias = Literal["read-only", "shell-only", "full"]
+COMPACTION_REQUEST_OVERHEAD_TOKENS = 512
+MIN_COMPACTION_INPUT_TOKENS = 1_024
 
 
 @dataclass(frozen=True)
@@ -41,15 +43,54 @@ FormatterConfig = ReviewConfig
 
 
 @dataclass(frozen=True)
+class CompactionConfig:
+    enabled: bool
+    reserve_tokens: int
+    keep_recent_tokens: int
+    summary_tokens: int
+
+
+@dataclass(frozen=True)
 class HistoryConfig:
-    max_turns: int
-    max_messages: int
-    max_bytes: int
-    response_reserve_bytes: int
+    context_window_tokens: int
+    compaction: CompactionConfig
 
     def __post_init__(self) -> None:
-        if self.response_reserve_bytes >= self.max_bytes:
-            raise ValueError("history response reserve must be smaller than max bytes")
+        if self.context_window_tokens <= 0:
+            raise ValueError("history context window must be positive")
+        if self.compaction.reserve_tokens < 0:
+            raise ValueError("compaction reserve must be non-negative")
+        if self.compaction.keep_recent_tokens <= 0:
+            raise ValueError("compaction recent-token target must be positive")
+        if self.compaction.summary_tokens <= 0:
+            raise ValueError("compaction summary-token budget must be positive")
+        if self.compaction.reserve_tokens >= self.context_window_tokens:
+            raise ValueError(
+                "compaction reserve must be smaller than the context window"
+            )
+        if self.compaction.keep_recent_tokens >= (
+            self.context_window_tokens - self.compaction.reserve_tokens
+        ):
+            raise ValueError(
+                "compaction recent-token target must leave room for a summary"
+            )
+        if (
+            self.compaction.keep_recent_tokens + self.compaction.summary_tokens
+            >= self.context_window_tokens - self.compaction.reserve_tokens
+        ):
+            raise ValueError(
+                "compaction recent and summary token budgets must leave working room"
+            )
+        if (
+            self.context_window_tokens
+            - self.compaction.summary_tokens
+            - COMPACTION_REQUEST_OVERHEAD_TOKENS
+            < self.compaction.summary_tokens + MIN_COMPACTION_INPUT_TOKENS
+        ):
+            raise ValueError(
+                "compactor input budget must fit the prior summary and at least "
+                f"{MIN_COMPACTION_INPUT_TOKENS} prompt tokens"
+            )
 
 
 @dataclass(frozen=True)
@@ -113,10 +154,11 @@ class Settings(BaseSettings):
     tool_profile: ToolProfileName = "full"
     review_tool_profile: ToolProfileName = "full"
 
-    history_max_turns: int = Field(default=20, gt=0)
-    history_max_messages: int = Field(default=200, gt=0)
-    history_max_bytes: int = Field(default=400_000, gt=0)
-    history_response_reserve_bytes: int = Field(default=50_000, ge=0)
+    history_context_window_tokens: int = Field(default=16_384, gt=0)
+    compaction_enabled: bool = True
+    compaction_reserve_tokens: int = Field(default=4_096, ge=0)
+    compaction_keep_recent_tokens: int = Field(default=4_096, gt=0)
+    compaction_summary_tokens: int = Field(default=2_048, gt=0)
 
     observability_enabled: bool = False
     observability_include_content: bool = False
@@ -150,10 +192,13 @@ class Settings(BaseSettings):
                 review_profile=self.review_tool_profile,
             ),
             history=HistoryConfig(
-                max_turns=self.history_max_turns,
-                max_messages=self.history_max_messages,
-                max_bytes=self.history_max_bytes,
-                response_reserve_bytes=self.history_response_reserve_bytes,
+                context_window_tokens=self.history_context_window_tokens,
+                compaction=CompactionConfig(
+                    enabled=self.compaction_enabled,
+                    reserve_tokens=self.compaction_reserve_tokens,
+                    keep_recent_tokens=self.compaction_keep_recent_tokens,
+                    summary_tokens=self.compaction_summary_tokens,
+                ),
             ),
             observability=ObservabilityConfig(
                 enabled=self.observability_enabled,

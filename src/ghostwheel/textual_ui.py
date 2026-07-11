@@ -798,6 +798,16 @@ def _vim_character_class(character: str) -> int:
     return 2
 
 
+def _format_token_count(value: int) -> str:
+    if value < 1_000:
+        return str(value)
+    thousands = value / 1_000
+    if thousands < 10 and not thousands.is_integer():
+        compact = f"{thousands:.1f}".rstrip("0").rstrip(".")
+        return f"{compact}k"
+    return f"{thousands:.0f}k"
+
+
 @dataclass(slots=True)
 class _ToolState:
     name: str
@@ -1058,11 +1068,12 @@ class TextualPresenter:
             classes="system-message",
         )
 
-    def history_compacted(self, dropped_turns: int) -> None:
-        noun = "turn" if dropped_turns == 1 else "turns"
+    def history_compacted(self, before_tokens: int, after_tokens: int) -> None:
         self.app.add_renderable(
             Text(
-                f"Context compacted: dropped {dropped_turns} {noun} to fit the budget.",
+                "Context compacted: "
+                f"{_format_token_count(before_tokens)} → "
+                f"~{_format_token_count(after_tokens)}.",
                 style="dim",
             ),
             classes="system-message",
@@ -1195,7 +1206,7 @@ class GhostwheelApp(App[None]):
     }
 
     #context {
-        width: 12;
+        width: 16;
         height: 1fr;
         content-align: right top;
         color: $text-muted;
@@ -1210,7 +1221,6 @@ class GhostwheelApp(App[None]):
         reviews: ReviewService,
         *,
         app_info: AppInfo,
-        max_turns: int,
         history_path: Path | None = None,
         cancellation: TurnCancellation | None = None,
         vim_mode: bool = True,
@@ -1220,7 +1230,6 @@ class GhostwheelApp(App[None]):
         self.session = session
         self.reviews = reviews
         self.app_info = app_info
-        self.max_turns = max_turns
         self.cancellation = cancellation or TurnCancellation()
         self.history = InputHistory(history_path)
         self.input_reader = QueueInputReader()
@@ -1326,8 +1335,19 @@ class GhostwheelApp(App[None]):
             )
 
     def update_context(self) -> None:
-        turn_count = getattr(self.session, "turn_count", 0)
-        self.context.update(Text(f"ctx {turn_count}/{self.max_turns}", style="dim"))
+        estimated_tokens = getattr(self.session, "estimated_context_tokens", 0)
+        context_window = getattr(self.session, "context_window_tokens", 0)
+        is_estimate = getattr(self.session, "context_tokens_estimated", True)
+        compaction_enabled = getattr(self.session, "compaction_enabled", True)
+        estimate_marker = "~" if is_estimate else ""
+        compaction_marker = "" if compaction_enabled else " · off"
+        label = (
+            f"ctx {estimate_marker}{_format_token_count(estimated_tokens)}/"
+            f"{_format_token_count(context_window)}{compaction_marker}"
+            if context_window
+            else ""
+        )
+        self.context.update(Text(label, style="dim"))
 
     def _resize_composer(self) -> None:
         if not self.composer_shell.is_mounted:
@@ -1472,7 +1492,7 @@ def _turn_failure(outcome: TurnFailed) -> Panel:
         ),
         FailureKind.CONFIGURATION: (
             "Configuration Error",
-            "Check the GHOSTWHEEL_MODEL_* settings and provider name.",
+            "Check the model, context-window, and compaction settings.",
         ),
         FailureKind.TOOL: (
             "Tool Error",

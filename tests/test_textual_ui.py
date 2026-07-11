@@ -27,8 +27,13 @@ class FakeSession:
     def __init__(self) -> None:
         self.history: tuple[object, ...] = ()
         self.last_compacted_turns = 0
+        self.last_compaction = None
         self.sent: list[str] = []
         self.sent_event = asyncio.Event()
+        self.estimated_context_tokens = 0
+        self.context_tokens_estimated = True
+        self.context_window_tokens = 16_384
+        self.compaction_enabled = True
 
     @property
     def turn_count(self) -> int:
@@ -41,6 +46,7 @@ class FakeSession:
 
     def clear(self) -> None:
         self.history = ()
+        self.estimated_context_tokens = 0
 
 
 class FakeReviews:
@@ -78,7 +84,6 @@ def make_app(
             model="test-model",
             tool_profile="full",
         ),
-        max_turns=20,
         vim_mode=vim_mode,
     )
 
@@ -220,6 +225,40 @@ def test_composer_tracks_soft_wrap_and_keeps_transcript_visible() -> None:
             assert app.transcript.region.height == 4
             assert app.composer.wrapped_document.height > visible_rows
             assert app.composer.scroll_offset.y > 0
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_context_status_distinguishes_exact_and_estimated_token_usage() -> None:
+    async def scenario() -> None:
+        session = FakeSession()
+        session.estimated_context_tokens = 1_250
+        app = make_app(session)
+        async with app.run_test(size=(100, 30)):
+            assert str(app.context.render()) == "ctx ~1.2k/16k"
+
+            session.context_tokens_estimated = False
+            app.update_context()
+            assert str(app.context.render()) == "ctx 1.2k/16k"
+
+            session.compaction_enabled = False
+            app.update_context()
+            assert str(app.context.render()) == "ctx 1.2k/16k · off"
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_textual_compaction_message_shows_before_and_after_tokens() -> None:
+    async def scenario() -> None:
+        app = make_app()
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.presenter.history_compacted(12_000, 4_200)
+            await pilot.pause()
+
+            messages = list(app.query(".system-message"))
+            assert str(messages[-1].render()) == ("Context compacted: 12k → ~4.2k.")
             app.exit()
 
     asyncio.run(scenario())

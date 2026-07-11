@@ -49,6 +49,16 @@ class _ToolActivity:
     finished_at: float | None = None
 
 
+def _format_token_count(value: int) -> str:
+    if value < 1_000:
+        return str(value)
+    thousands = value / 1_000
+    if thousands < 10 and not thousands.is_integer():
+        compact = f"{thousands:.1f}".rstrip("0").rstrip(".")
+        return f"{compact}k"
+    return f"{thousands:.0f}k"
+
+
 class RichPresenter:
     """Render application events without interpreting dynamic values as markup."""
 
@@ -244,11 +254,12 @@ class RichPresenter:
     def history_cleared(self) -> None:
         self.console.print(Text("Conversation history cleared.", style="dim"))
 
-    def history_compacted(self, dropped_turns: int) -> None:
-        noun = "turn" if dropped_turns == 1 else "turns"
+    def history_compacted(self, before_tokens: int, after_tokens: int) -> None:
         self.console.print(
             Text(
-                f"Context compacted: dropped {dropped_turns} {noun} to fit the budget.",
+                "Context compacted: "
+                f"{_format_token_count(before_tokens)} → "
+                f"~{_format_token_count(after_tokens)}.",
                 style="dim",
             )
         )
@@ -311,7 +322,7 @@ class RichPresenter:
             ),
             FailureKind.CONFIGURATION: (
                 "Configuration Error",
-                "Check the GHOSTWHEEL_MODEL_* settings and provider name.",
+                "Check the model, context-window, and compaction settings.",
             ),
             FailureKind.TOOL: (
                 "Tool Error",

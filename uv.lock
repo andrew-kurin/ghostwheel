@@ -124,6 +124,7 @@ dependencies = [
     { name = "regex" },
     { name = "rich" },
     { name = "textual" },
+    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -141,6 +142,7 @@ requires-dist = [
     { name = "regex", specifier = ">=2024.11.6,<2027" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
+    { name = "tiktoken", specifier = ">=0.12.0,<1" },
 ]
 
 [package.metadata.requires-dev]

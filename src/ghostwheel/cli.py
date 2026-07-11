@@ -149,8 +149,11 @@ async def run_cli(
             presenter.turn_cancelled()
             continue
         presenter.turn_outcome(outcome)
-        if session.last_compacted_turns:
-            presenter.history_compacted(session.last_compacted_turns)
+        if session.last_compaction is not None:
+            presenter.history_compacted(
+                session.last_compaction.before_tokens,
+                session.last_compaction.after_tokens,
+            )
 
 
 def _package_version() -> str:
@@ -261,12 +264,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 application.session,
                 application.reviews,
                 app_info=application.presenter.app_info,
-                max_turns=config.history.max_turns,
                 history_path=history_path,
                 vim_mode=args.vim,
             )
             event_handler = tui.presenter.handle_event
-            tui.run()
+            # Keep terminal-native drag selection available in Ghostty and
+            # libghostty hosts. Textual mouse reporting intercepts those drags.
+            tui.run(mouse=False)
         else:
             asyncio.run(
                 run_cli(

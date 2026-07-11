@@ -23,7 +23,7 @@ from ghostwheel.events import (
 )
 from ghostwheel.review import ReviewFailed
 from ghostwheel.rich_ui import RichPresenter
-from ghostwheel.session import TurnNoResult, TurnSucceeded
+from ghostwheel.session import CompactionStats, TurnNoResult, TurnSucceeded
 
 
 class FakeConsole:
@@ -38,6 +38,7 @@ class FakeSession:
     def __init__(self) -> None:
         self.history = ("chat-history",)
         self.last_compacted_turns = 0
+        self.last_compaction: CompactionStats | None = None
         self.sent: list[str] = []
         self.cleared = 0
 
@@ -92,8 +93,8 @@ class FakePresenter:
     def history_cleared(self) -> None:
         self.calls.append(("cleared", None))
 
-    def history_compacted(self, count: int) -> None:
-        self.calls.append(("compacted", count))
+    def history_compacted(self, before_tokens: int, after_tokens: int) -> None:
+        self.calls.append(("compacted", (before_tokens, after_tokens)))
 
     def turn_started(self, label: str = "Thinking…") -> None:
         self.calls.append(("started", label))
@@ -193,6 +194,33 @@ def test_local_commands_do_not_reach_the_model_and_retry_repeats_chat() -> None:
     assert ("unknown", ("/retrz", "/retry")) in presenter.calls
 
 
+def test_cli_reports_compaction_token_reduction() -> None:
+    class CompactingSession(FakeSession):
+        async def send(self, prompt: str) -> TurnNoResult:
+            self.sent.append(prompt)
+            self.last_compaction = CompactionStats(
+                before_tokens=12_000,
+                after_tokens=4_200,
+                summarized_messages=6,
+                summarized_turns=2,
+            )
+            return TurnNoResult()
+
+    session = CompactingSession()
+    presenter = FakePresenter()
+
+    asyncio.run(
+        run_cli(
+            FakeConsole(["hello", "/quit"]),  # type: ignore[arg-type]
+            session,  # type: ignore[arg-type]
+            FakeReviews(),  # type: ignore[arg-type]
+            presenter=presenter,  # type: ignore[arg-type]
+        )
+    )
+
+    assert ("compacted", (12_000, 4_200)) in presenter.calls
+
+
 def test_sigint_cancels_repeated_turns_and_keeps_the_prompt_alive() -> None:
     class BlockingSession(FakeSession):
         def __init__(self) -> None:
@@ -286,7 +314,15 @@ def test_main_passes_vim_mode_to_the_interactive_app(
     )
     config = SimpleNamespace(
         observability=object(),
-        history=SimpleNamespace(max_turns=20),
+        history=SimpleNamespace(
+            context_window_tokens=16_384,
+            compaction=SimpleNamespace(
+                enabled=True,
+                reserve_tokens=4_096,
+                keep_recent_tokens=4_096,
+                summary_tokens=2_048,
+            ),
+        ),
     )
 
     class FakeSettings:
@@ -298,8 +334,9 @@ def test_main_passes_vim_mode_to_the_interactive_app(
             captured.update(kwargs)
             self.presenter = SimpleNamespace(handle_event=lambda _event: None)
 
-        def run(self) -> None:
+        def run(self, **kwargs: object) -> None:
             captured["ran"] = True
+            captured["run_kwargs"] = kwargs
 
     monkeypatch.setattr(cli_module, "_interactive_mode", lambda *_args: True)
     monkeypatch.setattr(config_module, "Settings", FakeSettings)
@@ -315,6 +352,7 @@ def test_main_passes_vim_mode_to_the_interactive_app(
 
     assert captured["vim_mode"] is expected
     assert captured["ran"] is True
+    assert captured["run_kwargs"] == {"mouse": False}
     assert captured["closed"] is True
 
 
@@ -353,6 +391,17 @@ def test_rich_presenter_renders_completed_interactive_output_as_markdown() -> No
     assert "Heading" in rendered
     assert "strong" in rendered
     assert "[bold]literal[/bold]" in rendered
+
+
+def test_rich_presenter_shows_compaction_token_reduction() -> None:
+    output = StringIO()
+    presenter = RichPresenter(
+        Console(file=output, color_system=None, force_terminal=False, width=80)
+    )
+
+    presenter.history_compacted(12_000, 4_200)
+
+    assert "Context compacted: 12k → ~4.2k." in output.getvalue()
 
 
 def test_help_is_the_only_place_that_lists_shortcuts() -> None:
