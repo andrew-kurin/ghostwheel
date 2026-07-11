@@ -24,12 +24,42 @@ uv sync
 uv run ghostwheel
 ```
 
+Ghostwheel uses a persistent full-screen chat interface when stdin and stdout
+are terminals, and automatically falls back to a plain streaming interface for
+pipes and redirected output. Select a mode explicitly with `--ui interactive`
+or `--ui plain`.
+
+Interactive input supports command and review-path completion plus ↑/↓ prompt
+history. Shift+Enter inserts a newline. The composer grows upward for multiline
+or wrapped prompts and returns to its compact height after submission. Input
+history is stored in
+`$XDG_STATE_HOME/ghostwheel/input-history` (or
+`~/.local/state/ghostwheel/input-history`); use `--no-history` to keep it only in
+memory or `--history-file PATH` to choose another location. History contains
+prompts in plain text, so disable it when prompts may contain secrets.
+
+Vim-style prompt editing is enabled by default. It starts each prompt in Insert
+mode; Escape switches to Normal mode, and `i`, `a`, `I`, `A`, `o`, or `O` return
+to Insert mode. The compact `I` or `N` beside `You` shows the current mode. Run
+`/help` for the available motions and editing commands, or use `--no-vim` to
+restore the standard prompt editor.
+
 In the chat prompt:
 
 - Ask questions about the current repository.
 - Use `/review path/to/file.py` to run a focused code review.
 - Use `/clear` to reset conversation history.
+- Use `/retry` to repeat the previous chat or review.
+- Use `/model`, `/tools`, or `/help` for runtime information.
 - Use `/quit` to exit.
+
+During an active turn, Ctrl+C cancels that turn and returns to the composer. At
+the composer, Ctrl+O toggles expanded thinking traces and tool-call results,
+including details from existing turns in the visible transcript. Detail widgets
+are collapsed by default and are removed from the layout again when collapsed.
+Assistant replies render as Markdown in interactive mode; tool calls remain
+visible as compact status rows with completion time. Review findings switch to
+stacked cards on narrow terminals.
 
 ## Configuration
 

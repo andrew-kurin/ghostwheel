@@ -5,11 +5,17 @@ from pathlib import Path
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import FunctionToolResultEvent, RetryPromptPart
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    RetryPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models.test import TestModel
 
 from ghostwheel.config import Settings
-from ghostwheel.events import ToolFailed
+from ghostwheel.events import ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.pydantic_runner import (
     PydanticAgentRunner,
     _failure_kind,
@@ -154,15 +160,44 @@ def test_pydantic_runner_supports_per_run_structured_output() -> None:
     assert isinstance(outcome.output, ReviewResult)
 
 
-def test_runner_emits_failed_tool_results() -> None:
+def test_runner_correlates_tool_events() -> None:
     events: list[object] = []
-    event = FunctionToolResultEvent(
-        RetryPromptPart("outside workspace", tool_name="read")
+    call_id = "call-123"
+
+    asyncio.run(
+        _handle_tool_event(
+            FunctionToolCallEvent(
+                ToolCallPart("read", {"path": "README.md"}, tool_call_id=call_id)
+            ),
+            events.append,
+        )
+    )
+    asyncio.run(
+        _handle_tool_event(
+            FunctionToolResultEvent(
+                ToolReturnPart("read", "contents", tool_call_id=call_id)
+            ),
+            events.append,
+        )
+    )
+    asyncio.run(
+        _handle_tool_event(
+            FunctionToolResultEvent(
+                RetryPromptPart(
+                    "outside workspace",
+                    tool_name="read",
+                    tool_call_id=call_id,
+                )
+            ),
+            events.append,
+        )
     )
 
-    asyncio.run(_handle_tool_event(event, events.append))
-
-    assert events == [ToolFailed("read", "outside workspace")]
+    assert events == [
+        ToolStarted("read", "{'path': 'README.md'}", call_id=call_id),
+        ToolFinished("read", "contents", call_id=call_id),
+        ToolFailed("read", "outside workspace", call_id=call_id),
+    ]
 
 
 def test_pydantic_runner_awaits_async_tools(tmp_path: Path) -> None:

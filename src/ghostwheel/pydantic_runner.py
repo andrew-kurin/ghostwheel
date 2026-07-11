@@ -126,18 +126,36 @@ async def _handle_tool_event(event: Any, sink: EventSink | None) -> None:
     if isinstance(event, FunctionToolCallEvent):
         part = event.part
         if isinstance(part, ToolCallPart):
-            await _emit(sink, ToolStarted(part.tool_name, str(part.args)))
+            await _emit(
+                sink,
+                ToolStarted(
+                    part.tool_name,
+                    str(part.args),
+                    call_id=part.tool_call_id,
+                ),
+            )
     elif isinstance(event, FunctionToolResultEvent):
         # Pydantic AI 1.x called this field ``result``; 2.x renamed it ``part``.
         result = getattr(event, "result", None)
         if result is None:
             result = event.part
         if isinstance(result, ToolReturnPart):
-            await _emit(sink, ToolFinished(result.tool_name, str(result.content)))
+            await _emit(
+                sink,
+                ToolFinished(
+                    result.tool_name,
+                    str(result.content),
+                    call_id=result.tool_call_id,
+                ),
+            )
         elif isinstance(result, RetryPromptPart):
             await _emit(
                 sink,
-                ToolFailed(result.tool_name or "tool", str(result.content)),
+                ToolFailed(
+                    result.tool_name or "tool",
+                    str(result.content),
+                    call_id=result.tool_call_id,
+                ),
             )
 
 
