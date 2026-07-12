@@ -29,7 +29,7 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
-from ghostwheel.app_info import AppInfo, ToolSetInfo
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolSetInfo
 from ghostwheel.cancellation import TurnCancellation
 from ghostwheel.controller import (
     CancellationPort,
@@ -62,6 +62,7 @@ from ghostwheel.runtime_contracts import (
     TurnSucceeded,
 )
 from ghostwheel.terminal_composer import (
+    ComposerWarning,
     PrivateHistory,
     TerminalComposer,
     default_history_path,
@@ -196,7 +197,10 @@ class TerminalUI:
     def welcome(self) -> None:
         heading = Text("Ghostwheel", style="bold magenta")
         details = Text()
-        details.append(f"{self.app_info.provider}/{self.app_info.model}", style="cyan")
+        details.append("chat ", style="dim")
+        self._append_model(details, self.app_info.chat_model)
+        details.append("  ·  review ", style="dim")
+        self._append_model(details, self.app_info.review_model)
         details.append("  ·  ")
         details.append(self.app_info.workspace)
         for label, tool_set in (
@@ -252,15 +256,18 @@ class TerminalUI:
             return await self._redirected_reader.read()
 
         prompt_session = self._composer.get_session(self.input_stream)
+        self._render_composer_warning()
         if self.vim_mode:
             prompt_session.app.vi_state.input_mode = InputMode.INSERT
         self._prompt_active = True
         self._terminal_guard.guard_prompt()
         try:
-            return await prompt_session.prompt_async()
+            value = await prompt_session.prompt_async()
         finally:
             self._prompt_active = False
             self._terminal_guard.restore()
+            self._render_composer_warning()
+        return value
 
     def turn_started(self, label: str = "Thinking…") -> None:
         """Start a bounded Live region only after the inline prompt has closed."""
@@ -269,20 +276,24 @@ class TerminalUI:
             raise RuntimeError("cannot start Rich Live while the prompt is active")
         self._reset_turn(label)
         self._active = True
-        self._terminal_guard.silence()
-        self._turn_uses_live = self.live_enabled
-        if self._turn_uses_live:
-            self._live = Live(
-                self._active_renderable(),
-                console=self.console,
-                refresh_per_second=12,
-                screen=False,
-                transient=True,
-                vertical_overflow="crop",
-            )
-            self._live.start(refresh=True)
-        else:
-            self.console.print(Text(f"\n{label}", style="dim"))
+        try:
+            self._terminal_guard.silence()
+            self._turn_uses_live = self.live_enabled
+            if self._turn_uses_live:
+                self._live = Live(
+                    self._active_renderable(),
+                    console=self.console,
+                    refresh_per_second=12,
+                    screen=False,
+                    transient=True,
+                    vertical_overflow="crop",
+                )
+                self._live.start(refresh=True)
+            else:
+                self.console.print(Text(f"\n{label}", style="dim"))
+        except BaseException:
+            self._reset_turn()
+            raise
 
     def help(self) -> None:
         lines = (
@@ -290,7 +301,7 @@ class TerminalUI:
             ("/review [path]", "review code; defaults to the workspace"),
             ("/retry", "repeat the previous chat or review"),
             ("/clear", "clear model conversation history"),
-            ("/model", "show the active provider and model"),
+            ("/model", "show the active chat and review models"),
             ("/tools", "list available tools and active profiles"),
             ("/quit", "exit Ghostwheel"),
         )
@@ -310,12 +321,15 @@ class TerminalUI:
         self.console.print(Panel(body, title="Commands", border_style="cyan"))
 
     def model_info(self) -> None:
-        self.console.print(
-            Text.assemble(
-                Text("Model  ", style="bold"),
-                Text(f"{self.app_info.provider}/{self.app_info.model}", style="cyan"),
-            )
-        )
+        body = Text("Chat model    ", style="bold")
+        self._append_model(body, self.app_info.chat_model)
+        body.append("\nReview model  ", style="bold")
+        self._append_model(body, self.app_info.review_model)
+        self.console.print(Panel(body, title="Models", border_style="cyan"))
+
+    @staticmethod
+    def _append_model(body: Text, model: ModelInfo) -> None:
+        body.append(f"{model.provider}/{model.model}", style="cyan")
 
     def tools_info(self) -> None:
         body = Text()
@@ -372,60 +386,68 @@ class TerminalUI:
         )
 
     def turn_cancelled(self) -> None:
-        self._finish_activity()
-        if not self._turn_input_monitor.quit_requested:
-            self.console.print(Text("Turn cancelled.", style="yellow"))
-        self._reset_turn()
+        try:
+            self._finish_activity()
+            if not self._turn_input_monitor.quit_requested:
+                self.console.print(Text("Turn cancelled.", style="yellow"))
+        finally:
+            self._reset_turn()
 
     def turn_outcome(self, outcome: TurnOutcome) -> None:
         managed_live = self._active and self._turn_uses_live
-        self._finish_activity()
-        if isinstance(outcome, TurnSucceeded):
-            if managed_live:
-                self.console.print(Text("\nGhostwheel", style="bold magenta"))
-                self.console.print(Markdown(outcome.output))
-            elif not self._turn.answer:
-                self.console.print(
-                    Text("\nGhostwheel\n", style="bold magenta"),
-                    end="",
-                )
-                self.console.print(Text(outcome.output), soft_wrap=True)
-        elif isinstance(outcome, TurnNoResult):
-            self.console.print(Text(outcome.message, style="yellow"))
-        elif isinstance(outcome, TurnFailed):
-            self._render_turn_failure(outcome)
-        self._reset_turn()
+        try:
+            self._finish_activity()
+            if isinstance(outcome, TurnSucceeded):
+                if managed_live:
+                    self.console.print(Text("\nGhostwheel", style="bold magenta"))
+                    self.console.print(Markdown(outcome.output))
+                elif not self._turn.answer:
+                    self.console.print(
+                        Text("\nGhostwheel\n", style="bold magenta"),
+                        end="",
+                    )
+                    self.console.print(Text(outcome.output), soft_wrap=True)
+            elif isinstance(outcome, TurnNoResult):
+                self.console.print(Text(outcome.message, style="yellow"))
+            elif isinstance(outcome, TurnFailed):
+                self._render_turn_failure(outcome)
+        finally:
+            self._reset_turn()
 
     def review_outcome(self, outcome: ReviewOutcome) -> None:
-        self._finish_activity()
-        if isinstance(outcome, StructuredReview):
-            self.console.print("")
-            if outcome.used_fallback:
-                self.console.print(
-                    Text(
-                        "Structured-output fallback was used for this review.",
-                        style="dim",
+        try:
+            self._finish_activity()
+            if isinstance(outcome, StructuredReview):
+                self.console.print("")
+                if outcome.used_fallback:
+                    self.console.print(
+                        Text(
+                            "Structured-output fallback was used for this review.",
+                            style="dim",
+                        )
                     )
+                render_review(outcome.review, self.console)
+            elif isinstance(outcome, RawReview):
+                body = Text()
+                body.append("Couldn't produce a structured review.\n", style="yellow")
+                body.append("Reason: ", style="dim")
+                body.append(outcome.structured_failure, style="dim")
+                body.append("\n\nShowing the raw review instead:\n\n", style="bold")
+                body.append(outcome.prose)
+                self.console.print(
+                    Panel(body, title="Structured Review Failed", border_style="yellow")
                 )
-            render_review(outcome.review, self.console)
-        elif isinstance(outcome, RawReview):
-            body = Text()
-            body.append("Couldn't produce a structured review.\n", style="yellow")
-            body.append("Reason: ", style="dim")
-            body.append(outcome.structured_failure, style="dim")
-            body.append("\n\nShowing the raw review instead:\n\n", style="bold")
-            body.append(outcome.prose)
-            self.console.print(
-                Panel(body, title="Structured Review Failed", border_style="yellow")
-            )
-        elif isinstance(outcome, ReviewFailed):
-            body = Text(outcome.message)
-            body.append(
-                "\n\nCheck the review model configuration, then use /retry.",
-                style="dim",
-            )
-            self.console.print(Panel(body, title="Review Failed", border_style="red"))
-        self._reset_turn()
+            elif isinstance(outcome, ReviewFailed):
+                body = Text(outcome.message)
+                body.append(
+                    "\n\nCheck the review model configuration, then use /retry.",
+                    style="dim",
+                )
+                self.console.print(
+                    Panel(body, title="Review Failed", border_style="red")
+                )
+        finally:
+            self._reset_turn()
 
     @property
     def context_status(self) -> str:
@@ -455,9 +477,38 @@ class TerminalUI:
     def close(self) -> None:
         """Release UI-owned terminal input state and stop any active Live region."""
 
-        self._stop_live()
-        self._terminal_guard.restore()
-        self._composer.close()
+        try:
+            self._stop_live()
+        finally:
+            try:
+                self._terminal_guard.restore()
+            finally:
+                self._composer.close()
+
+    def _render_composer_warning(self) -> None:
+        warning = self._composer.take_warning()
+        if warning is None:
+            return
+        self.console.print(
+            Panel(
+                self._composer_warning_text(warning),
+                title="History Warning",
+                border_style="yellow",
+            )
+        )
+
+    @staticmethod
+    def _composer_warning_text(warning: ComposerWarning) -> Text:
+        body = Text(warning.message, style="yellow")
+        if warning.path is not None:
+            body.append(f"\nPath: {warning.path}", style="dim")
+        if warning.detail:
+            body.append(f"\n{warning.detail}", style="dim")
+        body.append(
+            "\nChoose a writable --history-file path or use --no-history.",
+            style="dim",
+        )
+        return body
 
     def _render_turn_failure(self, outcome: TurnFailed) -> None:
         presentation = failure_presentation(outcome.kind)
@@ -512,13 +563,24 @@ class TerminalUI:
     def _finish_activity(self) -> None:
         if not self._active:
             return
-        self._refresh_live(force=True)
-        self._stop_live()
-        if self._turn_uses_live:
-            for activity in self._turn.tools:
-                self.console.print(self._tool_line(activity))
-        else:
-            self._ensure_stream_line_start()
+        finished = False
+        try:
+            try:
+                self._refresh_live(force=True)
+            finally:
+                self._stop_live()
+            if self._turn_uses_live:
+                for activity in self._turn.tools:
+                    self.console.print(self._tool_line(activity))
+            else:
+                self._ensure_stream_line_start()
+            finished = True
+        finally:
+            # A rendering failure must never leave active-turn raw mode in
+            # place. On success, _reset_turn() restores it after the complete
+            # outcome has rendered, preserving active-turn typeahead handling.
+            if not finished:
+                self._terminal_guard.restore()
 
     def _ensure_stream_line_start(self) -> None:
         """Finish a partial streamed line before rendering another UI element."""
@@ -528,9 +590,10 @@ class TerminalUI:
             self._stream_at_line_start = True
 
     def _stop_live(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+        live = self._live
+        self._live = None
+        if live is not None:
+            live.stop()
 
     def _tool_line(self, activity: ToolActivity) -> Text:
         icon, style = {
@@ -561,13 +624,17 @@ class TerminalUI:
         return line
 
     def _reset_turn(self, label: str = "Thinking…") -> None:
-        self._stop_live()
-        self._terminal_guard.restore()
-        self._active = False
-        self._turn_uses_live = False
-        self._turn.reset(label)
-        self._last_live_update = 0.0
-        self._stream_at_line_start = True
+        try:
+            self._stop_live()
+        finally:
+            try:
+                self._terminal_guard.restore()
+            finally:
+                self._active = False
+                self._turn_uses_live = False
+                self._turn.reset(label)
+                self._last_live_update = 0.0
+                self._stream_at_line_start = True
 
     @contextmanager
     def _capture_turn_input(

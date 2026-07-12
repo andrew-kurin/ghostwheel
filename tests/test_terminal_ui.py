@@ -29,8 +29,10 @@ from prompt_toolkit.keys import Keys
 from rich.console import Console
 
 import ghostwheel.terminal_io as terminal_io
-from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
+import ghostwheel.terminal_ui as terminal_ui_module
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
+from ghostwheel.review import ReviewFailed
 from ghostwheel.runtime_contracts import TurnSucceeded
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
 
@@ -88,8 +90,8 @@ def make_ui(
         app_info=app_info
         or AppInfo(
             str(workspace),
-            "provider",
-            "model",
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
             ToolSetInfo("read-only"),
             ToolSetInfo("read-only"),
         ),
@@ -155,6 +157,81 @@ def read_until(descriptor: int, marker: bytes, timeout: float = 2) -> bytes:
             raise AssertionError(f"child output did not contain {marker!r}: {output!r}")
         output.extend(os.read(descriptor, 4096))
     return bytes(output)
+
+
+def start_fallback_tty_reader(
+    tmp_path: Path,
+    *,
+    controlling: bool = True,
+    no_flush: bool = False,
+) -> tuple[subprocess.Popen[bytes], int, int]:
+    """Start a fallback reader with a real controlling pseudo-terminal."""
+
+    master, slave = os.openpty()
+    child = textwrap.dedent(
+        f"""
+        import asyncio
+        import fcntl
+        import os
+        import sys
+        import termios
+        from io import StringIO
+
+        from rich.console import Console
+
+        from ghostwheel.app_info import AppInfo, ModelInfo, ToolSetInfo
+        from ghostwheel.terminal_ui import TerminalUI
+
+        if {controlling!r}:
+            os.setsid()
+            fcntl.ioctl(sys.stdin.fileno(), termios.TIOCSCTTY, 0)
+        if {no_flush!r}:
+            attributes = termios.tcgetattr(sys.stdin.fileno())
+            attributes[3] |= termios.NOFLSH
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attributes)
+        ui = TerminalUI(
+            Console(file=StringIO()),
+            session=object(),
+            app_info=AppInfo(
+                {str(tmp_path)!r},
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
+            interactive=False,
+            input_stream=sys.stdin,
+            live=False,
+        )
+
+        async def main():
+            asyncio.get_running_loop().call_later(
+                0.05,
+                lambda: os.write(1, b"READY\\n"),
+            )
+            try:
+                value = await ui.read()
+            except EOFError:
+                os.write(1, b"EOF\\n")
+            else:
+                os.write(1, f"VALUE:{{value!r}}\\n".encode())
+            finally:
+                ui.close()
+
+        asyncio.run(main())
+        """
+    )
+    environment = os.environ.copy()
+    environment.update(TERM="dumb", PYTHONUNBUFFERED="1")
+    process = subprocess.Popen(
+        [sys.executable, "-c", child],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+        env=environment,
+    )
+    return process, master, slave
 
 
 def test_prompt_is_inline_mouse_free_and_distinguishes_submit_from_newline(
@@ -646,6 +723,256 @@ def test_stream_input_does_not_initialize_persistent_history(tmp_path: Path) -> 
     assert not history_path.parent.exists()
 
 
+def test_history_write_failure_keeps_prompt_history_in_memory_and_warns_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        history_path = tmp_path / "input-history"
+        output = StringIO()
+        original_open = Path.open
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                output=output,
+                history_path=history_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                live=False,
+            )
+            try:
+                first_prompt = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, first_prompt)
+
+                def deny_history_append(
+                    path: Path,
+                    mode: str = "r",
+                    *args: object,
+                    **kwargs: object,
+                ) -> object:
+                    if path == history_path and "a" in mode:
+                        raise PermissionError("write denied")
+                    return original_open(path, mode, *args, **kwargs)
+
+                monkeypatch.setattr(Path, "open", deny_history_append)
+                pipe_input.send_text("first prompt\r")
+                assert await asyncio.wait_for(first_prompt, 1) == "first prompt"
+
+                history_store = ui._composer.history_store
+                assert history_store is not None
+                assert history_store.path is None
+                assert history_store.entries == ["first prompt"]
+                assert output.getvalue().count("History Warning") == 1
+                assert "using in-memory history" in output.getvalue()
+                assert "write denied" in output.getvalue()
+
+                assert await feed_prompt(ui, pipe_input, "second prompt\r") == (
+                    "second prompt"
+                )
+                assert history_store.entries == ["first prompt", "second prompt"]
+                assert output.getvalue().count("History Warning") == 1
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
+def test_close_restores_terminal_and_closes_composer_when_live_stop_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ThrowingLive:
+        def stop(self) -> None:
+            calls.append("live")
+            raise RuntimeError("stop failed")
+
+    calls: list[str] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui._live = ThrowingLive()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: calls.append("restore"),
+    )
+    monkeypatch.setattr(ui._composer, "close", lambda: calls.append("close"))
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        ui.close()
+
+    assert calls == ["live", "restore", "close"]
+    assert ui._live is None
+
+
+def test_reset_turn_restores_terminal_and_state_when_live_stop_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ThrowingLive:
+        def stop(self) -> None:
+            raise RuntimeError("stop failed")
+
+    restored: list[bool] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui._active = True
+    ui._turn_uses_live = True
+    ui._turn.answer = "stale"
+    ui._live = ThrowingLive()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: restored.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        ui._reset_turn("Ready")
+
+    assert restored == [True]
+    assert ui._active is False
+    assert ui._turn_uses_live is False
+    assert ui._turn.status == "Ready"
+    assert ui._turn.answer == ""
+    assert ui._live is None
+
+
+@pytest.mark.parametrize("failure", ["live", "output"])
+def test_finish_activity_restores_terminal_on_rendering_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    class ThrowingLive:
+        def update(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def stop(self) -> None:
+            if failure == "live":
+                raise RuntimeError("render failed")
+
+    restored: list[bool] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui._active = True
+    ui._turn_uses_live = failure == "live"
+    ui._live = ThrowingLive() if failure == "live" else None  # type: ignore[assignment]
+    ui._stream_at_line_start = failure != "output"
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: restored.append(True),
+    )
+    if failure == "output":
+
+        def fail_output(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("render failed")
+
+        monkeypatch.setattr(ui.console, "print", fail_output)
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        ui._finish_activity()
+
+    assert restored == [True]
+    assert ui._live is None
+
+
+def test_finish_activity_keeps_turn_input_guarded_until_success_is_rendered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    restored: list[bool] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui._active = True
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: restored.append(True),
+    )
+
+    ui._finish_activity()
+
+    assert restored == []
+
+
+@pytest.mark.parametrize("failure", ["live", "output"])
+def test_turn_started_rolls_back_terminal_state_on_presentation_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    class ThrowingLive:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self, *, refresh: bool) -> None:
+            assert refresh is True
+            raise RuntimeError("start failed")
+
+        def stop(self) -> None:
+            pass
+
+    calls: list[str] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui.live_enabled = failure == "live"
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "silence",
+        lambda: calls.append("silence"),
+    )
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: calls.append("restore"),
+    )
+    if failure == "live":
+        monkeypatch.setattr(terminal_ui_module, "Live", ThrowingLive)
+    else:
+
+        def fail_output(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("start failed")
+
+        monkeypatch.setattr(ui.console, "print", fail_output)
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        ui.turn_started()
+
+    assert calls == ["restore", "silence", "restore"]
+    assert ui._active is False
+    assert ui._turn_uses_live is False
+    assert ui._live is None
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "chat", "review"])
+def test_outcome_rendering_failure_resets_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    restored: list[bool] = []
+    ui = make_ui(workspace=tmp_path, interactive=False, live=False)
+    ui._active = True
+    monkeypatch.setattr(
+        ui._terminal_guard,
+        "restore",
+        lambda: restored.append(True),
+    )
+
+    def fail_output(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("outcome failed")
+
+    monkeypatch.setattr(ui.console, "print", fail_output)
+
+    with pytest.raises(RuntimeError, match="outcome failed"):
+        if outcome == "cancelled":
+            ui.turn_cancelled()
+        elif outcome == "chat":
+            ui.turn_outcome(TurnSucceeded("answer", ()))
+        else:
+            ui.review_outcome(ReviewFailed("review failed"))
+
+    assert restored == [True]
+    assert ui._active is False
+    assert ui._turn_uses_live is False
+
+
 def test_private_history_round_trips_multiline_entries(tmp_path: Path) -> None:
     history_path = tmp_path / "state" / "ghostwheel" / "history"
     ui = make_ui(
@@ -934,7 +1261,7 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo, ToolSetInfo
+        from ghostwheel.app_info import AppInfo, ModelInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
@@ -942,8 +1269,8 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
             session=object(),
             app_info=AppInfo(
                 {str(tmp_path)!r},
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),
@@ -994,6 +1321,69 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
             process.stderr.close()
 
 
+def test_fallback_tty_ctrl_d_discards_draft_and_quits_immediately(
+    tmp_path: Path,
+) -> None:
+    process, master, slave = start_fallback_tty_reader(tmp_path)
+
+    try:
+        read_until(master, b"READY")
+        os.write(master, b"discard this\x04")
+        output = read_until(master, b"EOF")
+        assert b"VALUE:" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_fallback_tty_ctrl_c_clears_draft_without_exiting(tmp_path: Path) -> None:
+    process, master, slave = start_fallback_tty_reader(tmp_path, no_flush=True)
+
+    try:
+        read_until(master, b"READY")
+        # Replacement input can already be queued when Python handles SIGINT;
+        # clearing the draft must not flush bytes following Ctrl+C.
+        os.write(master, b"discard this\x03keep this\n")
+        output = read_until(master, b"VALUE:'keep this'")
+        assert b"VALUE:'discard this" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_fallback_tty_sigterm_restores_inherited_no_flush(tmp_path: Path) -> None:
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        controlling=False,
+        no_flush=True,
+    )
+
+    try:
+        read_until(master, b"READY")
+        active_flags = termios.tcgetattr(slave)[3]
+        assert not active_flags & termios.NOFLSH
+
+        process.send_signal(signal.SIGTERM)
+
+        assert process.wait(timeout=2) == -signal.SIGTERM
+        restored_flags = termios.tcgetattr(slave)[3]
+        assert restored_flags & termios.NOFLSH
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
 def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
     master, slave = os.openpty()
     local_flags = 3
@@ -1009,7 +1399,7 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo, ToolSetInfo
+        from ghostwheel.app_info import AppInfo, ModelInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
@@ -1017,8 +1407,8 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
             session=object(),
             app_info=AppInfo(
                 {str(tmp_path)!r},
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),
@@ -1081,7 +1471,7 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo, ToolSetInfo
+        from ghostwheel.app_info import AppInfo, ModelInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
@@ -1089,8 +1479,8 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
             session=object(),
             app_info=AppInfo(
                 {str(tmp_path)!r},
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),
@@ -1325,8 +1715,8 @@ def test_tools_info_lists_mixed_chat_and_review_capabilities(tmp_path: Path) -> 
         workspace=tmp_path,
         app_info=AppInfo(
             str(tmp_path),
-            "provider",
-            "model",
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
             ToolSetInfo("read-only", chat_tools),
             ToolSetInfo("full", review_tools, True),
         ),
@@ -1357,8 +1747,8 @@ def test_welcome_labels_mixed_chat_and_review_profiles(tmp_path: Path) -> None:
         workspace=tmp_path,
         app_info=AppInfo(
             str(tmp_path),
-            "provider",
-            "model",
+            ModelInfo("chat-provider", "chat-model"),
+            ModelInfo("review-provider", "review-model"),
             ToolSetInfo("read-only"),
             ToolSetInfo("full", has_shell_access=True),
         ),
@@ -1371,8 +1761,34 @@ def test_welcome_labels_mixed_chat_and_review_profiles(tmp_path: Path) -> None:
     ui.welcome()
 
     rendered = output.getvalue()
+    assert "chat chat-provider/chat-model" in rendered
+    assert "review review-provider/review-model" in rendered
     assert "chat READ-ONLY" in rendered
-    assert "review FULL (unrestricted shell)" in rendered
+    assert "review FULL" in rendered
+    assert "(unrestricted shell)" in rendered
+
+
+def test_model_info_lists_distinct_chat_and_review_models(tmp_path: Path) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        app_info=AppInfo(
+            str(tmp_path),
+            ModelInfo("chat-provider", "chat-model"),
+            ModelInfo("review-provider", "review-model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
+        output=output,
+        interactive=False,
+        live=False,
+    )
+
+    ui.model_info()
+
+    rendered = output.getvalue()
+    assert "Chat model    chat-provider/chat-model" in rendered
+    assert "Review model  review-provider/review-model" in rendered
 
 
 def test_tools_info_handles_a_profile_with_no_tools(tmp_path: Path) -> None:

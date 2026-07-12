@@ -9,14 +9,13 @@ and path completion, editor key bindings, and construction of the inline
 
 from __future__ import annotations
 
-import ctypes
 import datetime as dt
 import os
 import sys
 from collections.abc import Callable, Iterable
-from functools import lru_cache
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import (
@@ -48,37 +47,6 @@ from prompt_toolkit.styles import Style
 from ghostwheel.controller import COMMANDS
 
 _XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
-_MACOS_SHIFT_FLAG = 0x0002_0000
-_MACOS_COMBINED_SESSION_STATE = 0
-_CORE_GRAPHICS_PATH = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
-
-
-@lru_cache(maxsize=1)
-def _macos_flags_reader() -> tuple[ctypes.CDLL, Any] | None:
-    if sys.platform != "darwin":
-        return None
-    try:
-        library = ctypes.CDLL(_CORE_GRAPHICS_PATH)
-        reader = library.CGEventSourceFlagsState
-        reader.argtypes = [ctypes.c_int]
-        reader.restype = ctypes.c_uint64
-    except AttributeError, OSError:
-        return None
-    return library, reader
-
-
-def _macos_shift_pressed() -> bool:
-    """Recover Shift state when macOS terminal input contains a bare Enter."""
-
-    resolved = _macos_flags_reader()
-    if resolved is None:
-        return False
-    _library, reader = resolved
-    try:
-        flags = int(reader(_MACOS_COMBINED_SESSION_STATE))
-    except OSError, TypeError, ValueError:
-        return False
-    return bool(flags & _MACOS_SHIFT_FLAG)
 
 
 def default_history_path() -> Path:
@@ -89,14 +57,34 @@ def default_history_path() -> Path:
     return base / "ghostwheel" / "input-history"
 
 
+@dataclass(frozen=True, slots=True)
+class ComposerWarning:
+    """A recoverable composer problem suitable for rendering by the UI."""
+
+    code: str
+    message: str
+    path: Path | None = None
+    detail: str | None = None
+
+
 class InputHistory:
     """Private prompt history compatible with prompt_toolkit's file format."""
 
-    def __init__(self, path: Path | None) -> None:
+    def __init__(
+        self,
+        path: Path | None,
+        *,
+        on_error: Callable[[Path, OSError], None] | None = None,
+    ) -> None:
         self.path = path.expanduser() if path is not None else None
-        self.entries = self._load()
-        if self.path is not None:
-            self._ensure_file()
+        self._on_error = on_error
+        self.entries: list[str] = []
+        try:
+            self.entries = self._load()
+            if self.path is not None:
+                self._ensure_file()
+        except OSError as error:
+            self._disable_persistence(error)
 
     def append(self, value: str) -> None:
         if not value.strip():
@@ -104,11 +92,14 @@ class InputHistory:
         self.entries.append(value)
         if self.path is None:
             return
-        self._ensure_file()
-        with self.path.open("a", encoding="utf-8") as history_file:
-            history_file.write(f"\n# {dt.datetime.now().isoformat()}\n")
-            for line in value.split("\n"):
-                history_file.write(f"+{line}\n")
+        try:
+            self._ensure_file()
+            with self.path.open("a", encoding="utf-8") as history_file:
+                history_file.write(f"\n# {dt.datetime.now().isoformat()}\n")
+                for line in value.split("\n"):
+                    history_file.write(f"+{line}\n")
+        except OSError as error:
+            self._disable_persistence(error)
 
     def _load(self) -> list[str]:
         if self.path is None or not self.path.exists():
@@ -138,6 +129,14 @@ class InputHistory:
         )
         os.close(descriptor)
         self.path.chmod(0o600)
+
+    def _disable_persistence(self, error: OSError) -> None:
+        path = self.path
+        if path is None:
+            return
+        self.path = None
+        if self._on_error is not None:
+            self._on_error(path, error)
 
 
 class PrivateHistory(History):
@@ -222,7 +221,7 @@ def _key_bindings() -> KeyBindings:
     @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
     def _submit_or_modified_shift_enter(event: KeyPressEvent) -> None:
         data = event.key_sequence[-1].data
-        if data == _XTERM_SHIFT_ENTER or (data == "\r" and _macos_shift_pressed()):
+        if data == _XTERM_SHIFT_ENTER:
             event.current_buffer.insert_text("\n")
         else:
             event.current_buffer.validate_and_handle()
@@ -319,14 +318,41 @@ class TerminalComposer:
         self.completer = GhostwheelCompleter(workspace)
         self.owned_input: Input | None = None
         self.session: PromptSession[str] | None = None
+        self._warning: ComposerWarning | None = None
 
     def get_history(self) -> PrivateHistory:
         """Initialize persistent history only when the composer needs it."""
 
         if self.history is None:
-            self.history_store = InputHistory(self.history_path)
+            self.history_store = InputHistory(
+                self.history_path,
+                on_error=self._record_history_error,
+            )
             self.history = PrivateHistory(self.history_store)
         return self.history
+
+    def take_warning(self) -> ComposerWarning | None:
+        """Return and consume the pending recoverable warning, if any.
+
+        History failures disable persistence for the rest of this composer, so
+        each failure is surfaced at most once. Callers can invoke this after
+        session creation and after prompt completion to render late write
+        failures without coupling presentation to the history implementation.
+        """
+
+        warning = self._warning
+        self._warning = None
+        return warning
+
+    def _record_history_error(self, path: Path, error: OSError) -> None:
+        if self._warning is not None:
+            return
+        self._warning = ComposerWarning(
+            code="history_unavailable",
+            message="Prompt history is unavailable; using in-memory history.",
+            path=path,
+            detail=str(error),
+        )
 
     def get_session(self, input_stream: TextIO) -> PromptSession[str]:
         if self.session is None:

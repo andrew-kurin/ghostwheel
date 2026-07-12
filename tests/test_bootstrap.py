@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import ghostwheel.bootstrap as bootstrap_module
-from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.bootstrap import Runtime, build_runtime
 from ghostwheel.config import Settings
 from ghostwheel.review import ReviewService
@@ -22,8 +22,14 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
         assert runtime.tool_deps.cwd == tmp_path.resolve()
         assert runtime.tool_deps.limits is config.tools.limits
         assert runtime.app_info.workspace == str(tmp_path.resolve())
-        assert runtime.app_info.provider == config.chat_model.provider.value
-        assert runtime.app_info.model == config.chat_model.model
+        assert runtime.app_info.chat_model == ModelInfo(
+            config.chat_model.provider.value,
+            config.chat_model.model,
+        )
+        assert runtime.app_info.review_model == ModelInfo(
+            config.review.model.provider.value,
+            config.review.model.model,
+        )
         assert runtime.app_info.chat_tools.profile == config.tools.profile.value
         assert runtime.app_info.chat_tools.tools == (
             ToolInfo(
@@ -84,6 +90,26 @@ def test_build_runtime_reports_tools_from_the_active_custom_catalog(tmp_path) ->
         runtime.close()
 
 
+def test_build_runtime_reports_distinct_chat_and_review_models(tmp_path) -> None:
+    config = Settings(
+        model_provider="ollama",
+        model="chat-model",
+        review_provider="llama-cpp",
+        review_model="review-model",
+        _env_file=None,
+    ).resolve()
+
+    runtime = build_runtime(config, cwd=tmp_path)
+    try:
+        assert runtime.app_info.chat_model == ModelInfo("ollama", "chat-model")
+        assert runtime.app_info.review_model == ModelInfo(
+            "llama-cpp",
+            "review-model",
+        )
+    finally:
+        runtime.close()
+
+
 def test_build_runtime_accepts_a_tool_without_a_description(tmp_path) -> None:
     def inspect(path: str) -> str:
         return path
@@ -134,8 +160,8 @@ def test_runtime_async_context_owns_agent_and_tool_lifetimes() -> None:
         tool_deps=deps,  # type: ignore[arg-type]
         app_info=AppInfo(
             ".",
-            "provider",
-            "model",
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
             ToolSetInfo("read-only"),
             ToolSetInfo("read-only"),
         ),
@@ -187,8 +213,8 @@ def test_runtime_rejects_a_concurrent_enter_before_entry_finishes() -> None:
             tool_deps=deps,  # type: ignore[arg-type]
             app_info=AppInfo(
                 ".",
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),
@@ -245,8 +271,8 @@ def test_runtime_close_waits_for_an_in_progress_enter() -> None:
             tool_deps=deps,  # type: ignore[arg-type]
             app_info=AppInfo(
                 ".",
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),
@@ -352,8 +378,8 @@ def test_cancelling_close_owner_does_not_cancel_shared_teardown() -> None:
             tool_deps=deps,  # type: ignore[arg-type]
             app_info=AppInfo(
                 ".",
-                "provider",
-                "model",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
                 ToolSetInfo("read-only"),
                 ToolSetInfo("read-only"),
             ),

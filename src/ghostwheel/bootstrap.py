@@ -22,7 +22,7 @@ from ghostwheel.agent_factory import (
     review_fallback_agent_blueprint,
 )
 from ghostwheel.agent_blueprint import AgentBlueprint
-from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.compaction import HistoryCompactor
 from ghostwheel.config import AppConfig
 from ghostwheel.event_dispatcher import EventSink, deliver_event
@@ -334,8 +334,14 @@ def build_runtime(
         review_blueprint = review_agent_blueprint(config, catalog=catalog)
         app_info = AppInfo(
             workspace=str(deps.cwd),
-            provider=config.chat_model.provider.value,
-            model=config.chat_model.model,
+            chat_model=ModelInfo(
+                provider=config.chat_model.provider.value,
+                model=config.chat_model.model,
+            ),
+            review_model=ModelInfo(
+                provider=config.review.model.provider.value,
+                model=config.review.model.model,
+            ),
             chat_tools=_tool_set_info(
                 chat_blueprint,
                 profile=config.tools.profile.value,

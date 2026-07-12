@@ -50,18 +50,19 @@ Run `uv run ghostwheel --help` for all command-line options.
 
 The interactive prompt-toolkit composer supports multiline editing, command and
 review-path completion, and prompt history. Enter submits and Shift+Enter
-inserts a newline. Ghostwheel recognizes the physical Shift modifier on macOS,
-LF emitted by a terminal mapping, and xterm's modified-Enter sequence. Other
-terminals may need a Shift+Enter-to-LF mapping.
+inserts a newline. Ghostwheel recognizes LF emitted by a terminal mapping and
+xterm's modified-Enter sequence. Terminals that send ordinary Enter for this
+shortcut need a Shift+Enter-to-LF mapping.
 
 When the interactive composer is active, prompt history is stored in
 `$XDG_STATE_HOME/ghostwheel/input-history` (or
 `~/.local/state/ghostwheel/input-history`); use `--no-history` to keep it only in
 memory or `--history-file PATH` to choose another location. These history
 options do not apply to line-oriented input. History contains prompts in plain
-text, so disable it when prompts may contain secrets. Model conversation
-history and rolling summaries are memory-only and disappear when Ghostwheel
-exits.
+text, so disable it when prompts may contain secrets. If the history file
+cannot be read or written, Ghostwheel warns once and continues with in-memory
+history. Model conversation history and rolling summaries are memory-only and
+disappear when Ghostwheel exits.
 
 Vim-style prompt editing is enabled by default through prompt-toolkit. Each
 prompt starts in Insert mode; Escape switches to Normal mode, and the
@@ -74,7 +75,7 @@ In the chat prompt:
 - Use `/review path/to/file.py` to run a focused code review.
 - Use `/clear` to reset conversation history.
 - Use `/retry` to repeat the previous chat or review.
-- Use `/model`, `/tools`, or `/help` for runtime information.
+- Use `/model` for both active models, `/tools` for tool profiles, or `/help`.
 - Use `/quit` to exit.
 
 During an active turn, Esc cancels and returns to the composer. Ctrl+C clears

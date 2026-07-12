@@ -45,10 +45,12 @@ class RawTerminalGuard:
         *,
         externally_managed_input: bool,
         is_active: Callable[[], bool],
+        flush_input_on_restore: bool = True,
     ) -> None:
         self._input_stream = input_stream
         self._externally_managed_input = externally_managed_input
         self._is_active = is_active
+        self._flush_input_on_restore = flush_input_on_restore
         self._descriptor: int | None = None
         self._attributes: list[object] | None = None
         self._signal_handlers: dict[int, object] = {}
@@ -89,6 +91,30 @@ class RawTerminalGuard:
         self._descriptor = descriptor
         self._attributes = attributes
 
+    def clear_local_flags(self, flags: int) -> bool:
+        """Temporarily clear tty local flags with signal-safe restoration."""
+
+        if self._externally_managed_input or self._attributes is not None:
+            return False
+        terminal = self._terminal_attributes()
+        if terminal is None:
+            return False
+        descriptor, attributes = terminal
+        updated_attributes = attributes.copy()
+        updated_attributes[_TERMIOS_LOCAL_FLAGS] &= ~flags
+        if updated_attributes == attributes:
+            return True
+        if not self._install_signal_handlers():
+            return False
+        self._descriptor = descriptor
+        self._attributes = attributes
+        try:
+            termios.tcsetattr(descriptor, termios.TCSANOW, updated_attributes)
+        except OSError, termios.error:
+            self.restore()
+            return False
+        return True
+
     def restore(self) -> None:
         """Restore saved tty attributes and process signal handlers."""
 
@@ -97,10 +123,11 @@ class RawTerminalGuard:
         self._descriptor = None
         self._attributes = None
         if descriptor is not None and attributes is not None:
-            try:
-                termios.tcflush(descriptor, termios.TCIFLUSH)
-            except OSError, termios.error:
-                pass
+            if self._flush_input_on_restore:
+                try:
+                    termios.tcflush(descriptor, termios.TCIFLUSH)
+                except OSError, termios.error:
+                    pass
             try:
                 termios.tcsetattr(descriptor, termios.TCSANOW, attributes)
             except OSError, termios.error:
@@ -307,12 +334,25 @@ class ActiveTurnInputMonitor:
 
 
 class RedirectedLineReader:
-    """Read redirected lines asynchronously without worker-thread leakage."""
+    """Read stream or cooked-terminal lines without worker-thread leakage.
+
+    A fallback TTY deliberately remains in canonical mode so the kernel keeps
+    providing the user's normal line editing.  Its EOF delimiter is handled
+    as an unconditional quit, and its interrupt character clears the pending
+    kernel line without propagating ``KeyboardInterrupt``.
+    """
 
     def __init__(self, input_stream: TextIO) -> None:
         self._input_stream = input_stream
         self._buffer = bytearray()
         self._eof = False
+        self._terminal_read_active = False
+        self._terminal_guard = RawTerminalGuard(
+            input_stream,
+            externally_managed_input=False,
+            is_active=lambda: self._terminal_read_active,
+            flush_input_on_restore=False,
+        )
 
     async def read(self) -> str:
         try:
@@ -322,6 +362,8 @@ class RedirectedLineReader:
             return self._read_synchronously()
         if stat.S_ISREG(descriptor_mode):
             return self._read_synchronously()
+        if os.isatty(descriptor):
+            return await self._read_terminal_line(descriptor)
 
         while b"\n" not in self._buffer and not self._eof:
             chunk = await self._read_ready_chunk(descriptor)
@@ -343,6 +385,71 @@ class RedirectedLineReader:
         encoding = getattr(self._input_stream, "encoding", None) or "utf-8"
         errors = getattr(self._input_stream, "errors", None) or "strict"
         return raw_value.decode(encoding, errors).rstrip("\r\n")
+
+    async def _read_terminal_line(self, descriptor: int) -> str:
+        self._terminal_read_active = True
+        try:
+            if not self._terminal_guard.clear_local_flags(termios.NOFLSH):
+                raise RuntimeError("fallback terminal input could not guard tty state")
+            while True:
+                try:
+                    raw_value = await self._read_terminal_chunk(descriptor)
+                except _TerminalLineCleared:
+                    continue
+
+                # In canonical mode a read which does not end in a line delimiter
+                # was released by VEOF.  Discard any pending draft so one Ctrl+D
+                # always means quit, even when the kernel line buffer was nonempty.
+                if not raw_value or not raw_value.endswith((b"\n", b"\r")):
+                    raise EOFError
+
+                encoding = getattr(self._input_stream, "encoding", None) or "utf-8"
+                errors = getattr(self._input_stream, "errors", None) or "strict"
+                return raw_value.decode(encoding, errors).rstrip("\r\n")
+        finally:
+            self._terminal_read_active = False
+            self._terminal_guard.restore()
+
+    async def _read_terminal_chunk(self, descriptor: int) -> bytes:
+        loop = asyncio.get_running_loop()
+        readable: asyncio.Future[bytes] = loop.create_future()
+
+        def clear_pending_line(_signum: int, _frame: FrameType | None) -> None:
+            if not readable.done():
+                readable.set_exception(_TerminalLineCleared())
+
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        try:
+            signal.signal(signal.SIGINT, clear_pending_line)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(
+                "fallback terminal input must run on the main thread"
+            ) from error
+
+        def read_ready() -> None:
+            if readable.done():
+                return
+            try:
+                chunk = os.read(descriptor, 65_536)
+            except BlockingIOError:
+                return
+            except OSError as error:
+                readable.set_exception(error)
+            else:
+                readable.set_result(chunk)
+
+        try:
+            loop.add_reader(descriptor, read_ready)
+        except (NotImplementedError, OSError) as error:
+            signal.signal(signal.SIGINT, previous_sigint)
+            raise RuntimeError(
+                "fallback terminal input requires a pollable POSIX file descriptor"
+            ) from error
+        try:
+            return await readable
+        finally:
+            loop.remove_reader(descriptor)
+            signal.signal(signal.SIGINT, previous_sigint)
 
     async def _read_ready_chunk(self, descriptor: int) -> bytes:
         loop = asyncio.get_running_loop()
@@ -376,3 +483,7 @@ class RedirectedLineReader:
         if value == "":
             raise EOFError
         return value.rstrip("\r\n")
+
+
+class _TerminalLineCleared(Exception):
+    """Internal wakeup used when Ctrl+C clears a fallback terminal line."""
