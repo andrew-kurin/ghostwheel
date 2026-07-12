@@ -11,8 +11,9 @@ from ghostwheel.tools.workspace import Workspace
 class ToolLimits:
     """Resource limits shared by all tool implementations.
 
-    ``max_output_bytes`` bounds retained variable payload. The small structured
-    result envelope and field names are not counted against that value.
+    ``max_output_bytes`` bounds complete compact model text for ``ls`` and
+    ``grep``. For other tools it bounds retained variable payload; their small
+    structured result envelope and field names are additional.
     """
 
     max_output_bytes: int = 100_000
@@ -21,7 +22,9 @@ class ToolLimits:
     max_matches: int = 200
     bash_timeout_seconds: float = 30
     max_search_file_bytes: int = 5_000_000
+    max_search_total_bytes: int = 50_000_000
     max_search_files: int = 10_000
+    search_timeout_seconds: float = 5.0
     regex_timeout_seconds: float = 0.05
 
     def __post_init__(self) -> None:
@@ -32,7 +35,9 @@ class ToolLimits:
             "max_matches": self.max_matches,
             "bash_timeout_seconds": self.bash_timeout_seconds,
             "max_search_file_bytes": self.max_search_file_bytes,
+            "max_search_total_bytes": self.max_search_total_bytes,
             "max_search_files": self.max_search_files,
+            "search_timeout_seconds": self.search_timeout_seconds,
             "regex_timeout_seconds": self.regex_timeout_seconds,
         }
         for name, value in positive_values.items():
@@ -66,7 +71,9 @@ class ToolDeps:
         max_directory_scan_entries: int | None = None,
         max_matches: int | None = None,
         max_search_file_bytes: int | None = None,
+        max_search_total_bytes: int | None = None,
         max_search_files: int | None = None,
+        search_timeout_seconds: float | None = None,
         regex_timeout_seconds: float | None = None,
         allowed_roots: Iterable[Path | str] | None = None,
         workspace: Workspace | None = None,
@@ -95,7 +102,9 @@ class ToolDeps:
             max_matches,
             bash_timeout_seconds,
             max_search_file_bytes,
+            max_search_total_bytes,
             max_search_files,
+            search_timeout_seconds,
             regex_timeout_seconds,
         )
         if limits is not None and any(value is not None for value in scalar_limits):
@@ -120,8 +129,16 @@ class ToolDeps:
                     if max_search_file_bytes is None
                     else max_search_file_bytes
                 ),
+                max_search_total_bytes=(
+                    50_000_000
+                    if max_search_total_bytes is None
+                    else max_search_total_bytes
+                ),
                 max_search_files=(
                     10_000 if max_search_files is None else max_search_files
+                ),
+                search_timeout_seconds=(
+                    5.0 if search_timeout_seconds is None else search_timeout_seconds
                 ),
                 regex_timeout_seconds=(
                     0.05 if regex_timeout_seconds is None else regex_timeout_seconds
@@ -161,6 +178,14 @@ class ToolDeps:
     @property
     def max_matches(self) -> int:
         return self.limits.max_matches
+
+    @property
+    def max_search_total_bytes(self) -> int:
+        return self.limits.max_search_total_bytes
+
+    @property
+    def search_timeout_seconds(self) -> float:
+        return self.limits.search_timeout_seconds
 
     @property
     def bash_timeout_seconds(self) -> float:

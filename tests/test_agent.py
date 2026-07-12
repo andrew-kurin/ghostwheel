@@ -27,6 +27,7 @@ from ghostwheel.tools.bash import bash
 from ghostwheel.tools.command import CommandResult
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.tools.filesystem import DirectoryListing, ls
+from ghostwheel.tools.search import GrepResult, grep
 
 
 class FakeResult:
@@ -129,7 +130,9 @@ def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
         max_matches=5,
         bash_timeout_seconds=6,
         max_search_file_bytes=7,
+        max_search_total_bytes=70,
         max_search_files=8,
+        search_timeout_seconds=1.5,
         regex_timeout_seconds=0.2,
         _env_file=None,
     ).resolve()
@@ -144,7 +147,9 @@ def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
     assert deps.limits.max_matches == 5
     assert deps.limits.bash_timeout_seconds == 6
     assert deps.limits.max_search_file_bytes == 7
+    assert deps.limits.max_search_total_bytes == 70
     assert deps.limits.max_search_files == 8
+    assert deps.limits.search_timeout_seconds == 1.5
     assert deps.limits.regex_timeout_seconds == 0.2
 
 
@@ -270,6 +275,56 @@ def test_ls_sends_compact_text_and_retains_structured_metadata(tmp_path: Path) -
     )
     assert isinstance(tool_returns[0].metadata, DirectoryListing)
     assert [entry.name for entry in tool_returns[0].metadata.entries] == ["value.txt"]
+
+
+def test_grep_sends_compact_text_and_retains_structured_metadata(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "value.txt").write_text("a value\n", encoding="utf-8")
+    agent = Agent(
+        TestModel(call_tools=["grep"]),
+        deps_type=ToolDeps,
+        tools=(grep,),
+    )
+    deps = ToolDeps(cwd=tmp_path)
+
+    try:
+        outcome = asyncio.run(
+            PydanticAgentRunner(agent, deps).run("inspect", (), output_type=str)
+        )
+    finally:
+        deps.close()
+
+    assert isinstance(outcome, TurnSucceeded)
+    tool_returns = [
+        part
+        for message in outcome.new_messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    assert isinstance(tool_returns[0].content, str)
+    assert tool_returns[0].content.startswith(
+        'grep "." returned=1 scanned=1 searched=1 file_skipped=0 bytes=8 '
+        "complete=true reasons=-"
+    )
+    assert '\nf "value.txt"\n1:1 "a value"' in tool_returns[0].content
+    assert '"matches":' not in tool_returns[0].content
+    assert isinstance(tool_returns[0].metadata, GrepResult)
+    assert [match.file for match in tool_returns[0].metadata.matches] == ["value.txt"]
+
+    function_schema = agent._function_toolset.tools["grep"].function_schema
+    properties = function_schema.json_schema["properties"]
+    assert {
+        "literal",
+        "limit",
+        "cursor",
+        "show_hidden",
+        "include_noise",
+    } <= properties.keys()
+    assert properties["pattern"]["maxLength"] == 10_000
+    assert properties["file_glob"]["maxLength"] == 4_096
+    assert function_schema.return_schema == {"type": "string"}
 
 
 def test_runner_only_classifies_structured_output_failures_for_fallback() -> None:

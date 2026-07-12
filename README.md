@@ -172,7 +172,9 @@ GHOSTWHEEL_MAX_DIRECTORY_SCAN_ENTRIES=10000
 GHOSTWHEEL_MAX_MATCHES=200
 GHOSTWHEEL_BASH_TIMEOUT_SECONDS=30
 GHOSTWHEEL_MAX_SEARCH_FILE_BYTES=5000000
+GHOSTWHEEL_MAX_SEARCH_TOTAL_BYTES=50000000
 GHOSTWHEEL_MAX_SEARCH_FILES=10000
+GHOSTWHEEL_SEARCH_TIMEOUT_SECONDS=5.0
 GHOSTWHEEL_REGEX_TIMEOUT_SECONDS=0.05
 
 # full, read-only, or shell-only
@@ -202,6 +204,31 @@ the requested tree. Listings report why they are incomplete and omit a
 continuation cursor after scan or entry errors; a scan-limited subset is sorted
 but cannot guarantee complete deterministic membership.
 
+`grep` searches UTF-8 text one line at a time using the Python `regex` package,
+or exact text when `literal=true`. It returns each matching line once at the
+first match, grouped under an ASCII JSON-escaped file path as
+`LINE:COLUMN[~] JSON_SNIPPET`; `~` marks a match-centered snippet elided from a
+long line. Directory searches accept a recursive relative `file_glob`, are case
+sensitive by default, and omit hidden entries plus `.git`, `.venv`,
+`__pycache__`, and `node_modules` unless requested. Callers can also select
+case-insensitive or literal matching, include hidden/noise paths, set a smaller
+page limit, and continue an unchanged result set with its cursor.
+Continuations are stateless: each page reruns the bounded search and verifies
+that its result snapshot is unchanged before applying the cursor.
+
+The `grep` header reports scanned entries, searched and skipped files, bytes
+inspected, completeness, and explicit reasons for incomplete results. Binary,
+invalid UTF-8, oversized, and inaccessible files are skipped rather than searched
+lossily. `GHOSTWHEEL_MAX_SEARCH_FILE_BYTES` caps each file;
+`GHOSTWHEEL_MAX_SEARCH_TOTAL_BYTES` caps cumulative bytes per call;
+`GHOSTWHEEL_MAX_SEARCH_FILES` caps eligible files; and
+`GHOSTWHEEL_SEARCH_TIMEOUT_SECONDS` sets a cooperative deadline checked across
+the complete search.
+`GHOSTWHEEL_REGEX_TIMEOUT_SECONDS` separately bounds each line-oriented regex
+operation. `GHOSTWHEEL_MAX_MATCHES` caps collected matching lines and the maximum
+page size, while `GHOSTWHEEL_MAX_DIRECTORY_SCAN_ENTRIES` bounds traversal shared
+with `ls`.
+
 Chat history uses rolling summaries rather than a turn-count limit. Before each
 new chat request, Ghostwheel projects context usage including the pending prompt.
 When that projection exceeds `context window - reserve tokens`, older messages
@@ -230,8 +257,9 @@ rolling chunks. Review transcripts do not enter chat history. Set
 turn-count limit is applied, but Ghostwheel will no longer trim growing context,
 so the provider may reject or truncate oversized requests.
 
-`GHOSTWHEEL_MAX_OUTPUT_BYTES` limits retained variable payload (file content,
-matches, and process streams); the small structured result envelope is additional.
+`GHOSTWHEEL_MAX_OUTPUT_BYTES` caps the complete compact text that `ls` and `grep`
+send to the model. For structured file-read and process results it caps retained
+variable payload; their small result envelope is additional.
 
 ## Observability
 

@@ -124,7 +124,9 @@ def create_tool_deps(config: AppConfig, cwd: Path | None = None) -> ToolDeps:
             max_matches=config.tools.max_matches,
             bash_timeout_seconds=config.tools.bash_timeout_seconds,
             max_search_file_bytes=config.tools.max_search_file_bytes,
+            max_search_total_bytes=config.tools.max_search_total_bytes,
             max_search_files=config.tools.max_search_files,
+            search_timeout_seconds=config.tools.search_timeout_seconds,
             regex_timeout_seconds=config.tools.regex_timeout_seconds,
         ),
     )

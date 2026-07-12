@@ -25,7 +25,9 @@ class ToolConfig:
     max_matches: int
     bash_timeout_seconds: int
     max_search_file_bytes: int
+    max_search_total_bytes: int
     max_search_files: int
+    search_timeout_seconds: float
     regex_timeout_seconds: float
     profile: ToolProfileName
     review_profile: ToolProfileName
@@ -149,7 +151,9 @@ class Settings(BaseSettings):
     max_matches: int = Field(default=200, gt=0)
     bash_timeout_seconds: int = Field(default=30, gt=0)
     max_search_file_bytes: int = Field(default=5_000_000, gt=0)
+    max_search_total_bytes: int = Field(default=50_000_000, gt=0)
     max_search_files: int = Field(default=10_000, gt=0)
+    search_timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     regex_timeout_seconds: float = Field(default=0.05, gt=0, allow_inf_nan=False)
     tool_profile: ToolProfileName = "full"
     review_tool_profile: ToolProfileName = "full"
@@ -186,7 +190,9 @@ class Settings(BaseSettings):
                 max_matches=self.max_matches,
                 bash_timeout_seconds=self.bash_timeout_seconds,
                 max_search_file_bytes=self.max_search_file_bytes,
+                max_search_total_bytes=self.max_search_total_bytes,
                 max_search_files=self.max_search_files,
+                search_timeout_seconds=self.search_timeout_seconds,
                 regex_timeout_seconds=self.regex_timeout_seconds,
                 profile=self.tool_profile,
                 review_profile=self.review_tool_profile,

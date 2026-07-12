@@ -32,7 +32,9 @@ def test_default_config_uses_ollama_and_formatter_inherits_chat_model() -> None:
     assert config.tools.max_matches == 200
     assert config.tools.bash_timeout_seconds == 30
     assert config.tools.max_search_file_bytes == 5_000_000
+    assert config.tools.max_search_total_bytes == 50_000_000
     assert config.tools.max_search_files == 10_000
+    assert config.tools.search_timeout_seconds == 5.0
     assert config.tools.regex_timeout_seconds == 0.05
     assert config.tools.profile == "full"
     assert config.tools.review_profile == "full"
@@ -176,7 +178,9 @@ def test_formatter_retries_cannot_be_negative() -> None:
         "max_matches",
         "bash_timeout_seconds",
         "max_search_file_bytes",
+        "max_search_total_bytes",
         "max_search_files",
+        "search_timeout_seconds",
         "regex_timeout_seconds",
     ],
 )
@@ -185,10 +189,11 @@ def test_tool_limits_must_be_positive(field: str) -> None:
         Settings(**{field: 0}, _env_file=None)
 
 
+@pytest.mark.parametrize("field", ["regex_timeout_seconds", "search_timeout_seconds"])
 @pytest.mark.parametrize("value", [float("inf"), float("nan")])
-def test_regex_timeout_must_be_finite(value: float) -> None:
+def test_search_timeouts_must_be_finite(field: str, value: float) -> None:
     with pytest.raises(ValidationError, match="finite"):
-        Settings(regex_timeout_seconds=value, _env_file=None)
+        Settings(**{field: value}, _env_file=None)
 
 
 def test_history_context_window_must_be_positive() -> None:
