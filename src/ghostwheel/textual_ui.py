@@ -13,14 +13,21 @@ from typing import TYPE_CHECKING
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown as RichMarkdown
 from rich.panel import Panel
+from rich.segment import Segment
+from rich.style import Style as RichStyle
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.styles import RulesMap
 from textual.drivers.linux_driver import LinuxDriver
 from textual.geometry import Size
 from textual.message import Message
+from textual.selection import Selection
+from textual.strip import Strip
+from textual.style import Style as TextualStyle
+from textual.visual import RenderOptions, RichVisual, Visual
 from textual.widgets import Static, TextArea
 
 from ghostwheel.cancellation import TurnCancellation
@@ -82,6 +89,110 @@ class QueueInputReader:
 
     def submit(self, value: str) -> None:
         self._queue.put_nowait(value)
+
+
+class _SelectableRichVisual(Visual):
+    """Add Textual selection offsets and highlighting to a Rich visual."""
+
+    def __init__(self, visual: RichVisual) -> None:
+        self._visual = visual
+        self.plain_lines: list[str] = []
+
+    def get_optimal_width(self, rules: RulesMap, container_width: int) -> int:
+        return self._visual.get_optimal_width(rules, container_width)
+
+    def get_height(self, rules: RulesMap, width: int) -> int:
+        return self._visual.get_height(rules, width)
+
+    def render_strips(
+        self,
+        width: int,
+        height: int | None,
+        style: TextualStyle,
+        options: RenderOptions,
+    ) -> list[Strip]:
+        strips = self._visual.render_strips(width, height, style, options)
+        self.plain_lines = [strip.text.rstrip() for strip in strips]
+        return [
+            self._decorate_strip(strip, line_number, options)
+            for line_number, strip in enumerate(strips)
+        ]
+
+    @staticmethod
+    def _decorate_strip(
+        strip: Strip,
+        line_number: int,
+        options: RenderOptions,
+    ) -> Strip:
+        selection_span = (
+            options.selection.get_span(line_number)
+            if options.selection is not None
+            else None
+        )
+        output: list[Segment] = []
+        line_offset = 0
+
+        for text, segment_style, control in strip:
+            if control:
+                output.append(Segment(text, segment_style, control))
+                continue
+
+            segment_start = line_offset
+            segment_end = segment_start + len(text)
+            cuts = {0, len(text)}
+            if selection_span is not None:
+                selection_start, selection_end = selection_span
+                if segment_start < selection_start < segment_end:
+                    cuts.add(selection_start - segment_start)
+                if selection_end >= 0 and segment_start < selection_end < segment_end:
+                    cuts.add(selection_end - segment_start)
+
+            ordered_cuts = sorted(cuts)
+            for start, end in zip(ordered_cuts, ordered_cuts[1:]):
+                piece = text[start:end]
+                piece_offset = segment_start + start
+                rich_style = segment_style or RichStyle.null()
+                if selection_span is not None and options.selection_style is not None:
+                    selection_start, selection_end = selection_span
+                    if piece_offset >= selection_start and (
+                        selection_end < 0 or piece_offset < selection_end
+                    ):
+                        rich_style = (
+                            TextualStyle.from_rich_style(rich_style)
+                            + options.selection_style
+                        ).rich_style
+                rich_style += RichStyle.from_meta(
+                    {"offset": (piece_offset, line_number)}
+                )
+                output.append(Segment(piece, rich_style))
+            line_offset = segment_end
+
+        return Strip(output, strip.cell_length)
+
+
+class SelectableStatic(Static):
+    """Static content that remains selectable when backed by Rich renderables."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._selectable_source: RichVisual | None = None
+        self._selectable_visual: _SelectableRichVisual | None = None
+
+    def render(self) -> Visual:
+        visual = super().render()
+        if not isinstance(visual, RichVisual):
+            return visual
+        if visual is not self._selectable_source:
+            self._selectable_source = visual
+            self._selectable_visual = _SelectableRichVisual(visual)
+        assert self._selectable_visual is not None
+        return self._selectable_visual
+
+    def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+        visual = self._render()
+        if isinstance(visual, _SelectableRichVisual) and visual.plain_lines:
+            return selection.extract("\n".join(visual.plain_lines)), "\n"
+        return super().get_selection(selection)
 
 
 class VimMode(str, Enum):
@@ -823,16 +934,16 @@ class TurnView(Vertical):
     """One assistant turn with retained, dynamically hideable details."""
 
     def __init__(self, label: str, *, details_expanded: bool = False) -> None:
-        self.status = Static(Text(label, style="dim"), classes="turn-status")
-        self.tool_summaries = Static(classes="tool-summaries")
-        self.tool_details = Static(classes="turn-details tool-details")
-        self.thinking_detail = Static(classes="turn-details thinking-detail")
-        self.heading = Static(
+        self.status = SelectableStatic(Text(label, style="dim"), classes="turn-status")
+        self.tool_summaries = SelectableStatic(classes="tool-summaries")
+        self.tool_details = SelectableStatic(classes="turn-details tool-details")
+        self.thinking_detail = SelectableStatic(classes="turn-details thinking-detail")
+        self.heading = SelectableStatic(
             Text("Ghostwheel", style="bold magenta"),
             classes="assistant-heading",
         )
-        self.answer = Static(classes="assistant-answer")
-        self.outcome = Static(classes="turn-outcome")
+        self.answer = SelectableStatic(classes="assistant-answer")
+        self.outcome = SelectableStatic(classes="turn-outcome")
         super().__init__(
             self.status,
             self.tool_summaries,
@@ -1121,6 +1232,7 @@ class GhostwheelApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
         Binding("ctrl+o", "toggle_details", show=False, priority=True),
+        Binding("super+c", "copy_selection", show=False, priority=True),
         Binding("ctrl+c", "cancel_or_quit", show=False, priority=True),
         Binding("ctrl+q", "quit", show=False, priority=True),
     ]
@@ -1236,7 +1348,8 @@ class GhostwheelApp(App[None]):
         self.details_expanded = False
         self.vim_mode = vim_mode
         self._composer_height = COMPOSER_MIN_HEIGHT
-        self.header = Static(_header(app_info), id="app-header")
+        self._right_click_copy_active = False
+        self.header = SelectableStatic(_header(app_info), id="app-header")
         self.transcript = VerticalScroll(id="transcript")
         self.composer = Composer(self.history, vim_enabled=vim_mode)
         self.composer_prompt = Static(
@@ -1252,6 +1365,23 @@ class GhostwheelApp(App[None]):
             id="composer-shell",
         )
         self.presenter = TextualPresenter(self, app_info)
+
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, events.MouseEvent) and not event.is_forwarded:
+            if self._right_click_copy_active:
+                if isinstance(event, events.MouseUp):
+                    self._right_click_copy_active = False
+                return
+            if (
+                isinstance(event, events.MouseDown)
+                and event.button == 3
+                and self._copy_selection()
+            ):
+                # Consume the complete right-click gesture so Textual doesn't
+                # replace the existing selection before the button is released.
+                self._right_click_copy_active = True
+                return
+        await super().on_event(event)
 
     def compose(self) -> ComposeResult:
         yield self.header
@@ -1281,7 +1411,7 @@ class GhostwheelApp(App[None]):
         value = message.value
         user = Text("You › ", style="bold cyan")
         user.append(value)
-        await self.transcript.mount(Static(user, classes="user-message"))
+        await self.transcript.mount(SelectableStatic(user, classes="user-message"))
         self.follow_output(True)
         self.input_reader.submit(value)
 
@@ -1313,8 +1443,22 @@ class GhostwheelApp(App[None]):
             turn.set_details_expanded(self.details_expanded)
         self.follow_output(follow)
 
+    def _copy_selection(self) -> bool:
+        selected_text = self.composer.selected_text or self.screen.get_selected_text()
+        if selected_text is None:
+            return False
+        self.copy_to_clipboard(selected_text)
+        return True
+
+    def action_copy_selection(self) -> None:
+        """Copy app-managed text without giving Command+C a quit fallback."""
+        self.composer.clear_vim_pending()
+        self._copy_selection()
+
     def action_cancel_or_quit(self) -> None:
         self.composer.clear_vim_pending()
+        if self._copy_selection():
+            return
         if not self.cancellation.cancel():
             self.input_reader.submit("/quit")
 
@@ -1324,7 +1468,7 @@ class GhostwheelApp(App[None]):
         self.follow_output(follow)
 
     def add_renderable(self, renderable: RenderableType, *, classes: str) -> None:
-        self.add_widget(Static(renderable, classes=classes))
+        self.add_widget(SelectableStatic(renderable, classes=classes))
 
     def follow_output(self, should_follow: bool) -> None:
         if should_follow:
@@ -1404,10 +1548,14 @@ def _help_panel(*, vim_mode: bool = False) -> Panel:
         body.append(description)
     body.append("\n\nShortcuts\n", style="bold")
     body.append("Shift+Enter         insert a newline\n", style="dim")
-    body.append("Ctrl+C              cancel a turn; quit while idle\n", style="dim")
+    body.append("Cmd+C / Ctrl+C     copy selection\n", style="dim")
+    body.append("Ctrl+C              otherwise cancel/quit\n", style="dim")
     body.append("Ctrl+O              toggle thinking and tool details\n", style="dim")
     body.append("↑/↓                 recall earlier prompts\n", style="dim")
-    body.append("Tab                 complete commands and review paths", style="dim")
+    body.append("Tab                 complete commands and review paths\n", style="dim")
+    body.append("Mouse wheel / bar   scroll the transcript\n", style="dim")
+    body.append("Mouse drag          select transcript text\n", style="dim")
+    body.append("Right-click         copy selected text", style="dim")
     if vim_mode:
         body.append("\n\nVim prompt editing\n", style="bold")
         body.append("Esc / i a I A       switch Normal / Insert mode\n", style="dim")

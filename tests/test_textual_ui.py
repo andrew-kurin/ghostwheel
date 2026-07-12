@@ -4,9 +4,13 @@ import asyncio
 from io import StringIO
 
 from rich.console import Console
+from rich.text import Text
 from textual import events
 from textual._xterm_parser import XTermParser
 from textual.drivers.linux_driver import LinuxDriver
+from textual.pilot import Pilot
+from textual.widget import Widget
+from textual.widgets import Static
 
 import ghostwheel.textual_ui as textual_ui
 from ghostwheel.events import ThinkingOutput, ToolFinished, ToolStarted
@@ -86,6 +90,32 @@ def make_app(
         ),
         vim_mode=vim_mode,
     )
+
+
+async def right_click(
+    app: GhostwheelApp,
+    pilot: Pilot[None],
+    widget: Widget,
+) -> None:
+    x = widget.region.x
+    y = widget.region.y
+    for event_type in (events.MouseDown, events.MouseUp):
+        app.post_message(
+            event_type(
+                None,
+                x,
+                y,
+                0,
+                0,
+                3,
+                False,
+                False,
+                False,
+                screen_x=x,
+                screen_y=y,
+            )
+        )
+        await pilot.pause()
 
 
 def test_shift_enter_inserts_a_newline_and_plain_enter_submits() -> None:
@@ -501,6 +531,7 @@ def test_vim_shortcuts_only_appear_in_vim_help() -> None:
     assert "Vim prompt editing" not in rendered(False)
     assert "Vim prompt editing" in rendered(True)
     assert "Esc / i a I A" in rendered(True)
+    assert "Mouse wheel / bar" in rendered(True)
 
 
 def test_textual_parser_distinguishes_shift_enter_protocol_sequences() -> None:
@@ -514,6 +545,13 @@ def test_textual_parser_distinguishes_shift_enter_protocol_sequences() -> None:
     assert xterm_events[0].key == "shift+\r"  # type: ignore[attr-defined]
     assert len(mapped_events) == 1
     assert mapped_events[0].key == "ctrl+j"  # type: ignore[attr-defined]
+
+
+def test_textual_parser_recognizes_command_c() -> None:
+    events = list(XTermParser().feed("\x1b[99;9u"))
+
+    assert len(events) == 1
+    assert events[0].key == "super+c"  # type: ignore[attr-defined]
 
 
 def test_terminal_driver_enables_and_resets_modify_other_keys(monkeypatch) -> None:
@@ -612,6 +650,221 @@ def test_history_navigation_keeps_multiline_cursor_navigation_local() -> None:
             await pilot.press("up")
             assert app.composer.text == "first\nsecond"
             assert app.composer.cursor_location[0] == 0
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_transcript_mouse_wheel_does_not_navigate_prompt_history() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        app.history.append("older prompt")
+        app.composer._history_index = len(app.history.entries)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.transcript.mount(
+                Static(
+                    Text("\n".join(f"transcript line {index}" for index in range(100)))
+                )
+            )
+            app.composer.load_text("draft prompt")
+            await pilot.pause()
+            app.transcript.scroll_end(animate=False, immediate=True)
+            await pilot.pause()
+
+            initial_scroll = app.transcript.scroll_y
+            initial_history_index = app.composer._history_index
+            assert initial_scroll == app.transcript.max_scroll_y
+
+            await pilot._post_mouse_events(
+                [events.MouseScrollUp],
+                app.transcript,
+                offset=(10, 5),
+            )
+            await pilot.pause()
+
+            assert app.transcript.scroll_y < initial_scroll
+            assert app.composer.text == "draft prompt"
+            assert app.composer._history_index == initial_history_index
+
+            await pilot._post_mouse_events(
+                [events.MouseScrollDown],
+                app.transcript,
+                offset=(10, 5),
+            )
+            await pilot.pause()
+            assert app.transcript.scroll_y == initial_scroll
+            assert app.composer.text == "draft prompt"
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_transcript_scrollbar_track_and_thumb_are_mouse_operable() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.transcript.mount(
+                Static(
+                    Text("\n".join(f"transcript line {index}" for index in range(100)))
+                )
+            )
+            await pilot.pause()
+            scrollbar = app.transcript.vertical_scrollbar
+            app.transcript.scroll_home(animate=False, immediate=True)
+            await pilot.pause()
+
+            assert scrollbar.display is True
+            assert scrollbar.window_virtual_size > scrollbar.window_size
+            assert await pilot.click(
+                scrollbar,
+                offset=(0, scrollbar.region.height - 1),
+            )
+            await pilot.pause()
+            assert app.transcript.scroll_y > 0
+            assert app.screen.get_selected_text() is None
+
+            app.transcript.scroll_home(animate=False, immediate=True)
+            await pilot.pause()
+            assert await pilot.mouse_down(scrollbar, offset=(0, 0))
+            assert app.mouse_captured is scrollbar
+            assert await pilot._post_mouse_events(
+                [events.MouseMove],
+                scrollbar,
+                offset=(0, scrollbar.region.height // 2),
+                button=1,
+            )
+            await pilot.pause()
+            assert app.transcript.scroll_y > 0
+            assert await pilot.mouse_up(
+                scrollbar,
+                offset=(0, scrollbar.region.height // 2),
+            )
+            await pilot.pause()
+            assert app.mouse_captured is None
+            assert app.screen.get_selected_text() is None
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_command_c_copies_mouse_selected_transcript_text() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.presenter.turn_started()
+            app.presenter.turn_outcome(
+                TurnSucceeded("selectable **transcript** text", ())
+            )
+            await pilot.pause()
+            message = app.query_one(TurnView).answer
+
+            assert await pilot.mouse_down(message, offset=(0, 0))
+            assert await pilot._post_mouse_events(
+                [events.MouseMove],
+                message,
+                offset=(10, 0),
+                button=1,
+            )
+            assert await pilot.mouse_up(message, offset=(10, 0))
+            await pilot.pause()
+
+            assert app.screen.get_selected_text() == "selectable "
+            selected_segment, unselected_segment = list(message.render_line(0))[:2]
+            assert selected_segment.style is not None
+            assert unselected_segment.style is not None
+            assert selected_segment.style.bgcolor != unselected_segment.style.bgcolor
+            assert selected_segment.style.color != selected_segment.style.bgcolor
+            await pilot.press("super+c")
+            assert app.clipboard == "selectable "
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_right_click_copies_and_preserves_transcript_selection() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.presenter.turn_started()
+            app.presenter.turn_outcome(TurnSucceeded("selectable transcript text", ()))
+            await pilot.pause()
+            message = app.query_one(TurnView).answer
+
+            assert await pilot.mouse_down(message, offset=(0, 0))
+            assert await pilot._post_mouse_events(
+                [events.MouseMove],
+                message,
+                offset=(10, 0),
+                button=1,
+            )
+            assert await pilot.mouse_up(message, offset=(10, 0))
+            await pilot.pause()
+
+            await right_click(app, pilot, message)
+
+            assert app.clipboard == "selectable "
+            assert app.screen.get_selected_text() == "selectable "
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_right_click_copies_and_preserves_composer_selection() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.composer.load_text("copy this")
+            app.composer.move_cursor((0, 0))
+            app.composer.move_cursor((0, 4), select=True)
+
+            await right_click(app, pilot, app.composer)
+
+            assert app.clipboard == "copy"
+            assert app.composer.selected_text == "copy"
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_right_click_without_selection_does_not_copy() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.copy_to_clipboard("unchanged")
+
+            await right_click(app, pilot, app.composer)
+
+            assert app.clipboard == "unchanged"
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_command_c_without_selection_does_not_quit() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            await pilot.press("super+c")
+
+            assert app.is_running is True
+            assert app.input_reader._queue.empty()
+            app.exit()
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_c_copies_composer_selection_before_cancel_or_quit() -> None:
+    async def scenario() -> None:
+        app = make_app(vim_mode=False)
+        async with app.run_test(size=(60, 20)) as pilot:
+            app.composer.load_text("copy this")
+            app.composer.move_cursor((0, 0))
+            app.composer.move_cursor((0, 4), select=True)
+
+            await pilot.press("ctrl+c")
+
+            assert app.clipboard == "copy"
+            assert app.is_running is True
             app.exit()
 
     asyncio.run(scenario())

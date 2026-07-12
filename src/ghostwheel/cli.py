@@ -268,9 +268,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 vim_mode=args.vim,
             )
             event_handler = tui.presenter.handle_event
-            # Keep terminal-native drag selection available in Ghostty and
-            # libghostty hosts. Textual mouse reporting intercepts those drags.
-            tui.run(mouse=False)
+            # Textual routes wheel and scrollbar gestures while keeping content
+            # selectable through its screen-level selection support.
+            tui.run(mouse=True)
         else:
             asyncio.run(
                 run_cli(

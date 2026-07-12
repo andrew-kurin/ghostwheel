@@ -61,11 +61,19 @@ to Insert mode. The compact `I` or `N` beside `You` shows the current mode. Run
 `/help` for the available motions and editing commands, or use `--no-vim` to
 restore the standard prompt editor.
 
-The interactive UI leaves terminal mouse reporting disabled so native drag
-selection works in Ghostty and libghostty hosts such as cmux. Copy selected text
-with the terminal's copy shortcut. Ghostwheel therefore does not receive mouse
-clicks or Textual mouse-wheel events; use the keyboard for cursor movement and
-in-app scrolling.
+The interactive UI supports mouse-wheel transcript scrolling and dragging or
+clicking its scrollbar. Drag outside the scrollbar to select text; Textual keeps
+the scrollbar out of selection hit-testing. Copy selected text with `Cmd+C` on
+macOS, `Ctrl+C`, or a right-click. A right-click without selected text is left
+alone. With no selection, `Ctrl+C` retains its normal cancel/quit behavior.
+
+Ghostty 1.2 and newer forwards its default `Cmd+C` binding to terminal apps
+when there is no native terminal selection. If you override that binding, keep
+the same behavior so Ghostwheel can copy its app-managed selection:
+
+```ini
+keybind = performable:super+c=copy_to_clipboard:mixed
+```
 
 In the chat prompt:
 

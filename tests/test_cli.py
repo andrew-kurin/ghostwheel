@@ -352,7 +352,7 @@ def test_main_passes_vim_mode_to_the_interactive_app(
 
     assert captured["vim_mode"] is expected
     assert captured["ran"] is True
-    assert captured["run_kwargs"] == {"mouse": False}
+    assert captured["run_kwargs"] == {"mouse": True}
     assert captured["closed"] is True
 
 
