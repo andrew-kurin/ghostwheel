@@ -61,7 +61,9 @@ def test_bash_decodes_invalid_utf8_without_failing(tmp_path: Path) -> None:
 
 def test_bash_timeout_terminates_the_process_group(tmp_path: Path) -> None:
     result = run_bash(
-        tool_ctx(tmp_path, bash_timeout_seconds=0.1),
+        # Allow a loaded CI runner to fork the child and emit its PID before
+        # timeout cleanup; the 10-second sleep remains well beyond this limit.
+        tool_ctx(tmp_path, bash_timeout_seconds=1.0),
         "sleep 10 & child=$!; echo $child; wait $child",
     )
 
