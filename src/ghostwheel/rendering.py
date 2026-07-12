@@ -64,7 +64,7 @@ def review_renderables(
     *,
     width: int,
 ) -> tuple[RenderableType, ...]:
-    """Build review output for both the plain renderer and persistent TUI."""
+    """Build review output for the terminal UI at the requested width."""
     verdict = (
         Text("APPROVED", style="bold green")
         if review.approve

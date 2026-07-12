@@ -1,17 +1,11 @@
 import asyncio
-import gc
-import weakref
-from dataclasses import fields, replace
-from io import StringIO
 from pathlib import Path
-from typing import get_type_hints
 
 import pytest
-from rich.console import Console
 
 import ghostwheel.bootstrap as bootstrap_module
 from ghostwheel.app_info import AppInfo
-from ghostwheel.bootstrap import Application, Runtime, build_application, build_runtime
+from ghostwheel.bootstrap import Runtime, build_runtime
 from ghostwheel.config import Settings
 from ghostwheel.review import ReviewService
 from ghostwheel.session import ChatSession
@@ -34,66 +28,6 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
         assert runtime.session.context_tokens_estimated is True
     finally:
         runtime.close()
-
-
-def test_build_application_is_a_rich_compatibility_facade(tmp_path) -> None:
-    config = Settings(_env_file=None).resolve()
-    console = Console(file=StringIO(), force_terminal=False)
-
-    application = build_application(config, console, cwd=tmp_path)
-    try:
-        runtime = application.runtime
-        assert runtime is not None
-        assert application.session is runtime.session
-        assert application.reviews is runtime.reviews
-        assert application.tool_deps is runtime.tool_deps
-        assert application.presenter.app_info is runtime.app_info
-    finally:
-        application.close()
-
-
-def test_replaced_application_preserves_runtime_ownership(tmp_path) -> None:
-    config = Settings(_env_file=None).resolve()
-    application = build_application(
-        config,
-        Console(file=StringIO(), force_terminal=False),
-        cwd=tmp_path,
-    )
-    runtime = application.runtime
-    assert runtime is not None
-    runtime_reference = weakref.ref(runtime)
-    clients = [agent.model.client for agent in runtime._agents]
-
-    def is_closed(client: object) -> bool:
-        value = getattr(client, "is_closed")
-        return bool(value() if callable(value) else value)
-
-    replacement = replace(application)
-    assert replacement.runtime is runtime
-    assert replace(application, reviews=object()).runtime is None
-
-    del application
-    del runtime
-    gc.collect()
-
-    assert replacement.runtime is runtime_reference()
-    replacement.close()
-
-    assert all(is_closed(client) for client in clients)
-
-
-def test_application_preserves_original_dataclass_construction_shape() -> None:
-    values = [object() for _index in range(4)]
-    application = Application(*values)  # type: ignore[arg-type]
-
-    assert [field.name for field in fields(Application)] == [
-        "session",
-        "reviews",
-        "presenter",
-        "tool_deps",
-    ]
-    assert application.runtime is None
-    assert replace(application, presenter="replacement").presenter == "replacement"
 
 
 def test_runtime_async_context_owns_agent_and_tool_lifetimes() -> None:
@@ -432,64 +366,6 @@ def test_disabled_review_fallback_omits_fallback_agent(
         runtime.close()
 
 
-def test_compatibility_application_close_works_inside_an_active_event_loop(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        application = build_application(
-            Settings(_env_file=None).resolve(),
-            Console(file=StringIO(), force_terminal=False),
-            cwd=tmp_path,
-        )
-        runtime = application.runtime
-        assert runtime is not None
-        clients = [agent.model.client for agent in runtime._agents]
-
-        def is_closed(client: object) -> bool:
-            value = getattr(client, "is_closed")
-            return bool(value() if callable(value) else value)
-
-        application.close()
-
-        assert runtime.is_closed is True
-        assert all(is_closed(client) for client in clients)
-        assert application.tool_deps.workspace.is_closed is True
-
-    asyncio.run(scenario())
-
-
-def test_compatibility_application_does_not_cross_loops_when_runtime_is_entered(
-    tmp_path: Path,
-) -> None:
-    application = build_application(
-        Settings(_env_file=None).resolve(),
-        Console(file=StringIO(), force_terminal=False),
-        cwd=tmp_path,
-    )
-    runtime = application.runtime
-    assert runtime is not None
-
-    async def scenario() -> None:
-        async with application:
-            with pytest.raises(RuntimeError, match="await runtime.aclose"):
-                application.close()
-            assert runtime.is_closed is False
-
-    asyncio.run(scenario())
-
-    assert runtime.is_closed is True
-    assert application.tool_deps.workspace.is_closed is True
-
-
-def test_bootstrap_public_annotations_are_runtime_resolvable() -> None:
-    application_hints = get_type_hints(Application)
-    factory_hints = get_type_hints(build_application)
-
-    assert application_hints["session"] is ChatSession
-    assert "presenter" in application_hints
-    assert factory_hints["return"] is Application
-
-
 def test_build_runtime_closes_owned_dependencies_when_composition_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -570,70 +446,5 @@ def test_build_runtime_closes_agents_created_before_composition_failure(
         # failure, even when its caller already owns an event loop.
         assert agent.entered == 1
         assert agent.exited == 1
-
-    asyncio.run(scenario())
-
-
-def test_build_application_closes_runtime_when_presenter_construction_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ghostwheel.rich_ui as rich_ui_module
-
-    class FakeRuntime:
-        app_info = object()
-        closed = False
-
-        def close(self) -> None:
-            self.closed = True
-
-    runtime = FakeRuntime()
-    config = Settings(_env_file=None).resolve()
-    monkeypatch.setattr(
-        bootstrap_module,
-        "build_runtime",
-        lambda *_args, **_kwargs: runtime,
-    )
-
-    def fail_presenter(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("presenter construction failed")
-
-    monkeypatch.setattr(rich_ui_module, "RichPresenter", fail_presenter)
-
-    with pytest.raises(RuntimeError, match="presenter construction failed"):
-        build_application(config, Console(file=StringIO()))
-
-    assert runtime.closed is True
-
-
-def test_build_application_awaits_failure_cleanup_inside_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ghostwheel.rich_ui as rich_ui_module
-
-    class FakeRuntime:
-        app_info = object()
-        closed = False
-
-        async def aclose(self) -> None:
-            await asyncio.sleep(0)
-            self.closed = True
-
-    runtime = FakeRuntime()
-    config = Settings(_env_file=None).resolve()
-    monkeypatch.setattr(
-        bootstrap_module,
-        "build_runtime",
-        lambda *_args, **_kwargs: runtime,
-    )
-
-    def fail_presenter(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("presenter construction failed")
-
-    monkeypatch.setattr(rich_ui_module, "RichPresenter", fail_presenter)
-
-    async def scenario() -> None:
-        with pytest.raises(RuntimeError, match="presenter construction failed"):
-            build_application(config, Console(file=StringIO()))
-        assert runtime.closed is True
 
     asyncio.run(scenario())

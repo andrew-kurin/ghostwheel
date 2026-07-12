@@ -7,7 +7,7 @@ modules are not used by canonical implementation modules.
 ## Runtime flow
 
 ```text
-cli / Textual app
+cli / terminal UI
         |
         v
 command controller ---- presenter port
@@ -34,8 +34,9 @@ tool catalog ---- ToolDeps ---- Workspace / CommandRunner
 - `session.py` owns chat-session orchestration and re-exports its former public
   contract names for compatibility.
 - `presentation.py` reduces runtime events into renderer-neutral turn state.
-- `rich_ui.py`, `textual_ui.py`, and `textual_composer.py` are presentation
-  adapters.
+- `terminal_ui.py` is the sole presentation adapter. It uses prompt-toolkit for
+  inline input and Rich for a bounded transient preview plus completed output in
+  the primary terminal buffer.
 - `agent_blueprint.py` and `agent_factory.py` own SDK-independent agent inputs
   and Pydantic-AI construction. `agent.py` is a compatibility facade.
 - `model_config.py` and `tool_config.py` contain lightweight resolved values;
@@ -48,7 +49,7 @@ tool catalog ---- ToolDeps ---- Workspace / CommandRunner
   facades.
 - Runtime services and adapters import `runtime_contracts.py` and `history.py`
   directly rather than importing contract types from `session.py`.
-- Textual presentation code does not import the CLI or private Rich helpers.
+- The terminal UI does not import the CLI or runtime composition root.
 - Configuration modules do not import the tool implementation graph.
 - Bootstrap estimates static context from owned agent blueprints, not private
   Pydantic-AI attributes.
