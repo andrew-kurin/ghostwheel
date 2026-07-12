@@ -38,6 +38,8 @@ tool catalog ---- ToolDeps ---- Workspace / CommandRunner
   transient preview plus completed output in the primary terminal buffer.
 - `terminal_composer.py` owns prompt-toolkit session construction, editor key
   bindings, completion, and private prompt-history persistence.
+- `terminal_io.py` owns raw tty and signal restoration, active-turn key
+  monitoring, and asynchronous redirected-input buffering.
 - `agent_blueprint.py` and `agent_factory.py` own SDK-independent agent inputs
   and Pydantic-AI construction. `agent.py` is a compatibility facade.
 - `model_config.py` and `tool_config.py` contain lightweight resolved values;

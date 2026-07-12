@@ -42,18 +42,26 @@ uv run ghostwheel
 
 Ghostwheel runs inline in the terminal's primary screen buffer. Completed turns
 remain in native scrollback, and the terminal emulator owns text selection,
-copy/paste, search, wheel scrolling, and its scrollbar. When stdin or stdout is
-redirected, the same UI reads and writes line-oriented streams without terminal
-control sequences. Run `uv run ghostwheel --help` for all command-line options.
+copy/paste, search, wheel scrolling, and its scrollbar. When stdout is
+redirected, Ghostwheel writes a line-oriented stream without terminal control
+sequences. Redirecting stdin alone also switches input to a line-oriented
+stream, but output can retain terminal styling when stdout is still a terminal.
+Run `uv run ghostwheel --help` for all command-line options.
 
-The prompt supports multiline editing, command and review-path completion, and
-prompt history. Enter submits and Shift+Enter inserts a newline. Prompt history
-is stored in `$XDG_STATE_HOME/ghostwheel/input-history` (or
+The interactive prompt-toolkit composer supports multiline editing, command and
+review-path completion, and prompt history. Enter submits and Shift+Enter
+inserts a newline. Ghostwheel recognizes the physical Shift modifier on macOS,
+LF emitted by a terminal mapping, and xterm's modified-Enter sequence. Other
+terminals may need a Shift+Enter-to-LF mapping.
+
+When the interactive composer is active, prompt history is stored in
+`$XDG_STATE_HOME/ghostwheel/input-history` (or
 `~/.local/state/ghostwheel/input-history`); use `--no-history` to keep it only in
-memory or `--history-file PATH` to choose another location. History contains
-prompts in plain text, so disable it when prompts may contain secrets. Model
-conversation history and rolling summaries are memory-only and disappear when
-Ghostwheel exits.
+memory or `--history-file PATH` to choose another location. These history
+options do not apply to line-oriented input. History contains prompts in plain
+text, so disable it when prompts may contain secrets. Model conversation
+history and rolling summaries are memory-only and disappear when Ghostwheel
+exits.
 
 Vim-style prompt editing is enabled by default through prompt-toolkit. Each
 prompt starts in Insert mode; Escape switches to Normal mode, and the

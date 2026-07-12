@@ -7,27 +7,18 @@ only the active composer at the bottom of the terminal.
 
 from __future__ import annotations
 
-import asyncio
-import os
-import signal
-import stat
 import sys
-import termios
 import time
-from collections.abc import Awaitable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from types import FrameType
 from typing import TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.input import Input
-from prompt_toolkit.input.typeahead import get_typeahead
-from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
-from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, Group
@@ -75,6 +66,11 @@ from ghostwheel.terminal_composer import (
     TerminalComposer,
     default_history_path,
 )
+from ghostwheel.terminal_io import (
+    ActiveTurnInputMonitor,
+    RawTerminalGuard,
+    RedirectedLineReader,
+)
 
 __all__ = ["TerminalUI", "default_history_path"]
 
@@ -84,13 +80,6 @@ _LIVE_ANSWER_MAX_CHARACTERS = 400
 # prompt_toolkit's default VT-prefix timeout, used only when no composer
 # application exists to provide its configured ``ttimeoutlen``.
 _DEFAULT_TTIMEOUT_SECONDS = 0.5
-_TERMIOS_LOCAL_FLAGS = 3
-_TERMINAL_GUARDED_SIGNALS = (
-    signal.SIGHUP,
-    signal.SIGQUIT,
-    signal.SIGTERM,
-    signal.SIGTSTP,
-)
 
 
 class _TerminalCancellation:
@@ -153,14 +142,9 @@ class TerminalUI:
         self._turn_uses_live = False
         self._turn = TurnState()
         self._last_live_update = 0.0
+        self._stream_at_line_start = True
 
         self._prompt_active = False
-        self._quit_requested = False
-        self._line_buffer = bytearray()
-        self._line_eof = False
-        self._terminal_input_descriptor: int | None = None
-        self._terminal_input_attributes: list[object] | None = None
-        self._terminal_signal_handlers: dict[int, object] = {}
 
         self._composer = TerminalComposer(
             workspace=Path(app_info.workspace).expanduser(),
@@ -171,6 +155,17 @@ class TerminalUI:
             bottom_toolbar=self._bottom_toolbar,
             rprompt=self._rprompt,
         )
+        self._terminal_guard = RawTerminalGuard(
+            self.input_stream,
+            externally_managed_input=prompt_input is not None,
+            is_active=lambda: self._active or self._prompt_active,
+        )
+        self._turn_input_monitor = ActiveTurnInputMonitor(
+            get_input=lambda: self._composer.input_for_turn(self.input_stream),
+            get_timeout=self._turn_input_timeout,
+            terminal_guard=self._terminal_guard,
+        )
+        self._redirected_reader = RedirectedLineReader(self.input_stream)
 
     async def handle_event(self, event: AgentEvent) -> None:
         """Reduce one streamed event into the active turn presentation."""
@@ -186,10 +181,15 @@ class TerminalUI:
                         Text("\nGhostwheel\n", style="bold magenta"),
                         end="",
                     )
+                    self._stream_at_line_start = True
                 self.console.print(Text(event.content), end="", soft_wrap=True)
+                if event.content:
+                    self._stream_at_line_start = event.content.endswith("\n")
             elif isinstance(event, ToolStarted | ToolFinished | ToolFailed):
                 assert activity is not None
+                self._ensure_stream_line_start()
                 self.console.print(self._tool_line(activity))
+                self._stream_at_line_start = True
 
         self._refresh_live()
 
@@ -243,24 +243,24 @@ class TerminalUI:
 
         if self._active:
             raise RuntimeError("cannot open the prompt while a turn is active")
-        if self._quit_requested:
+        if self._turn_input_monitor.quit_requested:
             raise EOFError
         self._stop_live()
-        self._restore_terminal_input()
+        self._terminal_guard.restore()
 
         if not self._use_prompt_toolkit():
-            return await self._read_stream_line()
+            return await self._redirected_reader.read()
 
         prompt_session = self._composer.get_session(self.input_stream)
         if self.vim_mode:
             prompt_session.app.vi_state.input_mode = InputMode.INSERT
         self._prompt_active = True
-        self._guard_prompt_terminal()
+        self._terminal_guard.guard_prompt()
         try:
             return await prompt_session.prompt_async()
         finally:
             self._prompt_active = False
-            self._restore_terminal_input()
+            self._terminal_guard.restore()
 
     def turn_started(self, label: str = "Thinking…") -> None:
         """Start a bounded Live region only after the inline prompt has closed."""
@@ -269,7 +269,7 @@ class TerminalUI:
             raise RuntimeError("cannot start Rich Live while the prompt is active")
         self._reset_turn(label)
         self._active = True
-        self._silence_turn_input()
+        self._terminal_guard.silence()
         self._turn_uses_live = self.live_enabled
         if self._turn_uses_live:
             self._live = Live(
@@ -373,7 +373,7 @@ class TerminalUI:
 
     def turn_cancelled(self) -> None:
         self._finish_activity()
-        if not self._quit_requested:
+        if not self._turn_input_monitor.quit_requested:
             self.console.print(Text("Turn cancelled.", style="yellow"))
         self._reset_turn()
 
@@ -446,11 +446,17 @@ class TerminalUI:
             f"{format_token_count(context_window)}{compaction_marker}"
         )
 
+    @property
+    def _quit_requested(self) -> bool:
+        """Expose monitor state as a compatibility seam for focused tests."""
+
+        return self._turn_input_monitor.quit_requested
+
     def close(self) -> None:
         """Release UI-owned terminal input state and stop any active Live region."""
 
         self._stop_live()
-        self._restore_terminal_input()
+        self._terminal_guard.restore()
         self._composer.close()
 
     def _render_turn_failure(self, outcome: TurnFailed) -> None:
@@ -511,6 +517,15 @@ class TerminalUI:
         if self._turn_uses_live:
             for activity in self._turn.tools:
                 self.console.print(self._tool_line(activity))
+        else:
+            self._ensure_stream_line_start()
+
+    def _ensure_stream_line_start(self) -> None:
+        """Finish a partial streamed line before rendering another UI element."""
+
+        if not self._stream_at_line_start:
+            self.console.print("")
+            self._stream_at_line_start = True
 
     def _stop_live(self) -> None:
         if self._live is not None:
@@ -547,266 +562,22 @@ class TerminalUI:
 
     def _reset_turn(self, label: str = "Thinking…") -> None:
         self._stop_live()
-        self._restore_terminal_input()
+        self._terminal_guard.restore()
         self._active = False
         self._turn_uses_live = False
         self._turn.reset(label)
         self._last_live_update = 0.0
-
-    def _silence_turn_input(self) -> None:
-        """Prevent type-ahead from echoing into or leaking past an active turn."""
-
-        if (
-            self._composer.prompt_input is not None
-            or self._terminal_input_attributes is not None
-        ):
-            return
-        try:
-            descriptor = self.input_stream.fileno()
-            if not os.isatty(descriptor):
-                return
-            attributes = termios.tcgetattr(descriptor)
-            quiet_attributes = attributes.copy()
-            quiet_attributes[_TERMIOS_LOCAL_FLAGS] &= ~(
-                termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
-            )
-        except AttributeError, OSError, termios.error:
-            return
-
-        if not self._install_terminal_signal_handlers():
-            return
-        self._terminal_input_descriptor = descriptor
-        self._terminal_input_attributes = attributes
-        try:
-            termios.tcsetattr(descriptor, termios.TCSANOW, quiet_attributes)
-        except OSError, termios.error:
-            self._restore_terminal_input()
+        self._stream_at_line_start = True
 
     @contextmanager
     def _capture_turn_input(
         self,
         cancellation: CancellationPort,
     ) -> Iterator[None]:
-        """Drain active-turn keys, using Escape to cancel and Ctrl+D to quit."""
+        """Delegate active-turn key handling to the terminal input monitor."""
 
-        prompt_input = self._turn_input()
-        if prompt_input is None:
-            # ``turn_started`` may already have disabled canonical input and
-            # ISIG. Restore a normal, interruptible tty when monitoring cannot
-            # be attached instead of leaving the process unresponsive.
-            self._restore_terminal_input()
+        with self._turn_input_monitor.capture(cancellation):
             yield
-            return
-
-        loop = asyncio.get_running_loop()
-        flush_handle: asyncio.TimerHandle | None = None
-        monitor_active = True
-        cancellation_requested = False
-
-        def cancel_if_active() -> None:
-            nonlocal cancellation_requested
-            if monitor_active and not cancellation.cancel():
-                cancellation_requested = False
-
-        def request_cancellation() -> None:
-            nonlocal cancellation_requested
-            if cancellation_requested:
-                return
-            cancellation_requested = True
-            # Controller presenters start the activity immediately before
-            # CancellationPort.run owns its task. Deferring avoids losing a key
-            # that was typed in the same input chunk as prompt submission.
-            loop.call_soon(cancel_if_active)
-
-        def handle_keys(keys: Iterable[KeyPress]) -> None:
-            key_presses = tuple(keys)
-            for key_press in key_presses:
-                if key_press.key == Keys.ControlD:
-                    self._quit_requested = True
-                    request_cancellation()
-                    return
-            # VT input represents Alt/Meta combinations as Escape followed by
-            # the modified key in one decoded batch. Only a trailing Escape is
-            # standalone; an Escape with a following key is a prefix.
-            if key_presses and key_presses[-1].key == Keys.Escape:
-                request_cancellation()
-
-        def flush_pending_escape() -> None:
-            nonlocal flush_handle
-            flush_handle = None
-            handle_keys(prompt_input.flush_keys())
-
-        def input_ready() -> None:
-            nonlocal flush_handle
-            if flush_handle is not None:
-                flush_handle.cancel()
-                flush_handle = None
-            keys = prompt_input.read_keys()
-            handle_keys(keys)
-            if prompt_input.closed:
-                self._quit_requested = True
-                request_cancellation()
-            elif monitor_active:
-                flush_handle = loop.call_later(
-                    self._turn_input_timeout(prompt_input),
-                    flush_pending_escape,
-                )
-
-        stack = ExitStack()
-        try:
-            stack.enter_context(prompt_input.raw_mode())
-            stack.enter_context(prompt_input.attach(input_ready))
-        except EOFError, NotImplementedError, OSError, RuntimeError:
-            stack.close()
-            self._restore_terminal_input()
-            yield
-            return
-
-        try:
-            # prompt_toolkit can retain decoded keys read in the same chunk as
-            # Enter. A lone Escape may instead remain pending in its VT parser;
-            # defer that parser flush so a split arrow/Meta sequence can finish.
-            handle_keys(get_typeahead(prompt_input))
-            flush_handle = loop.call_later(
-                self._turn_input_timeout(prompt_input),
-                flush_pending_escape,
-            )
-            yield
-        finally:
-            monitor_active = False
-            if flush_handle is not None:
-                flush_handle.cancel()
-            stack.close()
-            prompt_input.flush_keys()
-            get_typeahead(prompt_input)
-
-    def _guard_prompt_terminal(self) -> None:
-        """Preserve cooked tty state across termination while the prompt is raw."""
-
-        if (
-            self._composer.prompt_input is not None
-            or self._terminal_input_attributes is not None
-        ):
-            return
-        try:
-            descriptor = self.input_stream.fileno()
-            if not os.isatty(descriptor):
-                return
-            attributes = termios.tcgetattr(descriptor)
-        except AttributeError, OSError, termios.error:
-            return
-        if not self._install_terminal_signal_handlers():
-            return
-        self._terminal_input_descriptor = descriptor
-        self._terminal_input_attributes = attributes
-
-    def _restore_terminal_input(self) -> None:
-        descriptor = self._terminal_input_descriptor
-        attributes = self._terminal_input_attributes
-        self._terminal_input_descriptor = None
-        self._terminal_input_attributes = None
-        if descriptor is not None and attributes is not None:
-            try:
-                termios.tcflush(descriptor, termios.TCIFLUSH)
-            except OSError, termios.error:
-                pass
-            try:
-                termios.tcsetattr(descriptor, termios.TCSANOW, attributes)
-            except OSError, termios.error:
-                pass
-        self._restore_terminal_signal_handlers()
-
-    def _install_terminal_signal_handlers(self) -> bool:
-        if self._terminal_signal_handlers:
-            return True
-
-        installed: dict[int, object] = {}
-        try:
-            for signum in _TERMINAL_GUARDED_SIGNALS:
-                installed[signum] = signal.getsignal(signum)
-                signal.signal(signum, self._handle_terminal_signal)
-        except OSError, RuntimeError, ValueError:
-            for signum, previous in installed.items():
-                try:
-                    signal.signal(signum, previous)
-                except OSError, RuntimeError, ValueError:
-                    pass
-            return False
-        self._terminal_signal_handlers = installed
-        return True
-
-    def _restore_terminal_signal_handlers(self) -> None:
-        handlers = self._terminal_signal_handlers
-        self._terminal_signal_handlers = {}
-        for signum, previous in handlers.items():
-            try:
-                signal.signal(signum, previous)
-            except OSError, RuntimeError, ValueError:
-                pass
-
-    def _handle_terminal_signal(
-        self,
-        signum: int,
-        frame: FrameType | None,
-    ) -> None:
-        """Restore the tty before honoring termination or job-control signals."""
-
-        previous = self._terminal_signal_handlers.get(signum, signal.SIG_DFL)
-        descriptor = self._terminal_input_descriptor
-        original_attributes = self._terminal_input_attributes
-        active_attributes: list[object] | None = None
-        if descriptor is not None:
-            try:
-                active_attributes = termios.tcgetattr(descriptor)
-            except OSError, termios.error:
-                pass
-        self._restore_terminal_input()
-
-        if previous == signal.SIG_IGN:
-            self._resume_guarded_terminal(
-                descriptor,
-                original_attributes,
-                active_attributes,
-            )
-            return
-        if previous == signal.SIG_DFL or previous is None:
-            signal.signal(signum, signal.SIG_DFL)
-            os.kill(os.getpid(), signum)
-            # SIGTSTP returns here after SIGCONT; termination signals do not.
-            self._resume_guarded_terminal(
-                descriptor,
-                original_attributes,
-                active_attributes,
-            )
-            return
-        if callable(previous):
-            previous(signum, frame)
-            self._resume_guarded_terminal(
-                descriptor,
-                original_attributes,
-                active_attributes,
-            )
-
-    def _resume_guarded_terminal(
-        self,
-        descriptor: int | None,
-        original_attributes: list[object] | None,
-        active_attributes: list[object] | None,
-    ) -> None:
-        if (
-            not (self._active or self._prompt_active)
-            or descriptor is None
-            or original_attributes is None
-            or active_attributes is None
-            or not self._install_terminal_signal_handlers()
-        ):
-            return
-        self._terminal_input_descriptor = descriptor
-        self._terminal_input_attributes = original_attributes
-        try:
-            termios.tcsetattr(descriptor, termios.TCSANOW, active_attributes)
-        except OSError, termios.error:
-            self._restore_terminal_input()
 
     def _use_prompt_toolkit(self) -> bool:
         if not self.interactive:
@@ -816,9 +587,6 @@ class TerminalUI:
         return _isatty(self.input_stream) and (
             self.console.is_terminal or self._composer.prompt_output is not None
         )
-
-    def _turn_input(self) -> Input | None:
-        return self._composer.input_for_turn(self.input_stream)
 
     def _turn_input_timeout(self, prompt_input: Input) -> float:
         """Use the composer's VT-prefix timeout when it owns this input."""
@@ -888,71 +656,6 @@ class TerminalUI:
             InputMode.REPLACE: "R",
             InputMode.REPLACE_SINGLE: "R",
         }[input_mode]
-
-    async def _read_stream_line(self) -> str:
-        """Read a redirected line without leaving an uncancellable worker thread."""
-
-        try:
-            descriptor = self.input_stream.fileno()
-            descriptor_mode = os.fstat(descriptor).st_mode
-        except AttributeError, OSError, TypeError, ValueError:
-            return self._read_stream_line_synchronously()
-        if stat.S_ISREG(descriptor_mode):
-            return self._read_stream_line_synchronously()
-
-        while b"\n" not in self._line_buffer and not self._line_eof:
-            chunk = await self._read_ready_chunk(descriptor)
-            if chunk:
-                self._line_buffer.extend(chunk)
-            else:
-                self._line_eof = True
-
-        newline = self._line_buffer.find(b"\n")
-        if newline >= 0:
-            raw_value = bytes(self._line_buffer[: newline + 1])
-            del self._line_buffer[: newline + 1]
-        elif self._line_buffer:
-            raw_value = bytes(self._line_buffer)
-            self._line_buffer.clear()
-        else:
-            raise EOFError
-
-        encoding = getattr(self.input_stream, "encoding", None) or "utf-8"
-        errors = getattr(self.input_stream, "errors", None) or "strict"
-        return raw_value.decode(encoding, errors).rstrip("\r\n")
-
-    async def _read_ready_chunk(self, descriptor: int) -> bytes:
-        loop = asyncio.get_running_loop()
-        readable: asyncio.Future[bytes] = loop.create_future()
-
-        def read_ready() -> None:
-            if readable.done():
-                return
-            try:
-                chunk = os.read(descriptor, 65_536)
-            except BlockingIOError:
-                return
-            except OSError as error:
-                readable.set_exception(error)
-            else:
-                readable.set_result(chunk)
-
-        try:
-            loop.add_reader(descriptor, read_ready)
-        except (NotImplementedError, OSError) as error:
-            raise RuntimeError(
-                "redirected input requires a pollable POSIX file descriptor"
-            ) from error
-        try:
-            return await readable
-        finally:
-            loop.remove_reader(descriptor)
-
-    def _read_stream_line_synchronously(self) -> str:
-        value = self.input_stream.readline()
-        if value == "":
-            raise EOFError
-        return value.rstrip("\r\n")
 
 
 def _live_answer_tail(answer: str) -> str:

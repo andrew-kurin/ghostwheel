@@ -2,18 +2,21 @@
 
 This module owns prompt_toolkit-specific concerns: persistent history, slash
 and path completion, editor key bindings, and construction of the inline
-``PromptSession``. Terminal presentation and active-turn input handling remain
-in :mod:`ghostwheel.terminal_ui`.
+``PromptSession``. Terminal presentation remains in
+:mod:`ghostwheel.terminal_ui`; active-turn input handling lives in
+:mod:`ghostwheel.terminal_io`.
 """
 
 from __future__ import annotations
 
+import ctypes
 import datetime as dt
 import os
 import sys
 from collections.abc import Callable, Iterable
+from functools import lru_cache
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import (
@@ -45,6 +48,37 @@ from prompt_toolkit.styles import Style
 from ghostwheel.controller import COMMANDS
 
 _XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
+_MACOS_SHIFT_FLAG = 0x0002_0000
+_MACOS_COMBINED_SESSION_STATE = 0
+_CORE_GRAPHICS_PATH = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+
+
+@lru_cache(maxsize=1)
+def _macos_flags_reader() -> tuple[ctypes.CDLL, Any] | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        library = ctypes.CDLL(_CORE_GRAPHICS_PATH)
+        reader = library.CGEventSourceFlagsState
+        reader.argtypes = [ctypes.c_int]
+        reader.restype = ctypes.c_uint64
+    except AttributeError, OSError:
+        return None
+    return library, reader
+
+
+def _macos_shift_pressed() -> bool:
+    """Recover Shift state when macOS terminal input contains a bare Enter."""
+
+    resolved = _macos_flags_reader()
+    if resolved is None:
+        return False
+    _library, reader = resolved
+    try:
+        flags = int(reader(_MACOS_COMBINED_SESSION_STATE))
+    except OSError, TypeError, ValueError:
+        return False
+    return bool(flags & _MACOS_SHIFT_FLAG)
 
 
 def default_history_path() -> Path:
@@ -187,7 +221,8 @@ def _key_bindings() -> KeyBindings:
 
     @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
     def _submit_or_modified_shift_enter(event: KeyPressEvent) -> None:
-        if event.key_sequence[-1].data == _XTERM_SHIFT_ENTER:
+        data = event.key_sequence[-1].data
+        if data == _XTERM_SHIFT_ENTER or (data == "\r" and _macos_shift_pressed()):
             event.current_buffer.insert_text("\n")
         else:
             event.current_buffer.validate_and_handle()

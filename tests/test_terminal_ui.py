@@ -10,6 +10,8 @@ import sys
 import termios
 import textwrap
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 
@@ -21,9 +23,12 @@ from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
+from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
+from prompt_toolkit.keys import Keys
 from rich.console import Console
 
+import ghostwheel.terminal_io as terminal_io
 from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.runtime_contracts import TurnSucceeded
@@ -853,6 +858,73 @@ def test_fallback_tty_monitors_escape_and_ctrl_d_without_composer(
         os.close(slave)
 
 
+def test_detached_turn_input_callback_cannot_consume_the_next_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class QueuedCallbackInput:
+        closed = False
+
+        def __init__(self) -> None:
+            self.callback: Callable[[], None] | None = None
+            self.read_count = 0
+
+        @contextmanager
+        def raw_mode(self) -> Iterator[None]:
+            yield
+
+        @contextmanager
+        def attach(self, callback: Callable[[], None]) -> Iterator[None]:
+            self.callback = callback
+            yield
+
+        def read_keys(self) -> list[KeyPress]:
+            self.read_count += 1
+            return [KeyPress(Keys.ControlD)]
+
+        def flush_keys(self) -> list[KeyPress]:
+            return []
+
+    class RecordingCancellation:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def cancel(self) -> bool:
+            self.calls += 1
+            return True
+
+    async def scenario() -> None:
+        queued_input = QueuedCallbackInput()
+        cancellation = RecordingCancellation()
+        monkeypatch.setattr(terminal_io, "get_typeahead", lambda _input: ())
+        ui = make_ui(
+            workspace=tmp_path,
+            interactive=True,
+            prompt_input=queued_input,
+            prompt_output=DummyOutput(),
+            live=False,
+        )
+        try:
+            ui.turn_started()
+            with ui._capture_turn_input(cancellation):
+                assert queued_input.callback is not None
+                queued_callback = queued_input.callback
+            ui.turn_cancelled()
+
+            # Reproduce an event-loop reader callback that was queued before
+            # attach() detached it, but runs after the active turn has ended.
+            queued_callback()
+            await asyncio.sleep(0)
+
+            assert queued_input.read_count == 0
+            assert cancellation.calls == 0
+            assert not ui._quit_requested
+        finally:
+            ui.close()
+
+    asyncio.run(scenario())
+
+
 def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
     child = textwrap.dedent(
         f"""
@@ -1137,6 +1209,15 @@ def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
     assert rendered.count("**strong**") == 1
     assert rendered.count("[bold]literal[/bold]") == 1
     assert rendered.count("with-a-single-very-long-unwrapped-line") == 1
+    lines = rendered.splitlines()
+    streamed_answer_line = next(
+        index
+        for index, line in enumerate(lines)
+        if "with-a-single-very-long-unwrapped-line" in line
+    )
+    tool_output = lines[streamed_answer_line + 1 :]
+    assert tool_output[0].lstrip().startswith("▸ read")
+    assert all(line for line in tool_output)
 
 
 def test_non_live_success_without_text_events_prints_literal_fallback(
@@ -1158,6 +1239,51 @@ def test_non_live_success_without_text_events_prints_literal_fallback(
     rendered = output.getvalue()
     assert rendered.endswith("\nGhostwheel\n" + raw_answer + "\n")
     assert rendered.count(raw_answer) == 1
+
+
+def test_non_live_streamed_success_finishes_line_before_followup(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        interactive=False,
+        live=False,
+    )
+
+    ui.turn_started()
+    asyncio.run(ui.handle_event(TextOutput("partial answer", starts_part=True)))
+    ui.turn_outcome(TurnSucceeded("partial answer", ()))
+    ui.history_compacted(1_200, 600)
+
+    assert "partial answer\nContext compacted" in output.getvalue()
+
+
+def test_non_live_tools_start_on_the_line_after_streamed_text_without_gaps(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        width=120,
+        interactive=False,
+        live=False,
+    )
+
+    ui.turn_started()
+    asyncio.run(ui.handle_event(TextOutput("partial answer", starts_part=True)))
+    asyncio.run(ui.handle_event(ToolStarted("read", "file.py", call_id="1")))
+    asyncio.run(ui.handle_event(ToolFinished("read", "done", call_id="1")))
+
+    rendered = output.getvalue()
+    assert "partial answer\n  ▸ read" in rendered
+    assert "partial answer\n\n" not in rendered
+    lines = rendered.splitlines()
+    answer_line = lines.index("partial answer")
+    assert lines[answer_line + 1].lstrip().startswith("▸ read")
+    assert lines[answer_line + 2].lstrip().startswith("✓ read")
 
 
 def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None:

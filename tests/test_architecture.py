@@ -18,6 +18,7 @@ CANONICAL_RUNTIME_MODULES = (
     "compaction",
     "review",
     "terminal_composer",
+    "terminal_io",
     "terminal_ui",
 )
 
@@ -94,6 +95,13 @@ def test_terminal_ui_does_not_depend_on_entrypoint_or_composition_root() -> None
 
     assert "ghostwheel.cli" not in imported
     assert "ghostwheel.bootstrap" not in imported
+
+
+def test_terminal_platform_input_is_owned_by_terminal_io() -> None:
+    imported = _imported_modules(_module_tree("terminal_ui"))
+
+    assert "ghostwheel.terminal_io" in imported
+    assert imported.isdisjoint({"os", "signal", "stat", "termios"})
 
 
 def test_legacy_terminal_adapters_are_removed() -> None:
