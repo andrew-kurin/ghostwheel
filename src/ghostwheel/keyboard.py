@@ -21,7 +21,7 @@ def _macos_flags_reader() -> tuple[ctypes.CDLL, Any] | None:
         reader = library.CGEventSourceFlagsState
         reader.argtypes = [ctypes.c_int]
         reader.restype = ctypes.c_uint64
-    except (AttributeError, OSError):
+    except AttributeError, OSError:
         return None
     return library, reader
 
@@ -35,6 +35,6 @@ def macos_shift_pressed() -> bool:
     _library, reader = resolved
     try:
         flags = int(reader(MACOS_COMBINED_SESSION_STATE))
-    except (OSError, TypeError, ValueError):
+    except OSError, TypeError, ValueError:
         return False
     return bool(flags & MACOS_SHIFT_FLAG)

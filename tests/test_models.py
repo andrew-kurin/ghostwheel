@@ -2,7 +2,15 @@ import pytest
 from pydantic_ai.models.ollama import OllamaModel
 from pydantic_ai.models.openai import OpenAIChatModel
 
-from ghostwheel.model_config import ModelSpec as ConfigurationModelSpec
+import ghostwheel.providers as provider_adapters
+from ghostwheel.model_config import (
+    MODEL_PROVIDER_ALIASES,
+    MODEL_PROVIDER_DEFAULT_BASE_URLS,
+    MODEL_PROVIDER_DESCRIPTORS,
+    SUPPORTED_PROVIDERS,
+    ModelSpec as ConfigurationModelSpec,
+    model_provider_descriptor,
+)
 from ghostwheel.models import (
     ModelProvider,
     ModelSpec,
@@ -50,12 +58,43 @@ def test_default_base_url_rejects_unknown_provider() -> None:
         default_base_url("missing")
 
 
-def test_provider_registry_owns_aliases_and_defaults() -> None:
+def test_neutral_provider_descriptor_owns_aliases_and_defaults() -> None:
+    descriptor = model_provider_descriptor("llama.cpp")
     registration = provider_registration("llama.cpp")
 
-    assert registration.provider is ModelProvider.LLAMA_CPP
-    assert "llama.cpp" in registration.aliases
-    assert registration.default_base_url == "http://localhost:8080/v1"
+    assert descriptor.provider is ModelProvider.LLAMA_CPP
+    assert "llama.cpp" in descriptor.aliases
+    assert descriptor.default_base_url == "http://localhost:8080/v1"
+    assert registration.provider is descriptor.provider
+    assert registration.aliases is descriptor.aliases
+    assert registration.default_base_url == descriptor.default_base_url
+
+
+def test_provider_metadata_views_are_derived_from_the_descriptor_registry() -> None:
+    descriptors = tuple(MODEL_PROVIDER_DESCRIPTORS.values())
+
+    assert set(MODEL_PROVIDER_DESCRIPTORS) == set(ModelProvider)
+    assert SUPPORTED_PROVIDERS == tuple(
+        descriptor.canonical_id for descriptor in descriptors
+    )
+    assert dict(MODEL_PROVIDER_ALIASES) == {
+        alias: descriptor.provider
+        for descriptor in descriptors
+        for alias in descriptor.aliases
+    }
+    assert dict(MODEL_PROVIDER_DEFAULT_BASE_URLS) == {
+        descriptor.provider: descriptor.default_base_url for descriptor in descriptors
+    }
+
+
+def test_provider_adapter_keys_exactly_match_validated_descriptors() -> None:
+    assert set(provider_adapters._PROVIDER_ADAPTERS) == set(MODEL_PROVIDER_DESCRIPTORS)
+
+
+def test_provider_registry_covers_every_canonical_provider() -> None:
+    assert {
+        provider_registration(provider).provider for provider in ModelProvider
+    } == set(ModelProvider)
 
 
 def test_build_model_creates_ollama_model() -> None:

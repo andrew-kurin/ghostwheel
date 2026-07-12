@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
-from hashlib import sha256
 from collections.abc import Sequence
+from hashlib import sha256
+import json
 
 from pydantic_ai.messages import (
     ModelMessage,
@@ -18,14 +18,14 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-from ghostwheel.session import (
+from ghostwheel.history import conversation_atoms, summary_message
+from ghostwheel.runtime_contracts import (
     AgentRunner,
     FailureKind,
     RunOutcome,
     TurnFailed,
     TurnNoResult,
     TurnSucceeded,
-    summary_message,
 )
 from ghostwheel.token_counting import (
     TextTokenCounter,
@@ -125,7 +125,7 @@ class HistoryCompactor:
                 ValueError("target_tokens must be positive"),
                 FailureKind.CONFIGURATION,
             )
-        pending = list(_summary_atoms(messages))
+        pending = list(conversation_atoms(messages))
         current_summary = previous_summary
         if not pending:
             conversation = "[No new messages]"
@@ -331,33 +331,6 @@ def serialize_conversation(messages: Sequence[ModelMessage]) -> str:
         elif isinstance(message, ModelResponse):
             _serialize_response(message, lines)
     return "\n".join(lines) or "[No messages]"
-
-
-def _summary_atoms(
-    messages: Sequence[ModelMessage],
-) -> tuple[tuple[ModelMessage, ...], ...]:
-    """Keep assistant tool calls and their result requests in one summary chunk."""
-
-    atoms: list[tuple[ModelMessage, ...]] = []
-    index = 0
-    while index < len(messages):
-        message = messages[index]
-        atom = [message]
-        index += 1
-        if isinstance(message, ModelResponse) and any(
-            isinstance(part, ToolCallPart) for part in message.parts
-        ):
-            while index < len(messages):
-                following = messages[index]
-                if not isinstance(following, ModelRequest) or not any(
-                    isinstance(part, (ToolReturnPart, RetryPromptPart))
-                    for part in following.parts
-                ):
-                    break
-                atom.append(following)
-                index += 1
-        atoms.append(tuple(atom))
-    return tuple(atoms)
 
 
 def _tool_pair_manifest(atom: Sequence[ModelMessage]) -> str:

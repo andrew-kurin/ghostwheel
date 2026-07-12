@@ -9,12 +9,14 @@ import pytest
 from rich.console import Console
 
 from ghostwheel.cli import (
-    CommandKind,
     _interactive_mode,
     build_parser,
     main,
-    parse_command,
     run_cli,
+)
+from ghostwheel.controller import (
+    CommandKind,
+    parse_command,
 )
 from ghostwheel.events import (
     TextOutput,
@@ -290,6 +292,49 @@ def test_cli_help_and_terminal_mode_detection(
         _interactive_mode("interactive", Stream(False), Stream(True))
 
 
+def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ghostwheel.bootstrap as bootstrap_module
+    import ghostwheel.cli as cli_module
+    import ghostwheel.config as config_module
+    import ghostwheel.telemetry as telemetry_module
+
+    config = SimpleNamespace(observability=object())
+    runtime_built = False
+    rejected_coroutine: object | None = None
+
+    class FakeSettings:
+        def resolve(self) -> object:
+            return config
+
+    def unexpected_build(*_args: object, **_kwargs: object) -> None:
+        nonlocal runtime_built
+        runtime_built = True
+
+    def reject_coroutine(coroutine: object) -> None:
+        nonlocal rejected_coroutine
+        rejected_coroutine = coroutine
+        raise RuntimeError("event loop unavailable")
+
+    monkeypatch.setattr(cli_module, "_interactive_mode", lambda *_args: False)
+    monkeypatch.setattr(config_module, "Settings", FakeSettings)
+    monkeypatch.setattr(
+        telemetry_module,
+        "configure_observability",
+        lambda _value: None,
+    )
+    monkeypatch.setattr(bootstrap_module, "build_runtime", unexpected_build)
+    monkeypatch.setattr(cli_module.asyncio, "run", reject_coroutine)
+
+    with pytest.raises(RuntimeError, match="event loop unavailable"):
+        main(["--ui", "plain", "--no-history"])
+
+    assert runtime_built is False
+    assert rejected_coroutine is not None
+    assert getattr(rejected_coroutine, "cr_frame") is None
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expected"),
     [([], True), (["--vim"], True), (["--no-vim"], False)],
@@ -306,12 +351,20 @@ def test_main_passes_vim_mode_to_the_interactive_app(
     import ghostwheel.textual_ui as textual_module
 
     captured: dict[str, object] = {}
-    application = SimpleNamespace(
-        session=object(),
-        reviews=object(),
-        presenter=SimpleNamespace(app_info=object()),
-        close=lambda: captured.__setitem__("closed", True),
-    )
+
+    class FakeRuntime:
+        session = object()
+        reviews = object()
+        app_info = object()
+
+        async def __aenter__(self) -> "FakeRuntime":
+            captured["started"] = True
+            return self
+
+        async def __aexit__(self, *_exc_info: object) -> None:
+            captured["closed"] = True
+
+    runtime = FakeRuntime()
     config = SimpleNamespace(
         observability=object(),
         history=SimpleNamespace(
@@ -330,11 +383,12 @@ def test_main_passes_vim_mode_to_the_interactive_app(
             return config
 
     class FakeTextualApp:
-        def __init__(self, *_args: object, **kwargs: object) -> None:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["runtime_args"] = args
             captured.update(kwargs)
             self.presenter = SimpleNamespace(handle_event=lambda _event: None)
 
-        def run(self, **kwargs: object) -> None:
+        async def run_async(self, **kwargs: object) -> None:
             captured["ran"] = True
             captured["run_kwargs"] = kwargs
 
@@ -343,16 +397,17 @@ def test_main_passes_vim_mode_to_the_interactive_app(
     monkeypatch.setattr(
         telemetry_module, "configure_observability", lambda _value: None
     )
-    monkeypatch.setattr(
-        bootstrap_module, "build_application", lambda *_a, **_k: application
-    )
+    monkeypatch.setattr(bootstrap_module, "build_runtime", lambda *_a, **_k: runtime)
     monkeypatch.setattr(textual_module, "GhostwheelApp", FakeTextualApp)
 
     main(["--ui", "interactive", "--no-history", *extra_args])
 
     assert captured["vim_mode"] is expected
+    assert captured["runtime_args"] == (runtime.session, runtime.reviews)
+    assert captured["app_info"] is runtime.app_info
     assert captured["ran"] is True
     assert captured["run_kwargs"] == {"mouse": True}
+    assert captured["started"] is True
     assert captured["closed"] is True
 
 

@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 class Severity(str, Enum):
@@ -48,17 +48,17 @@ class Finding(BaseModel):
 class ReviewResult(BaseModel):
     summary: str = Field(description="Summary of the review result")
     findings: list[Finding]
-    approve: bool = Field(
-        default=False,
+
+    @computed_field(
         description=(
             "Derived from findings: true exactly when there are no warnings or blockers"
-        ),
+        )
     )
+    @property
+    def approve(self) -> bool:
+        """Return the verdict as a durable derivative of finding severities."""
 
-    @model_validator(mode="after")
-    def derive_approval(self) -> Self:
-        self.approve = not any(
+        return not any(
             finding.severity in {Severity.WARNING, Severity.BLOCKER}
             for finding in self.findings
         )
-        return self

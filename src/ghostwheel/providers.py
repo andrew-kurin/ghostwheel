@@ -1,7 +1,8 @@
-"""Provider registry and Pydantic AI model adapters."""
+"""Pydantic-AI adapter factories for framework-neutral model providers."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final
 
 from pydantic_ai.models import Model
@@ -12,17 +13,14 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from ghostwheel.model_config import (
-    MODEL_PROVIDER_ALIASES,
-    SUPPORTED_PROVIDERS as MODEL_SUPPORTED_PROVIDERS,
+    MODEL_PROVIDER_DESCRIPTORS,
+    SUPPORTED_PROVIDERS as SUPPORTED_PROVIDERS,
     ModelProvider,
     ModelSpec,
     default_model_base_url,
-    model_provider_key,
+    model_provider_descriptor,
     validate_model_provider,
 )
-
-SUPPORTED_PROVIDERS = MODEL_SUPPORTED_PROVIDERS
-
 
 # llama.cpp exposes an OpenAI-compatible Chat Completions API, but it is not
 # OpenAI. Keep the OpenAI wire format while using a local-friendly profile.
@@ -38,9 +36,15 @@ StructuredOutputSettingsFactory = Callable[[ModelSpec], OpenAIChatModelSettings 
 ModelFactory = Callable[[ModelSpec], Model]
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderAdapter:
+    model_factory: ModelFactory
+    structured_output_settings_factory: StructuredOutputSettingsFactory
+
+
 @dataclass(frozen=True)
 class ProviderRegistration:
-    """All provider-specific behavior and metadata in one registry entry."""
+    """Compatibility aggregate composed from a descriptor and SDK adapter."""
 
     provider: ModelProvider
     aliases: frozenset[str]
@@ -76,53 +80,39 @@ def _llama_cpp_structured_output_settings(
     )
 
 
-_PROVIDER_REGISTRY: Final[dict[ModelProvider, ProviderRegistration]] = {
-    ModelProvider.OLLAMA: ProviderRegistration(
-        provider=ModelProvider.OLLAMA,
-        aliases=frozenset(),
-        default_base_url=default_model_base_url(ModelProvider.OLLAMA),
-        model_factory=_build_ollama,
-        structured_output_settings_factory=_ollama_structured_output_settings,
-    ),
-    ModelProvider.LLAMA_CPP: ProviderRegistration(
-        provider=ModelProvider.LLAMA_CPP,
-        aliases=frozenset(
-            alias
-            for alias, provider in MODEL_PROVIDER_ALIASES.items()
-            if provider is ModelProvider.LLAMA_CPP
+_PROVIDER_ADAPTERS: Final[Mapping[ModelProvider, _ProviderAdapter]] = MappingProxyType(
+    {
+        ModelProvider.OLLAMA: _ProviderAdapter(
+            model_factory=_build_ollama,
+            structured_output_settings_factory=_ollama_structured_output_settings,
         ),
-        default_base_url=default_model_base_url(ModelProvider.LLAMA_CPP),
-        model_factory=_build_llama_cpp,
-        structured_output_settings_factory=_llama_cpp_structured_output_settings,
-    ),
-}
+        ModelProvider.LLAMA_CPP: _ProviderAdapter(
+            model_factory=_build_llama_cpp,
+            structured_output_settings_factory=_llama_cpp_structured_output_settings,
+        ),
+    }
+)
 
 
-def _provider_key(provider: str | ModelProvider) -> str:
-    return model_provider_key(provider)
-
-
-def _provider_lookup() -> dict[str, ModelProvider]:
-    lookup: dict[str, ModelProvider] = {}
-    for registration in _PROVIDER_REGISTRY.values():
-        lookup[_provider_key(registration.provider)] = registration.provider
-        lookup.update(
-            {
-                _provider_key(alias): registration.provider
-                for alias in registration.aliases
-            }
+def _validate_adapter_registry() -> None:
+    descriptor_keys = set(MODEL_PROVIDER_DESCRIPTORS)
+    adapter_keys = set(_PROVIDER_ADAPTERS)
+    if adapter_keys != descriptor_keys:
+        missing = sorted(provider.value for provider in descriptor_keys - adapter_keys)
+        extra = sorted(provider.value for provider in adapter_keys - descriptor_keys)
+        raise RuntimeError(
+            "Provider adapter registry keys must exactly match provider descriptors; "
+            f"missing={missing}, extra={extra}"
         )
-    return lookup
 
 
-_PROVIDER_LOOKUP: Final = _provider_lookup()
+_validate_adapter_registry()
 
 
 def normalize_provider(provider: str | ModelProvider) -> ModelProvider:
     """Resolve a provider name or alias to its validated canonical value."""
-    normalized = validate_model_provider(provider)
-    # Assert registry completeness at the adapter boundary.
-    return _PROVIDER_LOOKUP[_provider_key(normalized)]
+
+    return validate_model_provider(provider)
 
 
 def validate_provider(provider: str | ModelProvider) -> ModelProvider:
@@ -134,24 +124,35 @@ def validate_provider(provider: str | ModelProvider) -> ModelProvider:
 def provider_registration(
     provider: str | ModelProvider,
 ) -> ProviderRegistration:
-    return _PROVIDER_REGISTRY[normalize_provider(provider)]
+    normalized = normalize_provider(provider)
+    descriptor = model_provider_descriptor(normalized)
+    adapter = _PROVIDER_ADAPTERS[normalized]
+    return ProviderRegistration(
+        provider=descriptor.provider,
+        aliases=descriptor.aliases,
+        default_base_url=descriptor.default_base_url,
+        model_factory=adapter.model_factory,
+        structured_output_settings_factory=adapter.structured_output_settings_factory,
+    )
 
 
 def default_base_url(provider: str | ModelProvider) -> str:
-    return provider_registration(provider).default_base_url
+    return default_model_base_url(provider)
 
 
 def build_model(spec: ModelSpec) -> Model:
-    return provider_registration(spec.provider).model_factory(spec)
+    adapter = _PROVIDER_ADAPTERS[normalize_provider(spec.provider)]
+    return adapter.model_factory(spec)
 
 
 def structured_output_model_settings(
     spec: ModelSpec,
 ) -> OpenAIChatModelSettings | None:
-    registration = provider_registration(spec.provider)
-    return registration.structured_output_settings_factory(spec)
+    adapter = _PROVIDER_ADAPTERS[normalize_provider(spec.provider)]
+    return adapter.structured_output_settings_factory(spec)
 
 
 def formatter_model_settings(spec: ModelSpec) -> OpenAIChatModelSettings | None:
     """Compatibility alias for structured-output model settings."""
+
     return structured_output_model_settings(spec)

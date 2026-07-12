@@ -1,5 +1,8 @@
 # Ghostwheel
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for module ownership and dependency
+direction.
+
 Ghostwheel is a local-first coding assistant and code-review CLI built with
 Pydantic AI. It connects to either Ollama or a llama.cpp OpenAI-compatible
 server.

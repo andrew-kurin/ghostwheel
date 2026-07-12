@@ -1,38 +1,186 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from typing import Literal, TypeAlias
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ghostwheel.history_config import (
+    COMPACTION_REQUEST_OVERHEAD_TOKENS as COMPACTION_REQUEST_OVERHEAD_TOKENS,
+    DEFAULT_HISTORY_CONFIG,
+    MIN_COMPACTION_INPUT_TOKENS as MIN_COMPACTION_INPUT_TOKENS,
+    CompactionConfig,
+    HistoryConfig,
+    validate_compactor_capacity,
+)
 from ghostwheel.model_config import (
     ModelProvider,
     ModelSpec,
     default_model_base_url,
     validate_model_provider,
 )
+from ghostwheel.tool_config import DEFAULT_TOOL_LIMITS, ToolLimits, ToolProfile
 
 LogfireSendTo: TypeAlias = bool | Literal["if-token-present"]
-ToolProfileName: TypeAlias = Literal["read-only", "shell-only", "full"]
-COMPACTION_REQUEST_OVERHEAD_TOKENS = 512
-MIN_COMPACTION_INPUT_TOKENS = 1_024
+# Import-compatible alias retained for callers of the former literal type.
+ToolProfileName: TypeAlias = ToolProfile
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ToolConfig:
+    """Resolved tool configuration with one canonical limits value.
+
+    The scalar dataclass fields retain the original construction, reflection,
+    ``asdict()``, and ``replace()`` API. They are immutable mirrors populated
+    from the canonical :class:`ToolLimits` object exposed by ``limits``; runtime
+    composition passes that object onward unchanged.
+    """
+
     max_output_bytes: int
     max_read_lines: int
     max_read_scan_bytes: int
     max_entries: int
     max_directory_scan_entries: int
     max_matches: int
-    bash_timeout_seconds: int
+    bash_timeout_seconds: float
     max_search_file_bytes: int
     max_search_total_bytes: int
     max_search_files: int
     search_timeout_seconds: float
     regex_timeout_seconds: float
-    profile: ToolProfileName
-    review_profile: ToolProfileName
+    profile: ToolProfile
+    review_profile: ToolProfile
+
+    def __init__(
+        self,
+        max_output_bytes: int | ToolLimits | None = None,
+        max_read_lines: int | ToolProfile | str | None = None,
+        max_read_scan_bytes: int | ToolProfile | str | None = None,
+        max_entries: int | None = None,
+        max_directory_scan_entries: int | None = None,
+        max_matches: int | None = None,
+        bash_timeout_seconds: float | None = None,
+        max_search_file_bytes: int | None = None,
+        max_search_total_bytes: int | None = None,
+        max_search_files: int | None = None,
+        search_timeout_seconds: float | None = None,
+        regex_timeout_seconds: float | None = None,
+        profile: ToolProfile | str | None = None,
+        review_profile: ToolProfile | str | None = None,
+        *,
+        limits: ToolLimits | None = None,
+    ) -> None:
+        """Accept both the original flat API and canonical ``limits=`` API."""
+
+        # The refactor briefly exposed ``(limits, profile, review_profile)`` as the
+        # positional dataclass order. Preserve that form as well as the original
+        # fourteen-value scalar order.
+        if isinstance(max_output_bytes, ToolLimits):
+            if limits is not None:
+                raise TypeError("limits was provided more than once")
+            if any(
+                value is not None
+                for value in (
+                    max_entries,
+                    max_directory_scan_entries,
+                    max_matches,
+                    bash_timeout_seconds,
+                    max_search_file_bytes,
+                    max_search_total_bytes,
+                    max_search_files,
+                    search_timeout_seconds,
+                    regex_timeout_seconds,
+                )
+            ):
+                raise TypeError(
+                    "The positional limits form accepts only limits and profiles"
+                )
+            limits = max_output_bytes
+            if max_read_lines is not None:
+                if profile is not None:
+                    raise TypeError("profile was provided more than once")
+                profile = max_read_lines
+            if max_read_scan_bytes is not None:
+                if review_profile is not None:
+                    raise TypeError("review_profile was provided more than once")
+                review_profile = max_read_scan_bytes
+            max_output_bytes = None
+            max_read_lines = None
+            max_read_scan_bytes = None
+
+        if profile is None:
+            raise TypeError("profile is required")
+        if review_profile is None:
+            raise TypeError("review_profile is required")
+        if limits is not None and not isinstance(limits, ToolLimits):
+            raise TypeError("limits must be a ToolLimits instance")
+
+        overrides = {
+            name: value
+            for name, value in {
+                "max_output_bytes": max_output_bytes,
+                "max_read_lines": max_read_lines,
+                "max_read_scan_bytes": max_read_scan_bytes,
+                "max_entries": max_entries,
+                "max_directory_scan_entries": max_directory_scan_entries,
+                "max_matches": max_matches,
+                "bash_timeout_seconds": bash_timeout_seconds,
+                "max_search_file_bytes": max_search_file_bytes,
+                "max_search_total_bytes": max_search_total_bytes,
+                "max_search_files": max_search_files,
+                "search_timeout_seconds": search_timeout_seconds,
+                "regex_timeout_seconds": regex_timeout_seconds,
+            }.items()
+            if value is not None
+        }
+        if limits is not None and overrides:
+            raise TypeError(
+                "limits cannot be combined with scalar limit values; use "
+                "ToolConfig.from_limits() or config.with_limits()"
+            )
+        base_limits = DEFAULT_TOOL_LIMITS if limits is None else limits
+        resolved_limits = (
+            base_limits if not overrides else replace(base_limits, **overrides)
+        )
+        for limit_field in fields(ToolLimits):
+            object.__setattr__(
+                self,
+                limit_field.name,
+                getattr(resolved_limits, limit_field.name),
+            )
+        object.__setattr__(self, "profile", ToolProfile(profile))
+        object.__setattr__(self, "review_profile", ToolProfile(review_profile))
+        object.__setattr__(self, "_limits", resolved_limits)
+
+    @classmethod
+    def from_limits(
+        cls,
+        limits: ToolLimits,
+        *,
+        profile: ToolProfile | str,
+        review_profile: ToolProfile | str,
+    ) -> ToolConfig:
+        """Construct directly from one canonical limits object."""
+
+        return cls(
+            limits=limits,
+            profile=profile,
+            review_profile=review_profile,
+        )
+
+    def with_limits(self, limits: ToolLimits) -> ToolConfig:
+        """Return an equivalent profile configuration using ``limits`` by identity."""
+
+        return type(self).from_limits(
+            limits,
+            profile=self.profile,
+            review_profile=self.review_profile,
+        )
+
+    @property
+    def limits(self) -> ToolLimits:
+        """Return the canonical limits object mirrored by the scalar fields."""
+
+        return self.__dict__["_limits"]
 
 
 @dataclass(frozen=True)
@@ -44,57 +192,6 @@ class ReviewConfig:
 
 # Kept as an import-compatible name for callers of the original configuration API.
 FormatterConfig = ReviewConfig
-
-
-@dataclass(frozen=True)
-class CompactionConfig:
-    enabled: bool
-    reserve_tokens: int
-    keep_recent_tokens: int
-    summary_tokens: int
-
-
-@dataclass(frozen=True)
-class HistoryConfig:
-    context_window_tokens: int
-    compaction: CompactionConfig
-
-    def __post_init__(self) -> None:
-        if self.context_window_tokens <= 0:
-            raise ValueError("history context window must be positive")
-        if self.compaction.reserve_tokens < 0:
-            raise ValueError("compaction reserve must be non-negative")
-        if self.compaction.keep_recent_tokens <= 0:
-            raise ValueError("compaction recent-token target must be positive")
-        if self.compaction.summary_tokens <= 0:
-            raise ValueError("compaction summary-token budget must be positive")
-        if self.compaction.reserve_tokens >= self.context_window_tokens:
-            raise ValueError(
-                "compaction reserve must be smaller than the context window"
-            )
-        if self.compaction.keep_recent_tokens >= (
-            self.context_window_tokens - self.compaction.reserve_tokens
-        ):
-            raise ValueError(
-                "compaction recent-token target must leave room for a summary"
-            )
-        if (
-            self.compaction.keep_recent_tokens + self.compaction.summary_tokens
-            >= self.context_window_tokens - self.compaction.reserve_tokens
-        ):
-            raise ValueError(
-                "compaction recent and summary token budgets must leave working room"
-            )
-        if (
-            self.context_window_tokens
-            - self.compaction.summary_tokens
-            - COMPACTION_REQUEST_OVERHEAD_TOKENS
-            < self.compaction.summary_tokens + MIN_COMPACTION_INPUT_TOKENS
-        ):
-            raise ValueError(
-                "compactor input budget must fit the prior summary and at least "
-                f"{MIN_COMPACTION_INPUT_TOKENS} prompt tokens"
-            )
 
 
 @dataclass(frozen=True)
@@ -111,6 +208,9 @@ class AppConfig:
     tools: ToolConfig
     history: HistoryConfig
     observability: ObservabilityConfig
+
+    def __post_init__(self) -> None:
+        validate_compactor_capacity(self.history)
 
     @property
     def formatter(self) -> ReviewConfig:
@@ -147,30 +247,115 @@ class Settings(BaseSettings):
     review_retries: int | None = Field(default=None, ge=0)
     review_raw_fallback: bool = True
 
-    max_output_bytes: int = Field(default=100_000, gt=0)
-    max_read_lines: int = Field(default=200, gt=0)
-    max_read_scan_bytes: int = Field(default=5_000_000, gt=0)
-    max_entries: int = Field(default=200, gt=0)
-    max_directory_scan_entries: int = Field(default=10_000, gt=0)
-    max_matches: int = Field(default=200, gt=0)
-    bash_timeout_seconds: int = Field(default=30, gt=0)
-    max_search_file_bytes: int = Field(default=5_000_000, gt=0)
-    max_search_total_bytes: int = Field(default=50_000_000, gt=0)
-    max_search_files: int = Field(default=10_000, gt=0)
-    search_timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
-    regex_timeout_seconds: float = Field(default=0.05, gt=0, allow_inf_nan=False)
-    tool_profile: ToolProfileName = "full"
-    review_tool_profile: ToolProfileName = "full"
+    max_output_bytes: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_output_bytes,
+        gt=0,
+    )
+    max_read_lines: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_read_lines,
+        gt=0,
+    )
+    max_read_scan_bytes: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_read_scan_bytes,
+        gt=0,
+    )
+    max_entries: int = Field(default=DEFAULT_TOOL_LIMITS.max_entries, gt=0)
+    max_directory_scan_entries: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_directory_scan_entries,
+        gt=0,
+    )
+    max_matches: int = Field(default=DEFAULT_TOOL_LIMITS.max_matches, gt=0)
+    bash_timeout_seconds: float = Field(
+        default=DEFAULT_TOOL_LIMITS.bash_timeout_seconds,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    max_search_file_bytes: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_search_file_bytes,
+        gt=0,
+    )
+    max_search_total_bytes: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_search_total_bytes,
+        gt=0,
+    )
+    max_search_files: int = Field(
+        default=DEFAULT_TOOL_LIMITS.max_search_files,
+        gt=0,
+    )
+    search_timeout_seconds: float = Field(
+        default=DEFAULT_TOOL_LIMITS.search_timeout_seconds,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    regex_timeout_seconds: float = Field(
+        default=DEFAULT_TOOL_LIMITS.regex_timeout_seconds,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    tool_profile: ToolProfile = ToolProfile.FULL
+    review_tool_profile: ToolProfile = ToolProfile.FULL
 
-    history_context_window_tokens: int = Field(default=16_384, gt=0)
-    compaction_enabled: bool = True
-    compaction_reserve_tokens: int = Field(default=4_096, ge=0)
-    compaction_keep_recent_tokens: int = Field(default=4_096, gt=0)
-    compaction_summary_tokens: int = Field(default=2_048, gt=0)
+    history_context_window_tokens: int = Field(
+        default=DEFAULT_HISTORY_CONFIG.context_window_tokens,
+        gt=0,
+    )
+    compaction_enabled: bool = DEFAULT_HISTORY_CONFIG.compaction.enabled
+    compaction_reserve_tokens: int = Field(
+        default=DEFAULT_HISTORY_CONFIG.compaction.reserve_tokens,
+        ge=0,
+    )
+    compaction_keep_recent_tokens: int = Field(
+        default=DEFAULT_HISTORY_CONFIG.compaction.keep_recent_tokens,
+        gt=0,
+    )
+    compaction_summary_tokens: int = Field(
+        default=DEFAULT_HISTORY_CONFIG.compaction.summary_tokens,
+        gt=0,
+    )
 
     observability_enabled: bool = False
     observability_include_content: bool = False
     observability_send_to_logfire: LogfireSendTo = "if-token-present"
+
+    @field_validator(
+        "max_output_bytes",
+        "max_read_lines",
+        "max_read_scan_bytes",
+        "max_entries",
+        "max_directory_scan_entries",
+        "max_matches",
+        "max_search_file_bytes",
+        "max_search_total_bytes",
+        "max_search_files",
+        mode="before",
+    )
+    @classmethod
+    def _validate_integer_tool_limit_input(cls, value: object) -> object:
+        """Reject coercions that would weaken ``ToolLimits`` integer types."""
+
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate[:1] in {"+", "-"}:
+                candidate = candidate[1:]
+            if candidate.isdecimal():
+                return value
+        elif isinstance(value, int) and not isinstance(value, bool):
+            return value
+        raise ValueError("tool integer limits must be integers")
+
+    @field_validator(
+        "bash_timeout_seconds",
+        "search_timeout_seconds",
+        "regex_timeout_seconds",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_timeout_input(cls, value: object) -> object:
+        """Prevent booleans from being coerced into numeric timeouts."""
+
+        if isinstance(value, bool):
+            raise ValueError("tool timeouts must be real numbers, not booleans")
+        return value
 
     def resolve(self) -> AppConfig:
         chat_model = self._chat_model_spec()
@@ -188,18 +373,20 @@ class Settings(BaseSettings):
                 raw_fallback=self.review_raw_fallback,
             ),
             tools=ToolConfig(
-                max_output_bytes=self.max_output_bytes,
-                max_read_lines=self.max_read_lines,
-                max_read_scan_bytes=self.max_read_scan_bytes,
-                max_entries=self.max_entries,
-                max_directory_scan_entries=self.max_directory_scan_entries,
-                max_matches=self.max_matches,
-                bash_timeout_seconds=self.bash_timeout_seconds,
-                max_search_file_bytes=self.max_search_file_bytes,
-                max_search_total_bytes=self.max_search_total_bytes,
-                max_search_files=self.max_search_files,
-                search_timeout_seconds=self.search_timeout_seconds,
-                regex_timeout_seconds=self.regex_timeout_seconds,
+                limits=ToolLimits(
+                    max_output_bytes=self.max_output_bytes,
+                    max_read_lines=self.max_read_lines,
+                    max_read_scan_bytes=self.max_read_scan_bytes,
+                    max_entries=self.max_entries,
+                    max_directory_scan_entries=self.max_directory_scan_entries,
+                    max_matches=self.max_matches,
+                    bash_timeout_seconds=self.bash_timeout_seconds,
+                    max_search_file_bytes=self.max_search_file_bytes,
+                    max_search_total_bytes=self.max_search_total_bytes,
+                    max_search_files=self.max_search_files,
+                    search_timeout_seconds=self.search_timeout_seconds,
+                    regex_timeout_seconds=self.regex_timeout_seconds,
+                ),
                 profile=self.tool_profile,
                 review_profile=self.review_tool_profile,
             ),

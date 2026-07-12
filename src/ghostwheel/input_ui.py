@@ -5,24 +5,14 @@ from __future__ import annotations
 import datetime as dt
 import os
 from pathlib import Path
-from typing import Protocol
 
 from rich.console import Console
 
-
-COMMANDS = (
-    "/clear",
-    "/help",
-    "/model",
-    "/quit",
-    "/retry",
-    "/review",
-    "/tools",
-)
+from ghostwheel.controller import COMMANDS as COMMANDS
+from ghostwheel.controller import InputPort
 
 
-class InputReader(Protocol):
-    async def read(self) -> str: ...
+InputReader = InputPort
 
 
 class ConsoleInputReader:
@@ -72,7 +62,9 @@ class InputHistory:
             return []
         entries: list[str] = []
         lines: list[str] = []
-        for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in self.path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
             if line.startswith("+"):
                 lines.append(line[1:])
             elif lines:

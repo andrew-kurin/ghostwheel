@@ -1,19 +1,14 @@
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from enum import Enum
 from typing import Protocol, TypeAlias
 
+from ghostwheel.tool_config import ToolProfile
 from ghostwheel.tools.bash import bash
-from ghostwheel.tools.filesystem import ls, read
+from ghostwheel.tools.listing import ls
+from ghostwheel.tools.read import read
 from ghostwheel.tools.search import grep
 
 ToolCallable: TypeAlias = Callable[..., object]
-
-
-class ToolProfile(str, Enum):
-    READ_ONLY = "read-only"
-    SHELL_ONLY = "shell-only"
-    FULL = "full"
 
 
 class ToolRegistrar(Protocol):
@@ -27,7 +22,11 @@ class ToolCatalog:
     read_only: tuple[ToolCallable, ...]
     shell: tuple[ToolCallable, ...]
 
-    def for_profile(self, profile: ToolProfile) -> tuple[ToolCallable, ...]:
+    def for_profile(
+        self,
+        profile: ToolProfile | str,
+    ) -> tuple[ToolCallable, ...]:
+        profile = ToolProfile(profile)
         if profile is ToolProfile.READ_ONLY:
             return self.read_only
         if profile is ToolProfile.SHELL_ONLY:
@@ -48,7 +47,7 @@ def register_tools(
     tools: Iterable[ToolCallable] | None = None,
     *,
     catalog: ToolCatalog = DEFAULT_TOOL_CATALOG,
-    profile: ToolProfile = ToolProfile.FULL,
+    profile: ToolProfile | str = ToolProfile.FULL,
 ) -> None:
     selected_tools = catalog.for_profile(profile) if tools is None else tuple(tools)
     for tool in selected_tools:

@@ -63,18 +63,30 @@ def _pin_root(
     path: Path | str,
     *,
     relative_to: Path | None = None,
-) -> tuple[Path, int]:
+) -> tuple[Path, int, os.stat_result]:
     """Resolve and pin a root, rejecting changes during initialization."""
     candidate = Path(path).expanduser()
     if not candidate.is_absolute() and relative_to is not None:
         candidate = relative_to / candidate
+    initial_stat = os.stat(candidate)
     before = candidate.resolve(strict=True)
+    expected_stat = os.stat(before, follow_symlinks=False)
+    if (initial_stat.st_dev, initial_stat.st_ino) != (
+        expected_stat.st_dev,
+        expected_stat.st_ino,
+    ):
+        raise RuntimeError(f"Workspace root changed during setup: {candidate}")
     descriptor = _open_absolute_directory(before)
     try:
+        first_stat = os.fstat(descriptor)
+        if (expected_stat.st_dev, expected_stat.st_ino) != (
+            first_stat.st_dev,
+            first_stat.st_ino,
+        ):
+            raise RuntimeError(f"Workspace root changed during setup: {candidate}")
         after = candidate.resolve(strict=True)
         verification_descriptor = _open_absolute_directory(after)
         try:
-            first_stat = os.fstat(descriptor)
             second_stat = os.fstat(verification_descriptor)
             if before != after or (
                 first_stat.st_dev,
@@ -89,7 +101,7 @@ def _pin_root(
     except BaseException:
         os.close(descriptor)
         raise
-    return before, descriptor
+    return before, descriptor, first_stat
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,10 +119,45 @@ class OpenedWorkspaceFile:
 
 
 @dataclass(frozen=True, slots=True)
-class OpenedWorkspaceDirectory:
+class _RootIdentity:
+    path: Path
+    fd: int
+    stat: os.stat_result
+
+
+@dataclass(slots=True)
+class _RootLease:
+    identity: _RootIdentity
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectoryIdentity:
+    workspace_token: object
     fd: int
     path: WorkspacePath
     stat: os.stat_result
+
+
+@dataclass(slots=True)
+class _DirectoryLease:
+    identity: _DirectoryIdentity
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class OpenedWorkspaceDirectory:
+    _lease: _DirectoryLease = field(repr=False, compare=False)
+
+    @property
+    def path(self) -> WorkspacePath:
+        return self._lease.identity.path
+
+    @property
+    def stat(self) -> os.stat_result:
+        return self._lease.identity.stat
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,13 +171,13 @@ class Workspace:
 
     cwd: Path
     filesystem_roots: tuple[Path, ...] = ()
-    root_descriptors: tuple[tuple[Path, int], ...] = field(
+    _root_leases: tuple[_RootLease, ...] = field(
         default=(),
         repr=False,
         compare=False,
     )
-    descriptor_lock: threading.Lock = field(
-        default_factory=threading.Lock,
+    _directory_token: object = field(
+        default_factory=object,
         repr=False,
         compare=False,
     )
@@ -141,36 +188,61 @@ class Workspace:
         filesystem_roots: Iterable[Path | str] = (),
     ) -> None:
         _require_secure_posix()
-        descriptors: list[tuple[Path, int]] = []
+        root_leases: list[_RootLease] = []
         try:
             requested_roots = tuple(filesystem_roots)
             if requested_roots:
                 canonical_cwd = _canonical_root(cwd)
                 for requested_root in requested_roots:
-                    root, descriptor = _pin_root(
+                    root, descriptor, root_stat = _pin_root(
                         requested_root,
                         relative_to=canonical_cwd,
                     )
-                    if any(existing_root == root for existing_root, _fd in descriptors):
+                    if any(lease.identity.path == root for lease in root_leases):
                         os.close(descriptor)
                         continue
-                    descriptors.append((root, descriptor))
+                    root_leases.append(
+                        _RootLease(
+                            _RootIdentity(
+                                path=root,
+                                fd=descriptor,
+                                stat=root_stat,
+                            )
+                        )
+                    )
             else:
-                canonical_cwd, descriptor = _pin_root(cwd)
-                descriptors.append((canonical_cwd, descriptor))
+                canonical_cwd, descriptor, root_stat = _pin_root(cwd)
+                root_leases.append(
+                    _RootLease(
+                        _RootIdentity(
+                            path=canonical_cwd,
+                            fd=descriptor,
+                            stat=root_stat,
+                        )
+                    )
+                )
         except BaseException:
-            for _root, descriptor in descriptors:
-                os.close(descriptor)
+            for lease in root_leases:
+                os.close(lease.identity.fd)
             raise
 
         object.__setattr__(self, "cwd", canonical_cwd)
         object.__setattr__(
             self,
             "filesystem_roots",
-            tuple(root for root, _descriptor in descriptors),
+            tuple(lease.identity.path for lease in root_leases),
         )
-        object.__setattr__(self, "root_descriptors", tuple(descriptors))
-        object.__setattr__(self, "descriptor_lock", threading.Lock())
+        object.__setattr__(self, "_root_leases", tuple(root_leases))
+        object.__setattr__(self, "_directory_token", object())
+
+    @property
+    def is_closed(self) -> bool:
+        leases = getattr(self, "_root_leases", ())
+        for lease in leases:
+            with lease.lock:
+                if lease.active:
+                    return False
+        return True
 
     def locate(self, path: Path | str) -> WorkspacePath:
         absolute = _lexical_absolute(path, relative_to=self.cwd)
@@ -196,16 +268,51 @@ class Workspace:
             return str(located.absolute)
 
     def _duplicate_root(self, located: WorkspacePath) -> int:
-        with self.descriptor_lock:
-            if not self.root_descriptors:
+        lease = next(
+            (
+                candidate
+                for candidate in self._root_leases
+                if candidate.identity.path == located.root
+            ),
+            None,
+        )
+        if lease is None:
+            raise ValueError("Path root is not owned by this Workspace")
+
+        identity = lease.identity
+        with lease.lock:
+            if not lease.active:
                 raise RuntimeError("Workspace is closed")
-            return os.dup(
-                next(
-                    descriptor
-                    for root, descriptor in self.root_descriptors
-                    if root == located.root
-                )
-            )
+            try:
+                owned_stat = os.fstat(identity.fd)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Workspace root descriptor identity changed"
+                ) from exc
+            if not self._same_directory(identity.stat, owned_stat):
+                raise RuntimeError("Workspace root descriptor identity changed")
+            descriptor = os.dup(identity.fd)
+            try:
+                duplicate_stat = os.fstat(descriptor)
+                if not self._same_directory(identity.stat, duplicate_stat):
+                    raise RuntimeError("Workspace root descriptor identity changed")
+            except BaseException:
+                os.close(descriptor)
+                raise
+            return descriptor
+
+    @staticmethod
+    def _same_directory(
+        expected: os.stat_result,
+        actual: os.stat_result,
+    ) -> bool:
+        return stat_module.S_ISDIR(actual.st_mode) and (
+            actual.st_dev,
+            actual.st_ino,
+        ) == (
+            expected.st_dev,
+            expected.st_ino,
+        )
 
     def _open_parent_fd(self, located: WorkspacePath) -> int:
         current_fd = self._duplicate_root(located)
@@ -243,6 +350,109 @@ class Workspace:
             os.close(current_fd)
         return final_fd
 
+    def _child_path(
+        self,
+        parent: _DirectoryIdentity,
+        child_name: str,
+    ) -> WorkspacePath:
+        """Locate one direct child of an already-opened workspace directory."""
+
+        if Path(child_name).parts != (child_name,) or child_name in {".", ".."}:
+            raise ValueError(f"Invalid child name: {child_name!r}")
+        if parent.path.root not in self.filesystem_roots:
+            raise ValueError("Directory handle root is not owned by this Workspace")
+        return WorkspacePath(
+            root=parent.path.root,
+            relative=parent.path.relative / child_name,
+            absolute=parent.path.absolute / child_name,
+        )
+
+    def _duplicate_directory_fd(
+        self,
+        directory: OpenedWorkspaceDirectory,
+    ) -> tuple[int, _DirectoryIdentity]:
+        """Duplicate and verify one live directory lease for an operation."""
+
+        lease = directory._lease
+        identity = lease.identity
+        if identity.workspace_token is not self._directory_token:
+            raise ValueError("Directory handle belongs to a different Workspace")
+        with lease.lock:
+            if not lease.active:
+                raise RuntimeError("Directory handle is no longer active")
+            descriptor = os.dup(identity.fd)
+        try:
+            current_stat = os.fstat(descriptor)
+            if not stat_module.S_ISDIR(current_stat.st_mode) or (
+                current_stat.st_dev,
+                current_stat.st_ino,
+            ) != (
+                identity.stat.st_dev,
+                identity.stat.st_ino,
+            ):
+                raise RuntimeError("Directory handle identity changed")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor, identity
+
+    @staticmethod
+    def _close_directory(
+        directory: OpenedWorkspaceDirectory,
+    ) -> None:
+        lease = directory._lease
+        identity = lease.identity
+        with lease.lock:
+            if not lease.active:
+                return
+            lease.active = False
+            try:
+                current_stat = os.fstat(identity.fd)
+            except OSError:
+                return
+            if not stat_module.S_ISDIR(current_stat.st_mode) or (
+                current_stat.st_dev,
+                current_stat.st_ino,
+            ) != (
+                identity.stat.st_dev,
+                identity.stat.st_ino,
+            ):
+                return
+            os.close(identity.fd)
+
+    def _open_child_fd(
+        self,
+        parent: OpenedWorkspaceDirectory,
+        child_name: str,
+        *,
+        directory: bool,
+    ) -> tuple[WorkspacePath, int, os.stat_result]:
+        parent_fd, parent_identity = self._duplicate_directory_fd(parent)
+        try:
+            located = self._child_path(parent_identity, child_name)
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            if directory:
+                flags |= os.O_DIRECTORY
+            else:
+                flags |= os.O_NONBLOCK
+            descriptor = os.open(child_name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        try:
+            child_stat = os.fstat(descriptor)
+            expected_type = (
+                stat_module.S_ISDIR(child_stat.st_mode)
+                if directory
+                else stat_module.S_ISREG(child_stat.st_mode)
+            )
+            if not expected_type:
+                kind = "directory" if directory else "regular file"
+                raise ValueError(f"Not a {kind}: {located.absolute}")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return located, descriptor, child_stat
+
     def stat_path(self, path: Path | str) -> os.stat_result:
         located = self.locate(path)
         if not located.relative.parts:
@@ -265,11 +475,14 @@ class Workspace:
     def open_file(self, path: Path | str) -> Iterator[OpenedWorkspaceFile]:
         located = self.locate(path)
         fd = self._open_fd(located, directory=False)
-        file_stat = os.fstat(fd)
-        if not stat_module.S_ISREG(file_stat.st_mode):
+        try:
+            file_stat = os.fstat(fd)
+            if not stat_module.S_ISREG(file_stat.st_mode):
+                raise ValueError(f"Not a regular file: {located.absolute}")
+            file = os.fdopen(fd, "rb")
+        except BaseException:
             os.close(fd)
-            raise ValueError(f"Not a regular file: {located.absolute}")
-        file = os.fdopen(fd, "rb")
+            raise
         try:
             yield OpenedWorkspaceFile(file=file, path=located, stat=file_stat)
         finally:
@@ -282,15 +495,94 @@ class Workspace:
     ) -> Iterator[OpenedWorkspaceDirectory]:
         located = self.locate(path)
         fd = self._open_fd(located, directory=True)
-        directory_stat = os.fstat(fd)
         try:
-            yield OpenedWorkspaceDirectory(
-                fd=fd,
-                path=located,
-                stat=directory_stat,
+            directory_stat = os.fstat(fd)
+            opened = OpenedWorkspaceDirectory(
+                _lease=_DirectoryLease(
+                    _DirectoryIdentity(
+                        workspace_token=self._directory_token,
+                        fd=fd,
+                        path=located,
+                        stat=directory_stat,
+                    )
+                ),
             )
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        try:
+            yield opened
+        finally:
+            self._close_directory(opened)
+
+    @contextmanager
+    def scan_directory(
+        self,
+        directory: OpenedWorkspaceDirectory,
+    ) -> Iterator[Iterator[os.DirEntry[str]]]:
+        """Iterate children of an opened directory without resolving pathnames."""
+
+        descriptor, _identity = self._duplicate_directory_fd(directory)
+        try:
+            with os.scandir(descriptor) as entries:
+                yield entries
+        finally:
+            os.close(descriptor)
+
+    @contextmanager
+    def open_child_file(
+        self,
+        parent: OpenedWorkspaceDirectory,
+        child_name: str,
+    ) -> Iterator[OpenedWorkspaceFile]:
+        """Open one direct regular-file child without following symlinks."""
+
+        located, descriptor, file_stat = self._open_child_fd(
+            parent,
+            child_name,
+            directory=False,
+        )
+        try:
+            file = os.fdopen(descriptor, "rb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        try:
+            yield OpenedWorkspaceFile(file=file, path=located, stat=file_stat)
+        finally:
+            file.close()
+
+    @contextmanager
+    def open_child_directory(
+        self,
+        parent: OpenedWorkspaceDirectory,
+        child_name: str,
+    ) -> Iterator[OpenedWorkspaceDirectory]:
+        """Open one direct directory child without following symlinks."""
+
+        located, descriptor, directory_stat = self._open_child_fd(
+            parent,
+            child_name,
+            directory=True,
+        )
+        try:
+            opened = OpenedWorkspaceDirectory(
+                _lease=_DirectoryLease(
+                    _DirectoryIdentity(
+                        workspace_token=self._directory_token,
+                        fd=descriptor,
+                        path=located,
+                        stat=directory_stat,
+                    )
+                ),
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        try:
+            yield opened
+        finally:
+            self._close_directory(opened)
 
     def is_file(self, path: Path | str) -> bool:
         try:
@@ -305,17 +597,19 @@ class Workspace:
             return False
 
     def close(self) -> None:
-        lock = getattr(self, "descriptor_lock", None)
-        if lock is None:
-            return
-        with lock:
-            descriptors = getattr(self, "root_descriptors", ())
-            object.__setattr__(self, "root_descriptors", ())
-        for _root, descriptor in descriptors:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+        for lease in getattr(self, "_root_leases", ()):
+            identity = lease.identity
+            with lease.lock:
+                if not lease.active:
+                    continue
+                lease.active = False
+                try:
+                    current_stat = os.fstat(identity.fd)
+                except OSError:
+                    continue
+                if not self._same_directory(identity.stat, current_stat):
+                    continue
+                os.close(identity.fd)
 
     def __del__(self) -> None:
         self.close()

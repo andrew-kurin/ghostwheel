@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import Sequence
+from dataclasses import asdict, fields, replace
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.usage import RequestUsage
 
+from ghostwheel.history_config import CompactionConfig, HistoryConfig
 from ghostwheel.session import (
     ChatSession,
     ContextCompactor,
@@ -208,7 +210,7 @@ def test_history_has_no_turn_or_message_count_cap() -> None:
                 "reserve_tokens": 0,
                 "keep_recent_tokens": 10,
             },
-            "must be smaller",
+            "must leave room for a summary",
         ),
         (
             {
@@ -240,6 +242,129 @@ def test_history_policy_validates_token_settings(
             token_counter=UnitTokenCounter(),
             **settings,
         )
+
+
+def test_history_policy_accepts_canonical_config_and_preserves_flat_accessors() -> None:
+    config = HistoryConfig(
+        context_window_tokens=10,
+        compaction=CompactionConfig(
+            enabled=False,
+            reserve_tokens=2,
+            keep_recent_tokens=3,
+            summary_tokens=1,
+        ),
+    )
+    counter = UnitTokenCounter()
+
+    policy = HistoryPolicy.from_config(config, token_counter=counter)
+
+    assert policy.config is config
+    assert policy.token_counter is counter
+    assert policy.context_window_tokens == 10
+    assert policy.compaction_enabled is False
+    assert policy.reserve_tokens == 2
+    assert policy.keep_recent_tokens == 3
+    assert policy.summary_tokens == 1
+    assert policy.compaction_trigger_tokens == 8
+
+
+def test_history_policy_flat_values_override_canonical_configuration() -> None:
+    config = HistoryConfig()
+
+    policy = HistoryPolicy(
+        config=config,
+        keep_recent_tokens=3_000,
+        summary_tokens=1_500,
+    )
+
+    assert policy.config is not config
+    assert policy.context_window_tokens == config.context_window_tokens
+    assert policy.keep_recent_tokens == 3_000
+    assert policy.summary_tokens == 1_500
+
+
+def test_history_policy_preserves_legacy_positional_construction() -> None:
+    counter = UnitTokenCounter()
+
+    policy = HistoryPolicy(10, False, 2, 3, 1, counter)
+
+    assert policy.context_window_tokens == 10
+    assert policy.compaction_enabled is False
+    assert policy.reserve_tokens == 2
+    assert policy.keep_recent_tokens == 3
+    assert policy.summary_tokens == 1
+    assert policy.token_counter is counter
+
+
+def test_history_policy_dataclass_replace_accepts_flat_fields() -> None:
+    counter = UnitTokenCounter()
+    policy = HistoryPolicy(10, True, 2, 3, 1, counter)
+
+    updated = replace(policy, keep_recent_tokens=2, summary_tokens=2)
+
+    assert updated.config is not policy.config
+    assert updated.context_window_tokens == 10
+    assert updated.compaction_enabled is True
+    assert updated.reserve_tokens == 2
+    assert updated.keep_recent_tokens == 2
+    assert updated.summary_tokens == 2
+    assert updated.token_counter is counter
+
+
+def test_history_policy_preserves_legacy_dataclass_reflection_contract() -> None:
+    counter = UnitTokenCounter()
+    policy = HistoryPolicy(10, False, 2, 3, 1, counter)
+
+    assert [policy_field.name for policy_field in fields(HistoryPolicy)] == [
+        "context_window_tokens",
+        "compaction_enabled",
+        "reserve_tokens",
+        "keep_recent_tokens",
+        "summary_tokens",
+        "token_counter",
+    ]
+    assert HistoryPolicy.__match_args__ == (
+        "context_window_tokens",
+        "compaction_enabled",
+        "reserve_tokens",
+        "keep_recent_tokens",
+        "summary_tokens",
+        "token_counter",
+    )
+    serialized = asdict(policy)
+    assert list(serialized) == list(HistoryPolicy.__match_args__)
+    assert serialized["context_window_tokens"] == 10
+    assert serialized["compaction_enabled"] is False
+    assert "config" not in serialized
+    assert repr(policy) == (
+        "HistoryPolicy(context_window_tokens=10, compaction_enabled=False, "
+        "reserve_tokens=2, keep_recent_tokens=3, summary_tokens=1)"
+    )
+
+    match policy:
+        case HistoryPolicy(10, False, 2, 3, 1, matched_counter):
+            assert matched_counter is counter
+        case _:
+            pytest.fail("legacy positional pattern did not match")
+
+
+def test_history_policy_equality_and_hash_ignore_token_counter_and_config() -> None:
+    first = HistoryPolicy(10, False, 2, 3, 1, UnitTokenCounter())
+    canonical = HistoryConfig(
+        context_window_tokens=10,
+        compaction=CompactionConfig(
+            enabled=False,
+            reserve_tokens=2,
+            keep_recent_tokens=3,
+            summary_tokens=1,
+        ),
+    )
+    second = HistoryPolicy.from_config(canonical, token_counter=ContentTokenCounter())
+
+    assert first == second
+    assert hash(first) == hash(second)
+    assert first.config is not second.config
+    assert second.config is canonical
 
 
 def test_compaction_threshold_is_strictly_greater_than_available_context() -> None:

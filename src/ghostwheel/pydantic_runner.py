@@ -1,5 +1,4 @@
-import inspect
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from typing import Any, TypeVar
 
 from pydantic_ai import Agent
@@ -25,6 +24,7 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
+from ghostwheel.event_dispatcher import EventDeliveryError, EventSink, deliver_event
 from ghostwheel.events import (
     AgentEvent,
     TextOutput,
@@ -33,7 +33,7 @@ from ghostwheel.events import (
     ToolFinished,
     ToolStarted,
 )
-from ghostwheel.session import (
+from ghostwheel.runtime_contracts import (
     FailureKind,
     RunOutcome,
     TurnFailed,
@@ -42,7 +42,6 @@ from ghostwheel.session import (
 )
 
 OutputT = TypeVar("OutputT")
-EventSink = Callable[[AgentEvent], Awaitable[None] | None]
 
 
 class PydanticAgentRunner:
@@ -67,13 +66,18 @@ class PydanticAgentRunner:
         output_type: type[OutputT],
     ) -> RunOutcome[OutputT]:
         try:
-            async with self._agent.iter(
-                prompt,
-                message_history=history,
-                deps=self._deps,
-                output_type=output_type,
-            ) as run:
-                await stream_agent_run(run, self._event_sink)
+            # Runtime keeps an outer Agent context during normal application use.
+            # This nested context is then a cheap ref-counted no-op. It also makes
+            # direct/legacy runner use safe: provider clients are opened and closed
+            # on the same event loop as each individual run.
+            async with self._agent:
+                async with self._agent.iter(
+                    prompt,
+                    message_history=history,
+                    deps=self._deps,
+                    output_type=output_type,
+                ) as run:
+                    await stream_agent_run(run, self._event_sink)
 
             if run.result is None:
                 return TurnNoResult()
@@ -82,6 +86,11 @@ class PydanticAgentRunner:
                 output=run.result.output,
                 new_messages=tuple(run.result.new_messages()),
             )
+        except EventDeliveryError:
+            # Presentation is outside the model/provider failure domain. Let the
+            # application boundary decide how to recover without misclassifying
+            # the run or encouraging a retry that could repeat tool side effects.
+            raise
         except Exception as error:
             return TurnFailed(error, _failure_kind(error))
 
@@ -162,9 +171,7 @@ async def _handle_tool_event(event: Any, sink: EventSink | None) -> None:
 async def _emit(sink: EventSink | None, event: AgentEvent) -> None:
     if sink is None:
         return
-    emitted = sink(event)
-    if inspect.isawaitable(emitted):
-        await emitted
+    await deliver_event(sink, event)
 
 
 def _failure_kind(error: Exception) -> FailureKind:

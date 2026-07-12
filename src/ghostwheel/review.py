@@ -5,14 +5,14 @@ from typing import TypeAlias
 
 from pydantic_ai.messages import ModelMessage
 
-from ghostwheel.schemas import ReviewResult
-from ghostwheel.session import (
+from ghostwheel.runtime_contracts import (
     AgentRunner,
     FailureKind,
     TurnFailed,
     TurnNoResult,
     TurnSucceeded,
 )
+from ghostwheel.schemas import ReviewResult
 
 REVIEW_PROMPT = (
     "Perform a careful code review of the files at {paths}. "

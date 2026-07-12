@@ -68,7 +68,7 @@ class TurnCancellation:
             try:
                 loop.add_signal_handler(signal.SIGINT, self.cancel)
                 handler_installed = True
-            except (NotImplementedError, RuntimeError, ValueError):
+            except NotImplementedError, RuntimeError, ValueError:
                 # Signal handlers are only available on supported loops in the
                 # main thread. Programmatic cancellation remains available.
                 pass

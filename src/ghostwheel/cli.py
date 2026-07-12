@@ -5,155 +5,67 @@ import asyncio
 import os
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
-from difflib import get_close_matches
-from enum import Enum
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from rich.console import Console
 
-from ghostwheel.cancellation import CANCELLED, TurnCancellation
+from ghostwheel.cancellation import TurnCancellation
+from ghostwheel.controller import (
+    CancellationPort,
+    CommandKind,
+    InputPort,
+    ParsedCommand,
+    PresenterPort,
+    ReviewPort,
+    SessionPort,
+    parse_command,
+    run_command_loop,
+)
+from ghostwheel.event_dispatcher import EventDispatcher
 from ghostwheel.input_ui import (
-    COMMANDS,
     ConsoleInputReader,
-    InputReader,
     default_history_path,
 )
-from ghostwheel.review import ReviewService
 from ghostwheel.rich_ui import RichPresenter
-from ghostwheel.session import ChatSession
+
+if TYPE_CHECKING:
+    from ghostwheel.config import AppConfig
 
 
-class CommandKind(str, Enum):
-    EMPTY = "empty"
-    QUIT = "quit"
-    CLEAR = "clear"
-    REVIEW = "review"
-    RETRY = "retry"
-    HELP = "help"
-    MODEL = "model"
-    TOOLS = "tools"
-    UNKNOWN = "unknown"
-    CHAT = "chat"
-
-
-@dataclass(frozen=True, slots=True)
-class ParsedCommand:
-    kind: CommandKind
-    value: str = ""
-
-
-NO_ARGUMENT_COMMANDS = {
-    "/quit": CommandKind.QUIT,
-    "/clear": CommandKind.CLEAR,
-    "/retry": CommandKind.RETRY,
-    "/help": CommandKind.HELP,
-    "/model": CommandKind.MODEL,
-    "/tools": CommandKind.TOOLS,
-}
-
-
-def parse_command(value: str) -> ParsedCommand:
-    normalized = value.strip()
-    if not normalized:
-        return ParsedCommand(CommandKind.EMPTY)
-
-    parts = normalized.split(maxsplit=1)
-    command = parts[0].lower()
-    arguments = parts[1].strip() if len(parts) == 2 else ""
-    if command == "/review":
-        return ParsedCommand(CommandKind.REVIEW, arguments or ".")
-    if command in NO_ARGUMENT_COMMANDS:
-        if arguments:
-            return ParsedCommand(CommandKind.UNKNOWN, normalized)
-        return ParsedCommand(NO_ARGUMENT_COMMANDS[command])
-    if command.startswith("/"):
-        return ParsedCommand(CommandKind.UNKNOWN, normalized)
-    return ParsedCommand(CommandKind.CHAT, normalized)
+__all__ = [
+    "CommandKind",
+    "ParsedCommand",
+    "build_parser",
+    "main",
+    "parse_command",
+    "run_cli",
+]
 
 
 async def run_cli(
     console: Console,
-    session: ChatSession,
-    reviews: ReviewService,
+    session: SessionPort,
+    reviews: ReviewPort,
     *,
-    presenter: RichPresenter | None = None,
-    input_reader: InputReader | None = None,
-    cancellation: TurnCancellation | None = None,
+    presenter: PresenterPort | None = None,
+    input_reader: InputPort | None = None,
+    cancellation: CancellationPort | None = None,
 ) -> None:
+    """Run the plain-console adapter around the neutral command controller."""
+
     presenter = presenter or RichPresenter(console)
     input_reader = input_reader or ConsoleInputReader(console)
     cancellation = cancellation or TurnCancellation(handle_sigint=True)
-    last_repeatable: ParsedCommand | None = None
-    presenter.welcome()
-
-    while True:
-        try:
-            user_input = await input_reader.read()
-        except EOFError, KeyboardInterrupt, StopIteration:
-            presenter.goodbye()
-            break
-
-        command = parse_command(user_input)
-        if command.kind is CommandKind.EMPTY:
-            continue
-        if command.kind is CommandKind.QUIT:
-            presenter.goodbye()
-            break
-        if command.kind is CommandKind.CLEAR:
-            session.clear()
-            last_repeatable = None
-            presenter.history_cleared()
-            continue
-        if command.kind is CommandKind.HELP:
-            presenter.help()
-            continue
-        if command.kind is CommandKind.MODEL:
-            presenter.model_info()
-            continue
-        if command.kind is CommandKind.TOOLS:
-            presenter.tools_info()
-            continue
-        if command.kind is CommandKind.UNKNOWN:
-            token = command.value.split(maxsplit=1)[0].lower()
-            matches = get_close_matches(token, COMMANDS, n=1, cutoff=0.55)
-            presenter.unknown_command(command.value, matches[0] if matches else None)
-            continue
-        if command.kind is CommandKind.RETRY:
-            if last_repeatable is None:
-                presenter.retry_unavailable()
-                continue
-            command = last_repeatable
-
-        if command.kind is CommandKind.REVIEW:
-            last_repeatable = command
-            presenter.turn_started("Reviewing…")
-            outcome = await cancellation.run(
-                reviews.review(
-                    command.value,
-                    chat_history=session.history,
-                )
-            )
-            if outcome is CANCELLED:
-                presenter.turn_cancelled()
-                continue
-            presenter.review_outcome(outcome)
-            continue
-
-        last_repeatable = command
-        presenter.turn_started()
-        outcome = await cancellation.run(session.send(command.value))
-        if outcome is CANCELLED:
-            presenter.turn_cancelled()
-            continue
-        presenter.turn_outcome(outcome)
-        if session.last_compaction is not None:
-            presenter.history_compacted(
-                session.last_compaction.before_tokens,
-                session.last_compaction.after_tokens,
-            )
+    await run_command_loop(
+        session,
+        reviews,
+        presenter=presenter,
+        input_reader=input_reader,
+        cancellation=cancellation,
+    )
 
 
 def _package_version() -> str:
@@ -226,7 +138,6 @@ def _interactive_mode(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    from ghostwheel.bootstrap import build_application
     from ghostwheel.config import Settings
     from ghostwheel.telemetry import configure_observability
 
@@ -243,43 +154,64 @@ def main(argv: Sequence[str] | None = None) -> None:
     history_path = (
         None if args.no_history else (args.history_file or default_history_path())
     )
-    event_handler = None
-
-    async def route_interactive_event(event) -> None:
-        if event_handler is not None:
-            await event_handler(event)
-
-    application = build_application(
+    selected_ui = _run_selected_ui(
         config,
         console,
-        event_sink=route_interactive_event if interactive else None,
+        interactive=interactive,
+        history_path=history_path,
+        vim_mode=args.vim,
     )
     try:
+        asyncio.run(selected_ui)
+    except BaseException:
+        # ``asyncio.run`` rejects before taking ownership when called from an
+        # active loop (and may fail while creating its runner). Closing is a
+        # no-op once the coroutine has completed, and prevents an unawaited
+        # coroutine warning when it never started.
+        selected_ui.close()
+        raise
+
+
+async def _run_selected_ui(
+    config: AppConfig,
+    console: Console,
+    *,
+    interactive: bool,
+    history_path: Path | None,
+    vim_mode: bool,
+) -> None:
+    """Construct and run the selected UI inside one event-loop lifetime."""
+
+    from ghostwheel.bootstrap import build_runtime
+
+    events = EventDispatcher()
+    runtime = build_runtime(config, event_sink=events)
+
+    async with runtime:
         if interactive:
             from ghostwheel.textual_ui import GhostwheelApp
 
-            assert application.presenter.app_info is not None
             tui = GhostwheelApp(
-                console,
-                application.session,
-                application.reviews,
-                app_info=application.presenter.app_info,
+                runtime.session,
+                runtime.reviews,
+                app_info=runtime.app_info,
                 history_path=history_path,
-                vim_mode=args.vim,
+                vim_mode=vim_mode,
             )
-            event_handler = tui.presenter.handle_event
+            events.bind(tui.presenter.handle_event)
             # Textual routes wheel and scrollbar gestures while keeping content
             # selectable through its screen-level selection support.
-            tui.run(mouse=True)
+            await tui.run_async(mouse=True)
         else:
-            asyncio.run(
-                run_cli(
-                    console,
-                    application.session,
-                    application.reviews,
-                    presenter=application.presenter,
-                    input_reader=ConsoleInputReader(console),
-                )
+            presenter = RichPresenter(
+                console,
+                app_info=runtime.app_info,
             )
-    finally:
-        application.close()
+            events.bind(presenter.handle_event)
+            await run_cli(
+                console,
+                runtime.session,
+                runtime.reviews,
+                presenter=presenter,
+                input_reader=ConsoleInputReader(console),
+            )

@@ -1,4 +1,3 @@
-import base64
 from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -18,8 +17,14 @@ import regex
 
 from .deps import ToolDeps
 from .output import normalize_utf8
+from .pagination import (
+    MAX_CURSOR_LENGTH,
+    decode_offset_cursor,
+    encode_fingerprint,
+    encode_offset_cursor,
+)
 from .path_filters import CompiledPathGlob, NOISE_DIRECTORY_NAMES
-from .workspace import Workspace
+from .workspace import OpenedWorkspaceDirectory, Workspace
 
 
 class GrepIncompleteReason(str, Enum):
@@ -68,7 +73,6 @@ class GrepResult(BaseModel):
 
 _MAX_SEARCH_DEPTH = 64
 _MAX_SNIPPET_CHARACTERS = 600
-_MAX_CURSOR_LENGTH = 4_096
 _MAX_PATTERN_CHARACTERS = 10_000
 _MAX_GLOB_CHARACTERS = 4_096
 _REGEX_META_CHARACTERS = frozenset(r"\.^$*+?{}[]|()")
@@ -345,54 +349,36 @@ def _search_open_file(
 def _open_and_search_child_file(
     state: _SearchState,
     *,
-    parent_fd: int,
+    parent: OpenedWorkspaceDirectory,
     child_name: str,
-    absolute_path: Path,
     raw_key: bytes,
 ) -> None:
     if not _claim_file(state):
         return
-    descriptor = -1
     try:
-        descriptor = os.open(
-            child_name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-            dir_fd=parent_fd,
-        )
-        file_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(file_stat.st_mode):
-            state.files_skipped += 1
-            state.reasons.add(GrepIncompleteReason.FILE_ERROR)
-            return
-        file = os.fdopen(descriptor, "rb")
-        descriptor = -1
-        with file:
+        with state.workspace.open_child_file(parent, child_name) as opened:
             _search_open_file(
                 state,
-                file,
-                file_stat,
-                absolute_path=absolute_path,
+                opened.file,
+                opened.stat,
+                absolute_path=opened.path.absolute,
                 raw_key=raw_key,
             )
-    except OSError:
+    except OSError, ValueError:
         state.files_skipped += 1
         state.reasons.add(GrepIncompleteReason.FILE_ERROR)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _walk_directory(
     state: _SearchState,
     *,
-    directory_fd: int,
-    absolute_path: Path,
+    directory: OpenedWorkspaceDirectory,
     relative_prefix: str,
     depth: int,
 ) -> None:
     batch: list[tuple[str, str, bytes, bool]] = []
     try:
-        with os.scandir(directory_fd) as entries:
+        with state.workspace.scan_directory(directory) as entries:
             for entry in entries:
                 if state.stop or _check_deadline(state):
                     break
@@ -431,14 +417,12 @@ def _walk_directory(
     for child_name, relative, raw_key, is_directory in batch:
         if state.stop:
             return
-        child_absolute = absolute_path / child_name
         if not is_directory:
             if state.path_glob.matches(relative):
                 _open_and_search_child_file(
                     state,
-                    parent_fd=directory_fd,
+                    parent=directory,
                     child_name=child_name,
-                    absolute_path=child_absolute,
                     raw_key=raw_key,
                 )
             continue
@@ -448,50 +432,24 @@ def _walk_directory(
         if depth >= _MAX_SEARCH_DEPTH:
             state.reasons.add(GrepIncompleteReason.DEPTH_LIMIT)
             continue
-        descriptor = -1
         try:
-            descriptor = os.open(
+            with state.workspace.open_child_directory(
+                directory,
                 child_name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=directory_fd,
-            )
-            directory_stat = os.fstat(descriptor)
-            if not stat.S_ISDIR(directory_stat.st_mode):
-                state.reasons.add(GrepIncompleteReason.ENTRY_ERROR)
-                continue
-            identity = (directory_stat.st_dev, directory_stat.st_ino)
-            if identity in state.visited_directories:
-                state.reasons.add(GrepIncompleteReason.ENTRY_ERROR)
-                continue
-            state.visited_directories.add(identity)
-            _walk_directory(
-                state,
-                directory_fd=descriptor,
-                absolute_path=child_absolute,
-                relative_prefix=relative,
-                depth=depth + 1,
-            )
-        except OSError:
+            ) as opened_child:
+                identity = (opened_child.stat.st_dev, opened_child.stat.st_ino)
+                if identity in state.visited_directories:
+                    state.reasons.add(GrepIncompleteReason.ENTRY_ERROR)
+                    continue
+                state.visited_directories.add(identity)
+                _walk_directory(
+                    state,
+                    directory=opened_child,
+                    relative_prefix=relative,
+                    depth=depth + 1,
+                )
+        except OSError, ValueError:
             state.reasons.add(GrepIncompleteReason.ENTRY_ERROR)
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-
-
-def _urlsafe_encode(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
-
-
-def _urlsafe_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    try:
-        return base64.b64decode(
-            value + padding,
-            altchars=b"-_",
-            validate=True,
-        )
-    except (ValueError, TypeError) as error:
-        raise ValueError("Invalid grep cursor") from error
 
 
 def _query_fingerprint(
@@ -522,7 +480,7 @@ def _query_fingerprint(
     for component in components:
         digest.update(len(component).to_bytes(8, "big"))
         digest.update(component)
-    return _urlsafe_encode(digest.digest()[:12])
+    return encode_fingerprint(digest.digest()[:12])
 
 
 def _snapshot_fingerprint(matches: list[_MatchCandidate]) -> str:
@@ -536,7 +494,7 @@ def _snapshot_fingerprint(matches: list[_MatchCandidate]) -> str:
         digest.update(len(text).to_bytes(4, "big"))
         digest.update(text)
         digest.update(b"1" if match.text_truncated else b"0")
-    return _urlsafe_encode(digest.digest()[:12])
+    return encode_fingerprint(digest.digest()[:12])
 
 
 def _encode_cursor(
@@ -544,26 +502,21 @@ def _encode_cursor(
     snapshot_fingerprint: str,
     offset: int,
 ) -> str:
-    return f"g1.{query_fingerprint}.{snapshot_fingerprint}.{offset:x}"
+    return encode_offset_cursor(
+        "g1",
+        query_fingerprint,
+        snapshot_fingerprint,
+        offset,
+    )
 
 
 def _decode_cursor(cursor: str | None, query_fingerprint: str) -> tuple[str, int]:
-    if cursor is None:
-        return "", 0
-    if len(cursor) > _MAX_CURSOR_LENGTH:
-        raise ValueError("Invalid grep cursor")
-    parts = cursor.split(".")
-    if len(parts) != 4 or parts[0] != "g1" or parts[1] != query_fingerprint:
-        raise ValueError("Invalid or mismatched grep cursor")
-    if len(_urlsafe_decode(parts[2])) != 12:
-        raise ValueError("Invalid grep cursor")
-    try:
-        offset = int(parts[3], 16)
-    except ValueError as error:
-        raise ValueError("Invalid grep cursor") from error
-    if offset <= 0:
-        raise ValueError("Invalid grep cursor")
-    return parts[2], offset
+    return decode_offset_cursor(
+        cursor,
+        version="g1",
+        query_fingerprint=query_fingerprint,
+        tool_name="grep",
+    )
 
 
 def _ordered_reasons(
@@ -791,9 +744,8 @@ def grep(
         raise ValueError(f"file_glob must be at most {_MAX_GLOB_CHARACTERS} characters")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
-    if cursor is not None and len(cursor) > _MAX_CURSOR_LENGTH:
+    if cursor is not None and len(cursor) > MAX_CURSOR_LENGTH:
         raise ValueError("Invalid grep cursor")
-
     deadline = time.monotonic() + ctx.deps.limits.search_timeout_seconds
     line_matcher = _LineMatcher.create(
         pattern,
@@ -922,8 +874,7 @@ def grep(
                 state.visited_directories.add((opened.stat.st_dev, opened.stat.st_ino))
                 _walk_directory(
                     state,
-                    directory_fd=opened.fd,
-                    absolute_path=opened.path.absolute,
+                    directory=opened,
                     relative_prefix="",
                     depth=1,
                 )

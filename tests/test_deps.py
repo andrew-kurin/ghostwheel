@@ -29,24 +29,34 @@ def test_tool_deps_accepts_search_aggregate_scalar_overrides(tmp_path) -> None:
         assert deps.limits.max_read_scan_bytes == 654_321
         assert deps.limits.max_search_total_bytes == 123_456
         assert deps.limits.search_timeout_seconds == 0.75
+        assert deps.limits.max_output_bytes == ToolLimits().max_output_bytes
+        assert deps.limits.max_entries == ToolLimits().max_entries
     finally:
         deps.close()
 
 
+def test_tool_deps_rejects_mixing_canonical_limits_with_legacy_scalars(
+    tmp_path,
+) -> None:
+    with pytest.raises(TypeError, match="limits or scalar"):
+        ToolDeps(cwd=tmp_path, limits=ToolLimits(), max_entries=10)
+
+
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "message"),
     [
-        ("max_read_lines", 0),
-        ("max_read_scan_bytes", 0),
-        ("max_search_total_bytes", 0),
-        ("search_timeout_seconds", 0),
-        ("search_timeout_seconds", math.inf),
-        ("search_timeout_seconds", math.nan),
+        ("max_read_lines", 0, "positive integer"),
+        ("max_read_scan_bytes", 0, "positive integer"),
+        ("max_search_total_bytes", 0, "positive integer"),
+        ("search_timeout_seconds", 0, "positive and finite"),
+        ("search_timeout_seconds", math.inf, "positive and finite"),
+        ("search_timeout_seconds", math.nan, "positive and finite"),
     ],
 )
 def test_search_aggregate_tool_limits_must_be_positive_and_finite(
     field: str,
     value: float,
+    message: str,
 ) -> None:
-    with pytest.raises(ValueError, match="positive and finite"):
+    with pytest.raises(ValueError, match=message):
         ToolLimits(**{field: value})

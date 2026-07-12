@@ -1,52 +1,10 @@
 from collections.abc import Iterable
-from dataclasses import dataclass
-import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 
+from ghostwheel.tool_config import ToolLimits
 from ghostwheel.tools.command import CommandRunner, LocalCommandRunner
 from ghostwheel.tools.workspace import Workspace
-
-
-@dataclass(frozen=True, slots=True)
-class ToolLimits:
-    """Resource limits shared by all tool implementations.
-
-    ``max_output_bytes`` bounds complete compact model text for ``read``, ``ls``,
-    and ``grep``. For other tools it bounds retained variable payload; their
-    small structured result envelope and field names are additional.
-    """
-
-    max_output_bytes: int = 100_000
-    max_read_lines: int = 200
-    max_read_scan_bytes: int = 5_000_000
-    max_entries: int = 200
-    max_directory_scan_entries: int = 10_000
-    max_matches: int = 200
-    bash_timeout_seconds: float = 30
-    max_search_file_bytes: int = 5_000_000
-    max_search_total_bytes: int = 50_000_000
-    max_search_files: int = 10_000
-    search_timeout_seconds: float = 5.0
-    regex_timeout_seconds: float = 0.05
-
-    def __post_init__(self) -> None:
-        positive_values = {
-            "max_output_bytes": self.max_output_bytes,
-            "max_read_lines": self.max_read_lines,
-            "max_read_scan_bytes": self.max_read_scan_bytes,
-            "max_entries": self.max_entries,
-            "max_directory_scan_entries": self.max_directory_scan_entries,
-            "max_matches": self.max_matches,
-            "bash_timeout_seconds": self.bash_timeout_seconds,
-            "max_search_file_bytes": self.max_search_file_bytes,
-            "max_search_total_bytes": self.max_search_total_bytes,
-            "max_search_files": self.max_search_files,
-            "search_timeout_seconds": self.search_timeout_seconds,
-            "regex_timeout_seconds": self.regex_timeout_seconds,
-        }
-        for name, value in positive_values.items():
-            if not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be positive and finite")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -101,61 +59,28 @@ class ToolDeps:
                 "Pass workspace or cwd/filesystem_roots/allowed_roots, not both"
             )
 
-        scalar_limits = (
-            max_output_bytes,
-            max_read_lines,
-            max_read_scan_bytes,
-            max_entries,
-            max_directory_scan_entries,
-            max_matches,
-            bash_timeout_seconds,
-            max_search_file_bytes,
-            max_search_total_bytes,
-            max_search_files,
-            search_timeout_seconds,
-            regex_timeout_seconds,
-        )
-        if limits is not None and any(value is not None for value in scalar_limits):
+        scalar_limits = {
+            name: value
+            for name, value in {
+                "max_output_bytes": max_output_bytes,
+                "max_read_lines": max_read_lines,
+                "max_read_scan_bytes": max_read_scan_bytes,
+                "max_entries": max_entries,
+                "max_directory_scan_entries": max_directory_scan_entries,
+                "max_matches": max_matches,
+                "bash_timeout_seconds": bash_timeout_seconds,
+                "max_search_file_bytes": max_search_file_bytes,
+                "max_search_total_bytes": max_search_total_bytes,
+                "max_search_files": max_search_files,
+                "search_timeout_seconds": search_timeout_seconds,
+                "regex_timeout_seconds": regex_timeout_seconds,
+            }.items()
+            if value is not None
+        }
+        if limits is not None and scalar_limits:
             raise TypeError("Pass limits or scalar limit arguments, not both")
         if limits is None:
-            limits = ToolLimits(
-                max_output_bytes=(
-                    100_000 if max_output_bytes is None else max_output_bytes
-                ),
-                max_read_lines=(200 if max_read_lines is None else max_read_lines),
-                max_read_scan_bytes=(
-                    5_000_000 if max_read_scan_bytes is None else max_read_scan_bytes
-                ),
-                max_entries=200 if max_entries is None else max_entries,
-                max_directory_scan_entries=(
-                    10_000
-                    if max_directory_scan_entries is None
-                    else max_directory_scan_entries
-                ),
-                max_matches=200 if max_matches is None else max_matches,
-                bash_timeout_seconds=(
-                    30 if bash_timeout_seconds is None else bash_timeout_seconds
-                ),
-                max_search_file_bytes=(
-                    5_000_000
-                    if max_search_file_bytes is None
-                    else max_search_file_bytes
-                ),
-                max_search_total_bytes=(
-                    50_000_000
-                    if max_search_total_bytes is None
-                    else max_search_total_bytes
-                ),
-                max_search_files=(
-                    10_000 if max_search_files is None else max_search_files
-                ),
-                search_timeout_seconds=(
-                    5.0 if search_timeout_seconds is None else search_timeout_seconds
-                ),
-                regex_timeout_seconds=(
-                    0.05 if regex_timeout_seconds is None else regex_timeout_seconds
-                ),
-            )
+            limits = replace(ToolLimits(), **scalar_limits)
 
         object.__setattr__(self, "workspace", workspace)
         object.__setattr__(self, "limits", limits)

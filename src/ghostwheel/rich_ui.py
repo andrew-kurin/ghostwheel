@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import ast
 import time
-from dataclasses import dataclass
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -11,6 +9,7 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
+from ghostwheel.app_info import AppInfo
 from ghostwheel.events import (
     AgentEvent,
     TextOutput,
@@ -19,44 +18,23 @@ from ghostwheel.events import (
     ToolFinished,
     ToolStarted,
 )
+from ghostwheel.presentation import (
+    ToolActivity,
+    TurnState,
+    duration,
+    failure_presentation,
+    format_token_count,
+    preview,
+    primary_argument,
+)
 from ghostwheel.rendering import render_review
 from ghostwheel.review import RawReview, ReviewFailed, ReviewOutcome, StructuredReview
-from ghostwheel.session import (
-    FailureKind,
+from ghostwheel.runtime_contracts import (
     TurnFailed,
     TurnNoResult,
     TurnOutcome,
     TurnSucceeded,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class AppInfo:
-    workspace: str
-    provider: str
-    model: str
-    tool_profile: str
-
-
-@dataclass(slots=True)
-class _ToolActivity:
-    name: str
-    arguments: str
-    call_id: str | None
-    started_at: float
-    status: str = "running"
-    detail: str = ""
-    finished_at: float | None = None
-
-
-def _format_token_count(value: int) -> str:
-    if value < 1_000:
-        return str(value)
-    thousands = value / 1_000
-    if thousands < 10 and not thousands.is_integer():
-        compact = f"{thousands:.1f}".rstrip("0").rstrip(".")
-        return f"{compact}k"
-    return f"{thousands:.0f}k"
 
 
 class RichPresenter:
@@ -76,10 +54,7 @@ class RichPresenter:
         self.show_thinking = False
         self._live: Live | None = None
         self._active = False
-        self._status = "Thinking…"
-        self._answer: list[str] = []
-        self._thinking: list[str] = []
-        self._tools: list[_ToolActivity] = []
+        self._turn = TurnState()
         self._last_live_update = 0.0
 
     async def handle_event(self, event: AgentEvent) -> None:
@@ -89,51 +64,28 @@ class RichPresenter:
             self._print_legacy_event(event)
             return
 
+        activity = self._turn.apply(event)
         if isinstance(event, ThinkingOutput):
-            self._thinking.append(event.content)
-            self._status = "Thinking…"
             if not self.live_enabled and self.show_thinking:
                 if event.starts_part:
                     self.console.print(Text("\nThinking  ", style="dim"), end="")
                 self.console.print(Text(event.content, style="dim"), end="")
         elif isinstance(event, TextOutput):
-            self._answer.append(event.content)
-            self._status = "Responding…"
             if not self.live_enabled:
                 if event.starts_part:
                     self.console.print(Text("\nGhostwheel\n", style="bold magenta"))
                 self.console.print(Text(event.content), end="")
         elif isinstance(event, ToolStarted):
-            self._tools.append(
-                _ToolActivity(
-                    name=event.name,
-                    arguments=event.arguments,
-                    call_id=event.call_id,
-                    started_at=time.monotonic(),
-                )
-            )
-            self._status = f"Running {event.name}…"
+            assert activity is not None
             if not self.live_enabled:
-                self.console.print(self._tool_line(self._tools[-1]))
+                self.console.print(self._tool_line(activity))
         elif isinstance(event, ToolFinished):
-            activity = self._finish_tool(
-                event.name,
-                event.call_id,
-                "succeeded",
-                event.result,
-            )
-            self._status = "Thinking…"
+            assert activity is not None
             if not self.live_enabled:
                 self.console.print(self._tool_line(activity))
                 self._print_verbose_tool_detail(activity)
         elif isinstance(event, ToolFailed):
-            activity = self._finish_tool(
-                event.name,
-                event.call_id,
-                "failed",
-                event.error,
-            )
-            self._status = f"{event.name} failed"
+            assert activity is not None
             if not self.live_enabled:
                 self.console.print(self._tool_line(activity))
                 self._print_verbose_tool_detail(activity)
@@ -141,9 +93,8 @@ class RichPresenter:
         self._refresh_live()
 
     def turn_started(self, label: str = "Thinking…") -> None:
-        self._reset_turn()
+        self._reset_turn(label)
         self._active = True
-        self._status = label
         if self.live_enabled:
             self._live = Live(
                 self._active_renderable(),
@@ -258,8 +209,8 @@ class RichPresenter:
         self.console.print(
             Text(
                 "Context compacted: "
-                f"{_format_token_count(before_tokens)} → "
-                f"~{_format_token_count(after_tokens)}.",
+                f"{format_token_count(before_tokens)} → "
+                f"~{format_token_count(after_tokens)}.",
                 style="dim",
             )
         )
@@ -271,7 +222,7 @@ class RichPresenter:
             if managed_live:
                 self.console.print(Text("\nGhostwheel", style="bold magenta"))
                 self.console.print(Markdown(outcome.output))
-            elif not self._answer:
+            elif not self._turn.answer:
                 self.console.print(Text("\nGhostwheel\n", style="bold magenta"))
                 self.console.print(Text(outcome.output))
         elif isinstance(outcome, TurnNoResult):
@@ -315,53 +266,32 @@ class RichPresenter:
         self._reset_turn()
 
     def _render_turn_failure(self, outcome: TurnFailed) -> None:
-        title, hint = {
-            FailureKind.PROVIDER: (
-                "Provider Error",
-                "Check that the configured model server is running; use /model to inspect it.",
-            ),
-            FailureKind.CONFIGURATION: (
-                "Configuration Error",
-                "Check the model, context-window, and compaction settings.",
-            ),
-            FailureKind.TOOL: (
-                "Tool Error",
-                "Inspect the tool output above, adjust the request, or use /retry.",
-            ),
-            FailureKind.MODEL_OUTPUT: (
-                "Model Output Error",
-                "The model returned an unsupported result; use /retry or change models.",
-            ),
-            FailureKind.UNKNOWN: (
-                "Agent Failed",
-                "Use /retry to try the turn again.",
-            ),
-        }[outcome.kind]
+        presentation = failure_presentation(outcome.kind)
         body = Text(outcome.message)
-        body.append(f"\n\n{hint}", style="dim")
-        self.console.print(Panel(body, title=title, border_style="red"))
+        body.append(f"\n\n{presentation.hint}", style="dim")
+        self.console.print(Panel(body, title=presentation.title, border_style="red"))
 
     def _active_renderable(self) -> Group:
         renderables: list[object] = [
-            Spinner("dots", Text(self._status, style="bold cyan"))
+            Spinner("dots", Text(self._turn.status, style="bold cyan"))
         ]
-        for activity in self._tools[-5:]:
+        for activity in self._turn.tools[-5:]:
             renderables.append(self._tool_line(activity))
             if self.verbose_tools and activity.detail:
                 renderables.append(self._tool_detail_panel(activity))
-        if self.show_thinking and self._thinking:
+        if self.show_thinking and self._turn.thinking:
             renderables.append(
                 Panel(
-                    Text(_preview("".join(self._thinking), 800), style="dim"),
+                    Text(preview(self._turn.thinking, 800), style="dim"),
                     title="Thinking",
                     border_style="dim",
                 )
             )
-        if self._answer:
+        if self._turn.answer:
             renderables.extend(
                 (
                     Text("Ghostwheel", style="bold magenta"),
-                    Markdown("".join(self._answer)),
+                    Markdown(self._turn.answer),
                 )
             )
         return Group(*renderables)
@@ -381,13 +311,13 @@ class RichPresenter:
         self._refresh_live(force=True)
         self._stop_live()
         if self.live_enabled:
-            for activity in self._tools:
+            for activity in self._turn.tools:
                 self.console.print(self._tool_line(activity))
                 self._print_verbose_tool_detail(activity)
-            if self.show_thinking and self._thinking:
+            if self.show_thinking and self._turn.thinking:
                 self.console.print(
                     Panel(
-                        Text("".join(self._thinking), style="dim"),
+                        Text(self._turn.thinking, style="dim"),
                         title="Thinking",
                         border_style="dim",
                     )
@@ -398,39 +328,7 @@ class RichPresenter:
             self._live.stop()
             self._live = None
 
-    def _finish_tool(
-        self,
-        name: str,
-        call_id: str | None,
-        status: str,
-        detail: str,
-    ) -> _ToolActivity:
-        activity = next(
-            (
-                item
-                for item in reversed(self._tools)
-                if item.status == "running"
-                and (
-                    (call_id is not None and item.call_id == call_id)
-                    or (
-                        call_id is not None
-                        and item.call_id is None
-                        and item.name == name
-                    )
-                    or (call_id is None and item.name == name)
-                )
-            ),
-            None,
-        )
-        if activity is None:
-            activity = _ToolActivity(name, "", call_id, time.monotonic())
-            self._tools.append(activity)
-        activity.status = status
-        activity.detail = _preview(detail, 800)
-        activity.finished_at = time.monotonic()
-        return activity
-
-    def _tool_line(self, activity: _ToolActivity) -> Text:
+    def _tool_line(self, activity: ToolActivity) -> Text:
         icon, style = {
             "running": ("▸", "yellow"),
             "succeeded": ("✓", "green"),
@@ -438,33 +336,33 @@ class RichPresenter:
         }[activity.status]
         line = Text(f"  {icon} ", style=style)
         line.append(activity.name, style=f"bold {style}")
-        argument = _primary_argument(activity.arguments)
+        argument = primary_argument(activity.arguments)
         if argument:
             line.append("  ")
-            line.append(_preview(argument, 72))
+            line.append(preview(argument, 72))
         if activity.finished_at is not None:
             line.append("  ·  ", style="dim")
             line.append(
-                _duration(activity.finished_at - activity.started_at),
+                duration(activity.finished_at - activity.started_at),
                 style="dim",
             )
         if activity.status == "failed" and activity.detail:
             line.append("  ·  ", style="red")
-            line.append(_preview(" ".join(activity.detail.split()), 100), style="red")
+            line.append(preview(" ".join(activity.detail.split()), 100), style="red")
         return line
 
-    def _print_verbose_tool_detail(self, activity: _ToolActivity) -> None:
+    def _print_verbose_tool_detail(self, activity: ToolActivity) -> None:
         if not self.verbose_tools:
             return
         self.console.print(self._tool_detail_panel(activity))
 
-    def _tool_detail_panel(self, activity: _ToolActivity) -> Panel:
+    def _tool_detail_panel(self, activity: ToolActivity) -> Panel:
         body = Text()
         body.append("Arguments\n", style="bold")
         body.append(activity.arguments or "(none)")
         if activity.detail:
             body.append("\n\nResult\n", style="bold")
-            body.append(activity.detail)
+            body.append(preview(activity.detail, 800))
         return Panel(
             body,
             title=Text(f"{activity.name} details", style="dim"),
@@ -484,59 +382,28 @@ class RichPresenter:
                 self.console.print(Text("\n💬 "), end="")
             self.console.print(Text(event.content), end="")
         elif isinstance(event, ToolStarted):
-            arguments = _preview(event.arguments, 80)
+            arguments = preview(event.arguments, 80)
             line = Text("\n🔧 ", style="yellow")
             line.append(event.name, style="yellow")
             line.append(f"({arguments})", style="yellow")
             self.console.print(line)
         elif isinstance(event, ToolFinished):
-            result = _preview(event.result, 120)
+            result = preview(event.result, 120)
             line = Text("← ", style="green")
             line.append(event.name, style="green")
             line.append(": ", style="green")
             line.append(result, style="green")
             self.console.print(line)
         elif isinstance(event, ToolFailed):
-            error = _preview(event.error, 120)
+            error = preview(event.error, 120)
             line = Text("← ", style="red")
             line.append(event.name, style="red")
             line.append(" failed: ", style="red")
             line.append(error, style="red")
             self.console.print(line)
 
-    def _reset_turn(self) -> None:
+    def _reset_turn(self, label: str = "Thinking…") -> None:
         self._stop_live()
         self._active = False
-        self._status = "Thinking…"
-        self._answer = []
-        self._thinking = []
-        self._tools = []
+        self._turn.reset(label)
         self._last_live_update = 0.0
-
-
-def _primary_argument(arguments: str) -> str:
-    if not arguments:
-        return ""
-    try:
-        parsed = ast.literal_eval(arguments)
-    except SyntaxError, ValueError:
-        return _preview(" ".join(arguments.split()), 72)
-    if not isinstance(parsed, dict):
-        return _preview(" ".join(str(parsed).split()), 72)
-    for key in ("path", "command", "pattern", "query", "paths"):
-        value = parsed.get(key)
-        if value not in (None, ""):
-            return " ".join(str(value).split())
-    return ""
-
-
-def _duration(seconds: float) -> str:
-    if seconds < 0.001:
-        return "<1 ms"
-    if seconds < 1:
-        return f"{seconds * 1000:.0f} ms"
-    return f"{seconds:.1f} s"
-
-
-def _preview(value: str, limit: int) -> str:
-    return value if len(value) <= limit else value[:limit] + "…"

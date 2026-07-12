@@ -139,6 +139,10 @@ def test_review_result_derives_approval_from_findings() -> None:
     review = ReviewResult(summary="Not safe.", findings=[finding], approve=True)
 
     assert review.approve is False
+    assert "approve" not in ReviewResult.model_json_schema()["properties"]
+    assert review.model_dump()["approve"] is False
+    with pytest.raises(AttributeError, match="no setter"):
+        review.approve = True  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(
