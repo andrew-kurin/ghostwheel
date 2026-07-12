@@ -22,7 +22,7 @@ from ghostwheel.agent_factory import (
     review_fallback_agent_blueprint,
 )
 from ghostwheel.agent_blueprint import AgentBlueprint
-from ghostwheel.app_info import AppInfo, ToolInfo
+from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
 from ghostwheel.compaction import HistoryCompactor
 from ghostwheel.config import AppConfig
 from ghostwheel.event_dispatcher import EventSink, deliver_event
@@ -331,17 +331,20 @@ def build_runtime(
     agents: list[Agent[Any, Any]] = []
     try:
         chat_blueprint = chat_agent_blueprint(config, catalog=catalog)
+        review_blueprint = review_agent_blueprint(config, catalog=catalog)
         app_info = AppInfo(
             workspace=str(deps.cwd),
             provider=config.chat_model.provider.value,
             model=config.chat_model.model,
-            tool_profile=config.tools.profile.value,
-            tools=tuple(
-                ToolInfo(
-                    tool.name,
-                    _short_tool_description(tool.description),
-                )
-                for tool in chat_blueprint.tools
+            chat_tools=_tool_set_info(
+                chat_blueprint,
+                profile=config.tools.profile.value,
+                catalog=catalog,
+            ),
+            review_tools=_tool_set_info(
+                review_blueprint,
+                profile=config.tools.review_profile.value,
+                catalog=catalog,
             ),
         )
         token_counter = TiktokenTokenCounter()
@@ -362,7 +365,7 @@ def build_runtime(
                 input_token_budget=config.history.compactor_input_tokens,
                 summary_token_limit=config.history.compaction.summary_tokens,
             )
-        review_agent = review_agent_blueprint(config, catalog=catalog).build()
+        review_agent = review_blueprint.build()
         agents.append(review_agent)
         fallback_runner: PydanticAgentRunner | None = None
         if config.review.raw_fallback:
@@ -422,8 +425,34 @@ def _estimate_chat_overhead(
     )
 
 
-def _short_tool_description(description: str) -> str:
+def _tool_set_info(
+    blueprint: AgentBlueprint[Any, Any],
+    *,
+    profile: str,
+    catalog: ToolCatalog,
+) -> ToolSetInfo:
+    """Describe the exact resolved tools and shell exposure for one agent."""
+
+    selected_tools = catalog.for_profile(profile)
+    has_shell_access = any(
+        selected is shell_tool
+        for selected in selected_tools
+        for shell_tool in catalog.shell
+    )
+    return ToolSetInfo(
+        profile=profile,
+        tools=tuple(
+            ToolInfo(tool.name, _short_tool_description(tool.description))
+            for tool in blueprint.tools
+        ),
+        has_shell_access=has_shell_access,
+    )
+
+
+def _short_tool_description(description: str | None) -> str:
     """Collapse a tool's first prose paragraph into one display line."""
 
+    if not description:
+        return "No description available."
     first_paragraph = description.partition("\n\n")[0]
     return " ".join(first_paragraph.split()) or "No description available."

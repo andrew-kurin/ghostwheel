@@ -5,10 +5,19 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class ToolInfo:
-    """Display metadata for one tool available to the chat agent."""
+    """Display metadata for one resolved agent tool."""
 
     name: str
     description: str
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSetInfo:
+    """Resolved tool capabilities for one independently configured agent."""
+
+    profile: str
+    tools: tuple[ToolInfo, ...] = ()
+    has_shell_access: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,5 +27,5 @@ class AppInfo:
     workspace: str
     provider: str
     model: str
-    tool_profile: str
-    tools: tuple[ToolInfo, ...] = ()
+    chat_tools: ToolSetInfo
+    review_tools: ToolSetInfo

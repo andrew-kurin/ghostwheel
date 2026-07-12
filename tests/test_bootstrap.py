@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 import ghostwheel.bootstrap as bootstrap_module
-from ghostwheel.app_info import AppInfo, ToolInfo
+from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
 from ghostwheel.bootstrap import Runtime, build_runtime
 from ghostwheel.config import Settings
 from ghostwheel.review import ReviewService
@@ -24,8 +24,8 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
         assert runtime.app_info.workspace == str(tmp_path.resolve())
         assert runtime.app_info.provider == config.chat_model.provider.value
         assert runtime.app_info.model == config.chat_model.model
-        assert runtime.app_info.tool_profile == config.tools.profile.value
-        assert runtime.app_info.tools == (
+        assert runtime.app_info.chat_tools.profile == config.tools.profile.value
+        assert runtime.app_info.chat_tools.tools == (
             ToolInfo(
                 "read", "Read a UTF-8 text file as a compact, line-numbered page."
             ),
@@ -36,6 +36,8 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
             ),
             ToolInfo("bash", "Run a shell command in the project working directory."),
         )
+        assert runtime.app_info.chat_tools.has_shell_access is True
+        assert runtime.app_info.review_tools == runtime.app_info.chat_tools
         assert runtime.session.estimated_context_tokens > 256
         assert runtime.session.context_tokens_estimated is True
     finally:
@@ -51,18 +53,57 @@ def test_build_runtime_reports_tools_from_the_active_custom_catalog(tmp_path) ->
 
         return path
 
+    def execute(command: str) -> str:
+        """Execute one project command."""
+
+        return command
+
+    config = Settings(
+        tool_profile="read-only",
+        review_tool_profile="full",
+        _env_file=None,
+    ).resolve()
+    catalog = ToolCatalog(read_only=(inspect_workspace,), shell=(execute,))
+
+    runtime = build_runtime(config, cwd=tmp_path, catalog=catalog)
+    try:
+        assert runtime.app_info.chat_tools == ToolSetInfo(
+            profile="read-only",
+            tools=(ToolInfo("inspect_workspace", "Inspect one workspace path."),),
+            has_shell_access=False,
+        )
+        assert runtime.app_info.review_tools == ToolSetInfo(
+            profile="full",
+            tools=(
+                ToolInfo("inspect_workspace", "Inspect one workspace path."),
+                ToolInfo("execute", "Execute one project command."),
+            ),
+            has_shell_access=True,
+        )
+    finally:
+        runtime.close()
+
+
+def test_build_runtime_accepts_a_tool_without_a_description(tmp_path) -> None:
+    def inspect(path: str) -> str:
+        return path
+
     config = Settings(
         tool_profile="read-only",
         review_tool_profile="read-only",
         _env_file=None,
     ).resolve()
-    catalog = ToolCatalog(read_only=(inspect_workspace,), shell=())
+    catalog = ToolCatalog(read_only=(inspect,), shell=())
 
     runtime = build_runtime(config, cwd=tmp_path, catalog=catalog)
     try:
-        assert runtime.app_info.tools == (
-            ToolInfo("inspect_workspace", "Inspect one workspace path."),
+        expected = ToolSetInfo(
+            profile="read-only",
+            tools=(ToolInfo("inspect", "No description available."),),
+            has_shell_access=False,
         )
+        assert runtime.app_info.chat_tools == expected
+        assert runtime.app_info.review_tools == expected
     finally:
         runtime.close()
 
@@ -91,7 +132,13 @@ def test_runtime_async_context_owns_agent_and_tool_lifetimes() -> None:
         session=object(),  # type: ignore[arg-type]
         reviews=object(),  # type: ignore[arg-type]
         tool_deps=deps,  # type: ignore[arg-type]
-        app_info=AppInfo(".", "provider", "model", "read-only"),
+        app_info=AppInfo(
+            ".",
+            "provider",
+            "model",
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
         _agents=(agent,),  # type: ignore[arg-type]
     )
 
@@ -138,7 +185,13 @@ def test_runtime_rejects_a_concurrent_enter_before_entry_finishes() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
 
@@ -190,7 +243,13 @@ def test_runtime_close_waits_for_an_in_progress_enter() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
 
@@ -291,7 +350,13 @@ def test_cancelling_close_owner_does_not_cancel_shared_teardown() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
         await runtime.__aenter__()

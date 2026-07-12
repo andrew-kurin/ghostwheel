@@ -287,6 +287,27 @@ def test_cli_has_one_automatic_terminal_interface(
     assert _supports_prompt_toolkit(Stream(True), Stream(True), term="dumb") is False
 
 
+def test_main_reports_resolution_errors_as_invalid_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ghostwheel.config as config_module
+
+    class InvalidSettings:
+        def resolve(self) -> object:
+            raise ValueError("Unknown model provider: invalid")
+
+    monkeypatch.setattr(config_module, "Settings", InvalidSettings)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--no-history"])
+
+    assert exit_info.value.code == 2
+    error_output = capsys.readouterr().err
+    assert "ghostwheel: error: Unknown model provider: invalid" in error_output
+    assert "Traceback" not in error_output
+
+
 def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

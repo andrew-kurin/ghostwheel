@@ -24,7 +24,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.console import Console
 
-from ghostwheel.app_info import AppInfo, ToolInfo
+from ghostwheel.app_info import AppInfo, ToolInfo, ToolSetInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.runtime_contracts import TurnSucceeded
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
@@ -80,7 +80,14 @@ def make_ui(
             width=width,
         ),
         session=session or FakeSession(),
-        app_info=app_info or AppInfo(str(workspace), "provider", "model", "read-only"),
+        app_info=app_info
+        or AppInfo(
+            str(workspace),
+            "provider",
+            "model",
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
         **kwargs,
     )
 
@@ -224,6 +231,53 @@ def test_prompt_shortcuts_clear_the_draft_ignore_ctrl_q_and_quit(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("input_mode", [InputMode.NAVIGATION, InputMode.REPLACE])
+@pytest.mark.parametrize(
+    "shift_enter",
+    ["\n", "\x1b[27;2;13~"],
+    ids=["lf", "xterm-modified-cr"],
+)
+def test_shift_enter_inserts_a_newline_in_every_vim_mode(
+    tmp_path: Path,
+    input_mode: InputMode,
+    shift_enter: str,
+) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                vim_mode=True,
+                live=False,
+            )
+            try:
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("abc")
+                await wait_for_buffer_text(ui, "abc")
+                ui._get_prompt_session().app.vi_state.input_mode = input_mode
+
+                pipe_input.send_text(shift_enter)
+                for _attempt in range(100):
+                    value = ui._get_prompt_session().default_buffer.text
+                    if "\n" in value:
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError("Shift+Enter did not insert a newline")
+                assert not prompt_task.done()
+
+                expected = ui._get_prompt_session().default_buffer.text
+                pipe_input.send_text("\r")
+                assert await asyncio.wait_for(prompt_task, 1) == expected
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
 def test_active_turn_uses_escape_to_cancel_and_ctrl_d_to_quit(
     tmp_path: Path,
 ) -> None:
@@ -264,21 +318,34 @@ def test_active_turn_uses_escape_to_cancel_and_ctrl_d_to_quit(
             run_task = asyncio.create_task(ui.run(FakeReviews()))
 
             await wait_for_prompt(ui, run_task)
+            ui._get_prompt_session().app.ttimeoutlen = 0.05
             pipe_input.send_text("first\r")
             assert await asyncio.wait_for(session.started.get(), 1) == "first"
 
-            pipe_input.send_text("\x03\x1b[A")
+            # Ctrl+C, Meta/Alt keys, and complete arrow sequences are discarded.
+            pipe_input.send_text("\x03\x1ba\x1b[A")
             await asyncio.sleep(0.1)
             assert session.cancelled == []
             assert not run_task.done()
 
+            # A split arrow prefix must be allowed to finish before the VT
+            # parser decides whether Escape was standalone.
             pipe_input.send_text("\x1b")
+            await asyncio.sleep(0.01)
+            pipe_input.send_text("[A")
+            await asyncio.sleep(0.1)
+            assert session.cancelled == []
+
+            # Ordinary input and a trailing Escape can share one read; the
+            # pending Escape is recognized after ttimeoutlen.
+            pipe_input.send_text("x\x1b")
             await wait_for_cancelled_output(output, 1)
             assert session.cancelled == ["first"]
             await wait_for_prompt(ui, run_task)
 
             # Escape can arrive in the same terminal read as prompt submission.
             pipe_input.send_text("second\r\x1b")
+            assert await asyncio.wait_for(session.started.get(), 1) == "second"
             await wait_for_cancelled_output(output, 2)
             await wait_for_prompt(ui, run_task)
 
@@ -558,6 +625,22 @@ def test_redirected_pipe_input_is_async_and_preserves_buffered_lines(
             pass
 
 
+def test_stream_input_does_not_initialize_persistent_history(tmp_path: Path) -> None:
+    history_path = tmp_path / "unwritable-state" / "input-history"
+    ui = make_ui(
+        workspace=tmp_path,
+        history_path=history_path,
+        interactive=False,
+        input_stream=StringIO("streamed prompt\n"),
+        live=False,
+    )
+
+    assert asyncio.run(ui.read()) == "streamed prompt"
+    assert ui._composer.history is None
+    assert ui._composer.history_store is None
+    assert not history_path.parent.exists()
+
+
 def test_private_history_round_trips_multiline_entries(tmp_path: Path) -> None:
     history_path = tmp_path / "state" / "ghostwheel" / "history"
     ui = make_ui(
@@ -567,8 +650,8 @@ def test_private_history_round_trips_multiline_entries(tmp_path: Path) -> None:
         live=False,
     )
 
-    ui._history.append_string("first")
-    ui._history.append_string("more\nthan one line")
+    ui._get_prompt_history().append_string("first")
+    ui._get_prompt_history().append_string("more\nthan one line")
 
     assert stat.S_IMODE(history_path.parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(history_path.stat().st_mode) == 0o600
@@ -578,7 +661,12 @@ def test_private_history_round_trips_multiline_entries(tmp_path: Path) -> None:
         interactive=False,
         live=False,
     )
-    assert restored._history_store.entries == ["first", "more\nthan one line"]
+    restored._get_prompt_history()
+    assert restored._composer.history_store is not None
+    assert restored._composer.history_store.entries == [
+        "first",
+        "more\nthan one line",
+    ]
     assert "+more\n+than one line" in history_path.read_text(encoding="utf-8")
 
 
@@ -595,8 +683,9 @@ def test_in_memory_history_and_xdg_default_create_no_unrequested_file(
         interactive=False,
         live=False,
     )
-    ui._history.append_string("remember for this run")
-    assert ui._history_store.entries == ["remember for this run"]
+    ui._get_prompt_history().append_string("remember for this run")
+    assert ui._composer.history_store is not None
+    assert ui._composer.history_store.entries == ["remember for this run"]
     assert not (tmp_path / "ghostwheel").exists()
 
 
@@ -606,12 +695,11 @@ def test_completion_covers_commands_files_and_directories(tmp_path: Path) -> Non
     ui = make_ui(workspace=tmp_path, interactive=False, live=False)
     event = CompleteEvent(completion_requested=True)
 
-    command_completions = list(ui._completer.get_completions(Document("/ret"), event))
-    file_completions = list(
-        ui._completer.get_completions(Document("/review REA"), event)
-    )
+    completer = ui._composer.completer
+    command_completions = list(completer.get_completions(Document("/ret"), event))
+    file_completions = list(completer.get_completions(Document("/review REA"), event))
     directory_completions = list(
-        ui._completer.get_completions(Document("/review s"), event)
+        completer.get_completions(Document("/review s"), event)
     )
 
     assert [completion.text for completion in command_completions] == ["/retry"]
@@ -619,7 +707,7 @@ def test_completion_covers_commands_files_and_directories(tmp_path: Path) -> Non
     assert [completion.text for completion in directory_completions] == ["rc/"]
     assert (
         list(
-            ui._completer.get_completions(
+            completer.get_completions(
                 Document("/revX", cursor_position=4),
                 event,
             )
@@ -628,7 +716,7 @@ def test_completion_covers_commands_files_and_directories(tmp_path: Path) -> Non
     )
 
 
-def test_custom_edit_bindings_are_inert_in_vim_navigation(tmp_path: Path) -> None:
+def test_completion_binding_is_inert_in_vim_navigation(tmp_path: Path) -> None:
     async def wait_for_navigation(ui: TerminalUI) -> None:
         for _attempt in range(100):
             if ui._get_prompt_session().app.vi_state.input_mode is InputMode.NAVIGATION:
@@ -647,18 +735,6 @@ def test_custom_edit_bindings_are_inert_in_vim_navigation(tmp_path: Path) -> Non
                 live=False,
             )
             try:
-                newline_task = asyncio.create_task(ui.read())
-                await wait_for_prompt(ui, newline_task)
-                pipe_input.send_text("abc\x1b")
-                await wait_for_navigation(ui)
-                assert ui._status_text().endswith(" · N")
-                pipe_input.send_text("\n")
-                await asyncio.sleep(0.01)
-                assert ui._get_prompt_session().default_buffer.text == "abc"
-                assert not newline_task.done()
-                pipe_input.send_text("\r")
-                assert await asyncio.wait_for(newline_task, 1) == "abc"
-
                 completion_task = asyncio.create_task(ui.read())
                 await wait_for_prompt(ui, completion_task)
                 assert (
@@ -725,6 +801,58 @@ def test_active_turn_silences_and_discards_terminal_typeahead(
         os.close(slave)
 
 
+def test_fallback_tty_monitors_escape_and_ctrl_d_without_composer(
+    tmp_path: Path,
+) -> None:
+    class RecordingCancellation:
+        def __init__(self) -> None:
+            self.requested = asyncio.Event()
+
+        def cancel(self) -> bool:
+            self.requested.set()
+            return True
+
+    master, slave = os.openpty()
+    input_stream = os.fdopen(os.dup(slave), "r", encoding="utf-8")
+    ui = make_ui(
+        workspace=tmp_path,
+        interactive=False,
+        input_stream=input_stream,
+        live=False,
+    )
+
+    async def scenario() -> None:
+        assert not ui._use_prompt_toolkit()
+
+        escape_cancellation = RecordingCancellation()
+        ui.turn_started()
+        with ui._capture_turn_input(escape_cancellation):
+            os.write(master, b"\x1b")
+            await asyncio.wait_for(escape_cancellation.requested.wait(), 1)
+        assert not ui._quit_requested
+        ui.turn_cancelled()
+
+        quit_cancellation = RecordingCancellation()
+        ui.turn_started()
+        with ui._capture_turn_input(quit_cancellation):
+            os.write(master, b"\x04")
+            await asyncio.wait_for(quit_cancellation.requested.wait(), 1)
+        assert ui._quit_requested
+        ui.turn_cancelled()
+
+    try:
+        asyncio.run(scenario())
+        restored_flags = termios.tcgetattr(slave)[3]
+        assert restored_flags & termios.ECHO
+        assert restored_flags & termios.ICANON
+        assert restored_flags & termios.ISIG
+    finally:
+        ui.close()
+        input_stream.close()
+        os.close(master)
+        os.close(slave)
+
+
 def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
     child = textwrap.dedent(
         f"""
@@ -734,13 +862,19 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo
+        from ghostwheel.app_info import AppInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
             Console(file=StringIO()),
             session=object(),
-            app_info=AppInfo({str(tmp_path)!r}, "provider", "model", "read-only"),
+            app_info=AppInfo(
+                {str(tmp_path)!r},
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             interactive=False,
             input_stream=sys.stdin,
             live=False,
@@ -803,13 +937,19 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo
+        from ghostwheel.app_info import AppInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
             Console(file=sys.stdout),
             session=object(),
-            app_info=AppInfo({str(tmp_path)!r}, "provider", "model", "read-only"),
+            app_info=AppInfo(
+                {str(tmp_path)!r},
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             interactive=True,
             input_stream=sys.stdin,
             live=False,
@@ -869,13 +1009,19 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
 
         from rich.console import Console
 
-        from ghostwheel.app_info import AppInfo
+        from ghostwheel.app_info import AppInfo, ToolSetInfo
         from ghostwheel.terminal_ui import TerminalUI
 
         ui = TerminalUI(
             Console(file=sys.stdout),
             session=object(),
-            app_info=AppInfo({str(tmp_path)!r}, "provider", "model", "read-only"),
+            app_info=AppInfo(
+                {str(tmp_path)!r},
+                "provider",
+                "model",
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             interactive=True,
             input_stream=sys.stdin,
             live=False,
@@ -954,6 +1100,7 @@ def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
     ui = make_ui(
         workspace=tmp_path,
         output=output,
+        width=20,
         interactive=False,
         live=False,
     )
@@ -961,22 +1108,56 @@ def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
     with pytest.raises(RuntimeError, match="outside an active turn"):
         asyncio.run(ui.handle_event(TextOutput("orphaned")))
 
+    raw_answer = (
+        "# Heading\n\n**strong** and [bold]literal[/bold] "
+        "with-a-single-very-long-unwrapped-line"
+    )
     ui.turn_started()
-    asyncio.run(ui.handle_event(TextOutput("# Heading\n\n[bold]literal[/bold]")))
+    asyncio.run(ui.handle_event(TextOutput("# Heading\n\n", starts_part=True)))
+    asyncio.run(ui.handle_event(TextOutput("**strong** and ")))
+    asyncio.run(
+        ui.handle_event(
+            TextOutput("[bold]literal[/bold] with-a-single-very-long-unwrapped-line")
+        )
+    )
+    streamed = output.getvalue()
+    assert streamed.endswith("\nGhostwheel\n" + raw_answer)
     asyncio.run(ui.handle_event(ToolStarted("read", "{'path': '[/]'}", call_id="1")))
     asyncio.run(ui.handle_event(ToolFinished("read", "[/]", call_id="1")))
     asyncio.run(ui.handle_event(ToolFailed("grep", "[bad]", call_id="missing")))
-    ui.turn_outcome(
-        TurnSucceeded("# Heading\n\n**strong** and [bold]literal[/bold]", ())
-    )
+    ui.turn_outcome(TurnSucceeded(raw_answer, ()))
 
     rendered = output.getvalue()
-    assert "Heading" in rendered
-    assert "strong" in rendered
+    assert "# Heading" in rendered
+    assert "**strong**" in rendered
     assert "[bold]literal[/bold]" in rendered
     assert "read" in rendered and "[/]" in rendered
     assert "grep" in rendered and "[bad]" in rendered
+    assert rendered.count("# Heading") == 1
+    assert rendered.count("**strong**") == 1
     assert rendered.count("[bold]literal[/bold]") == 1
+    assert rendered.count("with-a-single-very-long-unwrapped-line") == 1
+
+
+def test_non_live_success_without_text_events_prints_literal_fallback(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        width=20,
+        interactive=False,
+        live=False,
+    )
+    raw_answer = "**literal-markdown** with-a-single-very-long-unwrapped-line"
+
+    ui.turn_started()
+    ui.turn_outcome(TurnSucceeded(raw_answer, ()))
+
+    rendered = output.getvalue()
+    assert rendered.endswith("\nGhostwheel\n" + raw_answer + "\n")
+    assert rendered.count(raw_answer) == 1
 
 
 def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None:
@@ -999,15 +1180,18 @@ def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None
     assert "Ctrl+J" not in rendered
     assert "Ctrl+Q" not in rendered
     assert "Ctrl+O" not in rendered
-    assert "list available tools and the active profile" in rendered
+    assert "list available tools and active profiles" in rendered
     assert "Context compacted: 12k → ~4.2k." in rendered
 
 
-def test_tools_info_lists_every_available_tool_and_description(tmp_path: Path) -> None:
+def test_tools_info_lists_mixed_chat_and_review_capabilities(tmp_path: Path) -> None:
     output = StringIO()
-    tools = (
+    chat_tools = (
         ToolInfo("read", "Read a text file."),
         ToolInfo("ls", "List a directory."),
+    )
+    review_tools = (
+        ToolInfo("read", "Read a text file."),
         ToolInfo("grep", "Search text files."),
         ToolInfo("bash", "Run a shell command."),
     )
@@ -1017,8 +1201,8 @@ def test_tools_info_lists_every_available_tool_and_description(tmp_path: Path) -
             str(tmp_path),
             "provider",
             "model",
-            "full",
-            tools,
+            ToolSetInfo("read-only", chat_tools),
+            ToolSetInfo("full", review_tools, True),
         ),
         output=output,
         width=120,
@@ -1029,12 +1213,40 @@ def test_tools_info_lists_every_available_tool_and_description(tmp_path: Path) -
     ui.tools_info()
 
     rendered = output.getvalue()
+    assert "Chat" in rendered
+    assert "Review" in rendered
+    assert "Tool profile  read-only" in rendered
     assert "Tool profile  full" in rendered
-    assert "Available tools (4)" in rendered
-    for tool in tools:
+    assert "Available tools (2)" in rendered
+    assert "Available tools (3)" in rendered
+    for tool in (*chat_tools, *review_tools):
         assert tool.name in rendered
         assert tool.description in rendered
-    assert "Shell commands run with unrestricted environment access." in rendered
+    assert rendered.count("unrestricted environment access") == 1
+
+
+def test_welcome_labels_mixed_chat_and_review_profiles(tmp_path: Path) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        app_info=AppInfo(
+            str(tmp_path),
+            "provider",
+            "model",
+            ToolSetInfo("read-only"),
+            ToolSetInfo("full", has_shell_access=True),
+        ),
+        output=output,
+        width=160,
+        interactive=False,
+        live=False,
+    )
+
+    ui.welcome()
+
+    rendered = output.getvalue()
+    assert "chat READ-ONLY" in rendered
+    assert "review FULL (unrestricted shell)" in rendered
 
 
 def test_tools_info_handles_a_profile_with_no_tools(tmp_path: Path) -> None:
@@ -1049,8 +1261,8 @@ def test_tools_info_handles_a_profile_with_no_tools(tmp_path: Path) -> None:
     ui.tools_info()
 
     rendered = output.getvalue()
-    assert "Available tools (0)" in rendered
-    assert "None for this profile." in rendered
+    assert rendered.count("Available tools (0)") == 2
+    assert rendered.count("None for this profile.") == 2
     assert "unrestricted environment access" not in rendered
 
 

@@ -34,9 +34,10 @@ tool catalog ---- ToolDeps ---- Workspace / CommandRunner
 - `session.py` owns chat-session orchestration and re-exports its former public
   contract names for compatibility.
 - `presentation.py` reduces runtime events into renderer-neutral turn state.
-- `terminal_ui.py` is the sole presentation adapter. It uses prompt-toolkit for
-  inline input and Rich for a bounded transient preview plus completed output in
-  the primary terminal buffer.
+- `terminal_ui.py` is the sole presentation adapter. It uses Rich for a bounded
+  transient preview plus completed output in the primary terminal buffer.
+- `terminal_composer.py` owns prompt-toolkit session construction, editor key
+  bindings, completion, and private prompt-history persistence.
 - `agent_blueprint.py` and `agent_factory.py` own SDK-independent agent inputs
   and Pydantic-AI construction. `agent.py` is a compatibility facade.
 - `model_config.py` and `tool_config.py` contain lightweight resolved values;

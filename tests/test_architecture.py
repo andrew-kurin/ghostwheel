@@ -17,6 +17,7 @@ CANONICAL_RUNTIME_MODULES = (
     "pydantic_runner",
     "compaction",
     "review",
+    "terminal_composer",
     "terminal_ui",
 )
 

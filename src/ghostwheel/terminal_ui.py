@@ -8,7 +8,6 @@ only the active composer at the bottom of the terminal.
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import os
 import signal
 import stat
@@ -23,32 +22,13 @@ from typing import TextIO
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
-from prompt_toolkit.completion import (
-    CompleteEvent,
-    Completer,
-    Completion,
-    PathCompleter,
-)
-from prompt_toolkit.document import Document
-from prompt_toolkit.enums import DEFAULT_BUFFER, EditingMode
-from prompt_toolkit.filters import (
-    emacs_insert_mode,
-    has_focus,
-    vi_insert_mode,
-    vi_insert_multiple_mode,
-    vi_navigation_mode,
-)
 from prompt_toolkit.formatted_text import FormattedText
-from prompt_toolkit.history import History
 from prompt_toolkit.input import Input
-from prompt_toolkit.input.defaults import create_input
 from prompt_toolkit.input.typeahead import get_typeahead
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.key_processor import KeyPress, KeyPressEvent
+from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output
-from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, Group
 from rich.live import Live
@@ -58,10 +38,9 @@ from rich.rule import Rule
 from rich.spinner import Spinner
 from rich.text import Text
 
-from ghostwheel.app_info import AppInfo
+from ghostwheel.app_info import AppInfo, ToolSetInfo
 from ghostwheel.cancellation import TurnCancellation
 from ghostwheel.controller import (
-    COMMANDS,
     CancellationPort,
     ReviewPort,
     SessionPort,
@@ -69,6 +48,7 @@ from ghostwheel.controller import (
 )
 from ghostwheel.events import (
     AgentEvent,
+    TextOutput,
     ToolFailed,
     ToolFinished,
     ToolStarted,
@@ -90,14 +70,20 @@ from ghostwheel.runtime_contracts import (
     TurnOutcome,
     TurnSucceeded,
 )
+from ghostwheel.terminal_composer import (
+    PrivateHistory,
+    TerminalComposer,
+    default_history_path,
+)
 
 __all__ = ["TerminalUI", "default_history_path"]
 
 _LIVE_TOOL_LIMIT = 2
 _LIVE_ANSWER_MAX_LINES = 1
 _LIVE_ANSWER_MAX_CHARACTERS = 400
-_ESCAPE_FLUSH_SECONDS = 0.05
-_XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
+# prompt_toolkit's default VT-prefix timeout, used only when no composer
+# application exists to provide its configured ``ttimeoutlen``.
+_DEFAULT_TTIMEOUT_SECONDS = 0.5
 _TERMIOS_LOCAL_FLAGS = 3
 _TERMINAL_GUARDED_SIGNALS = (
     signal.SIGHUP,
@@ -105,223 +91,6 @@ _TERMINAL_GUARDED_SIGNALS = (
     signal.SIGTERM,
     signal.SIGTSTP,
 )
-
-
-def default_history_path() -> Path:
-    """Return the private per-user prompt history location."""
-
-    state_home = os.environ.get("XDG_STATE_HOME")
-    base = Path(state_home).expanduser() if state_home else Path.home() / ".local/state"
-    return base / "ghostwheel" / "input-history"
-
-
-class _InputHistory:
-    """Private prompt history compatible with prompt_toolkit's file format."""
-
-    def __init__(self, path: Path | None) -> None:
-        self.path = path.expanduser() if path is not None else None
-        self.entries = self._load()
-        if self.path is not None:
-            self._ensure_file()
-
-    def append(self, value: str) -> None:
-        if not value.strip():
-            return
-        self.entries.append(value)
-        if self.path is None:
-            return
-        self._ensure_file()
-        with self.path.open("a", encoding="utf-8") as history_file:
-            history_file.write(f"\n# {dt.datetime.now().isoformat()}\n")
-            for line in value.split("\n"):
-                history_file.write(f"+{line}\n")
-
-    def _load(self) -> list[str]:
-        if self.path is None or not self.path.exists():
-            return []
-        entries: list[str] = []
-        lines: list[str] = []
-        for line in self.path.read_text(
-            encoding="utf-8",
-            errors="replace",
-        ).splitlines():
-            if line.startswith("+"):
-                lines.append(line[1:])
-            elif lines:
-                entries.append("\n".join(lines))
-                lines = []
-        if lines:
-            entries.append("\n".join(lines))
-        return entries
-
-    def _ensure_file(self) -> None:
-        assert self.path is not None
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        descriptor = os.open(
-            self.path,
-            os.O_CREAT | os.O_APPEND | os.O_WRONLY,
-            0o600,
-        )
-        os.close(descriptor)
-        self.path.chmod(0o600)
-
-
-class _PrivateHistory(History):
-    """Expose the private history through prompt_toolkit's history protocol."""
-
-    def __init__(self, history: _InputHistory) -> None:
-        super().__init__()
-        self._history = history
-
-    def load_history_strings(self) -> Iterable[str]:
-        # prompt_toolkit consumes newest-first; the private store is oldest-first.
-        return reversed(tuple(self._history.entries))
-
-    def store_string(self, string: str) -> None:
-        self._history.append(string)
-
-    def append_string(self, string: str) -> None:
-        # Match the on-disk store's whitespace filtering in the in-memory view.
-        if string.strip():
-            super().append_string(string)
-
-
-class _GhostwheelCompleter(Completer):
-    """Complete slash commands and paths following ``/review``."""
-
-    def __init__(self, workspace: Path) -> None:
-        self._paths = PathCompleter(
-            get_paths=lambda: [str(workspace)],
-            expanduser=True,
-        )
-
-    def get_completions(
-        self,
-        document: Document,
-        complete_event: CompleteEvent,
-    ) -> Iterable[Completion]:
-        text = document.text_before_cursor
-        if document.text_after_cursor or "\n" in text:
-            return
-
-        review_prefix = "/review "
-        if text.lower().startswith(review_prefix):
-            path_text = text[len(review_prefix) :]
-            path_document = Document(path_text, cursor_position=len(path_text))
-            for completion in self._paths.get_completions(
-                path_document,
-                complete_event,
-            ):
-                completion_text = completion.text
-                if completion.display_text.endswith(
-                    os.sep
-                ) and not completion_text.endswith(os.sep):
-                    completion_text += os.sep
-                yield Completion(
-                    completion_text,
-                    start_position=completion.start_position,
-                    display=completion.display,
-                    display_meta=completion.display_meta,
-                )
-            return
-
-        if not text.startswith("/") or any(character.isspace() for character in text):
-            return
-        normalized = text.lower()
-        for command in COMMANDS:
-            if command.startswith(normalized):
-                yield Completion(
-                    command,
-                    start_position=-len(text),
-                    display=command,
-                )
-
-
-def _key_bindings() -> KeyBindings:
-    bindings = KeyBindings()
-    composer_focused = has_focus(DEFAULT_BUFFER)
-    editing_focused = composer_focused & (
-        emacs_insert_mode | vi_insert_mode | vi_insert_multiple_mode
-    )
-    history_navigation_focused = composer_focused & (emacs_insert_mode | vi_insert_mode)
-
-    @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
-    def _submit_or_modified_shift_enter(event: KeyPressEvent) -> None:
-        if event.key_sequence[-1].data == _XTERM_SHIFT_ENTER:
-            event.current_buffer.insert_text("\n")
-        else:
-            event.current_buffer.validate_and_handle()
-
-    @bindings.add(Keys.ControlJ, filter=editing_focused, eager=True)
-    def _shift_enter_newline(event: KeyPressEvent) -> None:
-        # Ghostty can map Shift+Enter to LF, which prompt_toolkit exposes as
-        # ControlJ. The physical shortcuts are indistinguishable in that mode.
-        event.current_buffer.insert_text("\n")
-
-    @bindings.add(Keys.ControlC, filter=composer_focused, eager=True)
-    def _clear_prompt(event: KeyPressEvent) -> None:
-        event.current_buffer.reset()
-        if event.app.editing_mode is EditingMode.VI:
-            event.app.vi_state.input_mode = InputMode.INSERT
-
-    @bindings.add(Keys.ControlD, eager=True, is_global=True)
-    def _quit(event: KeyPressEvent) -> None:
-        event.app.exit(exception=EOFError())
-
-    @bindings.add(Keys.ControlQ, eager=True, is_global=True)
-    def _ignore_removed_quit_shortcut(_event: KeyPressEvent) -> None:
-        pass
-
-    @bindings.add(Keys.ControlI, filter=editing_focused, eager=True)
-    def _complete(event: KeyPressEvent) -> None:
-        buffer = event.current_buffer
-        if buffer.complete_state is None:
-            buffer.start_completion(select_first=True)
-        else:
-            buffer.complete_next()
-
-    @bindings.add(Keys.Up, filter=history_navigation_focused, eager=True)
-    def _history_previous_or_cursor_up(event: KeyPressEvent) -> None:
-        event.current_buffer.auto_up(count=event.arg)
-
-    @bindings.add(Keys.Down, filter=history_navigation_focused, eager=True)
-    def _history_next_or_cursor_down(event: KeyPressEvent) -> None:
-        buffer = event.current_buffer
-        working_index = buffer.working_index
-        buffer.auto_down(count=event.arg)
-        if buffer.working_index != working_index:
-            buffer.cursor_position = len(buffer.text)
-
-    @bindings.add(
-        Keys.Up,
-        filter=composer_focused & vi_navigation_mode,
-        eager=True,
-    )
-    def _cursor_up_in_vi_navigation(event: KeyPressEvent) -> None:
-        event.current_buffer.cursor_up(count=event.arg)
-
-    @bindings.add(
-        Keys.Down,
-        filter=composer_focused & vi_navigation_mode,
-        eager=True,
-    )
-    def _cursor_down_in_vi_navigation(event: KeyPressEvent) -> None:
-        event.current_buffer.cursor_down(count=event.arg)
-
-    @bindings.add(
-        Keys.ControlJ,
-        filter=composer_focused & vi_navigation_mode,
-        eager=True,
-    )
-    @bindings.add(
-        Keys.ControlI,
-        filter=composer_focused & vi_navigation_mode,
-        eager=True,
-    )
-    def _ignore_insert_shortcuts_in_vi_navigation(_event: KeyPressEvent) -> None:
-        pass
-
-    return bindings
 
 
 class _TerminalCancellation:
@@ -385,12 +154,6 @@ class TerminalUI:
         self._turn = TurnState()
         self._last_live_update = 0.0
 
-        self._history_store = _InputHistory(history_path)
-        self._history = _PrivateHistory(self._history_store)
-        self._prompt_input = prompt_input
-        self._prompt_output = prompt_output
-        self._owned_prompt_input: Input | None = None
-        self._prompt_session: PromptSession[str] | None = None
         self._prompt_active = False
         self._quit_requested = False
         self._line_buffer = bytearray()
@@ -399,8 +162,15 @@ class TerminalUI:
         self._terminal_input_attributes: list[object] | None = None
         self._terminal_signal_handlers: dict[int, object] = {}
 
-        workspace = Path(app_info.workspace).expanduser()
-        self._completer = _GhostwheelCompleter(workspace)
+        self._composer = TerminalComposer(
+            workspace=Path(app_info.workspace).expanduser(),
+            history_path=history_path,
+            vim_mode=vim_mode,
+            prompt_input=prompt_input,
+            prompt_output=prompt_output,
+            bottom_toolbar=self._bottom_toolbar,
+            rprompt=self._rprompt,
+        )
 
     async def handle_event(self, event: AgentEvent) -> None:
         """Reduce one streamed event into the active turn presentation."""
@@ -410,7 +180,14 @@ class TerminalUI:
 
         activity = self._turn.apply(event)
         if not self._turn_uses_live:
-            if isinstance(event, ToolStarted | ToolFinished | ToolFailed):
+            if isinstance(event, TextOutput):
+                if event.starts_part:
+                    self.console.print(
+                        Text("\nGhostwheel\n", style="bold magenta"),
+                        end="",
+                    )
+                self.console.print(Text(event.content), end="", soft_wrap=True)
+            elif isinstance(event, ToolStarted | ToolFinished | ToolFailed):
                 assert activity is not None
                 self.console.print(self._tool_line(activity))
 
@@ -422,11 +199,15 @@ class TerminalUI:
         details.append(f"{self.app_info.provider}/{self.app_info.model}", style="cyan")
         details.append("  ·  ")
         details.append(self.app_info.workspace)
-        details.append("  ·  tools: ")
-        tool_style = "bold yellow" if self.app_info.tool_profile == "full" else "green"
-        details.append(self.app_info.tool_profile.upper(), style=tool_style)
-        if self.app_info.tool_profile == "full":
-            details.append(" (unrestricted shell)", style="yellow")
+        for label, tool_set in (
+            ("chat", self.app_info.chat_tools),
+            ("review", self.app_info.review_tools),
+        ):
+            details.append(f"  ·  {label} ")
+            tool_style = "bold yellow" if tool_set.has_shell_access else "green"
+            details.append(tool_set.profile.upper(), style=tool_style)
+            if tool_set.has_shell_access:
+                details.append(" (unrestricted shell)", style="yellow")
         self.console.print(heading)
         self.console.print(details)
         self.console.print(Text("Type /help for commands.", style="dim"))
@@ -470,7 +251,7 @@ class TerminalUI:
         if not self._use_prompt_toolkit():
             return await self._read_stream_line()
 
-        prompt_session = self._get_prompt_session()
+        prompt_session = self._composer.get_session(self.input_stream)
         if self.vim_mode:
             prompt_session.app.vi_state.input_mode = InputMode.INSERT
         self._prompt_active = True
@@ -510,7 +291,7 @@ class TerminalUI:
             ("/retry", "repeat the previous chat or review"),
             ("/clear", "clear model conversation history"),
             ("/model", "show the active provider and model"),
-            ("/tools", "list available tools and the active profile"),
+            ("/tools", "list available tools and active profiles"),
             ("/quit", "exit Ghostwheel"),
         )
         body = Text()
@@ -537,26 +318,32 @@ class TerminalUI:
         )
 
     def tools_info(self) -> None:
-        body = Text.assemble(
-            Text("Tool profile  ", style="bold"),
-            Text(self.app_info.tool_profile, style="yellow"),
-        )
-        body.append(f"\n\nAvailable tools ({len(self.app_info.tools)})", style="bold")
-        if self.app_info.tools:
-            name_width = max(len(tool.name) for tool in self.app_info.tools)
-            for tool in self.app_info.tools:
+        body = Text()
+        self._append_tool_set(body, "Chat", self.app_info.chat_tools)
+        body.append("\n\n")
+        self._append_tool_set(body, "Review", self.app_info.review_tools)
+        self.console.print(Panel(body, title="Tools", border_style="yellow"))
+
+    @staticmethod
+    def _append_tool_set(body: Text, title: str, tool_set: ToolSetInfo) -> None:
+        body.append(title, style="bold")
+        body.append("\nTool profile  ", style="bold")
+        body.append(tool_set.profile, style="yellow")
+        body.append(f"\nAvailable tools ({len(tool_set.tools)})", style="bold")
+        if tool_set.tools:
+            name_width = max(len(tool.name) for tool in tool_set.tools)
+            for tool in tool_set.tools:
                 body.append("\n")
                 body.append(f"{tool.name:<{name_width}}", style="bold cyan")
                 body.append("  ")
                 body.append(tool.description)
         else:
             body.append("\nNone for this profile.", style="dim")
-        if self.app_info.tool_profile in {"full", "shell-only"}:
+        if tool_set.has_shell_access:
             body.append(
-                "\n\nShell commands run with unrestricted environment access.",
+                "\nShell commands run with unrestricted environment access.",
                 style="yellow",
             )
-        self.console.print(Panel(body, title="Tools", border_style="yellow"))
 
     def unknown_command(self, command: str, suggestion: str | None = None) -> None:
         message = Text.assemble(
@@ -591,10 +378,18 @@ class TerminalUI:
         self._reset_turn()
 
     def turn_outcome(self, outcome: TurnOutcome) -> None:
+        managed_live = self._active and self._turn_uses_live
         self._finish_activity()
         if isinstance(outcome, TurnSucceeded):
-            self.console.print(Text("\nGhostwheel", style="bold magenta"))
-            self.console.print(Markdown(outcome.output))
+            if managed_live:
+                self.console.print(Text("\nGhostwheel", style="bold magenta"))
+                self.console.print(Markdown(outcome.output))
+            elif not self._turn.answer:
+                self.console.print(
+                    Text("\nGhostwheel\n", style="bold magenta"),
+                    end="",
+                )
+                self.console.print(Text(outcome.output), soft_wrap=True)
         elif isinstance(outcome, TurnNoResult):
             self.console.print(Text(outcome.message, style="yellow"))
         elif isinstance(outcome, TurnFailed):
@@ -656,10 +451,7 @@ class TerminalUI:
 
         self._stop_live()
         self._restore_terminal_input()
-        self._prompt_session = None
-        if self._owned_prompt_input is not None:
-            self._owned_prompt_input.close()
-            self._owned_prompt_input = None
+        self._composer.close()
 
     def _render_turn_failure(self, outcome: TurnFailed) -> None:
         presentation = failure_presentation(outcome.kind)
@@ -765,7 +557,7 @@ class TerminalUI:
         """Prevent type-ahead from echoing into or leaking past an active turn."""
 
         if (
-            self._prompt_input is not None
+            self._composer.prompt_input is not None
             or self._terminal_input_attributes is not None
         ):
             return
@@ -797,11 +589,15 @@ class TerminalUI:
     ) -> Iterator[None]:
         """Drain active-turn keys, using Escape to cancel and Ctrl+D to quit."""
 
-        if not self._use_prompt_toolkit():
+        prompt_input = self._turn_input()
+        if prompt_input is None:
+            # ``turn_started`` may already have disabled canonical input and
+            # ISIG. Restore a normal, interruptible tty when monitoring cannot
+            # be attached instead of leaving the process unresponsive.
+            self._restore_terminal_input()
             yield
             return
 
-        prompt_input = self._get_prompt_session().app.input
         loop = asyncio.get_running_loop()
         flush_handle: asyncio.TimerHandle | None = None
         monitor_active = True
@@ -823,14 +619,17 @@ class TerminalUI:
             loop.call_soon(cancel_if_active)
 
         def handle_keys(keys: Iterable[KeyPress]) -> None:
-            for key_press in keys:
+            key_presses = tuple(keys)
+            for key_press in key_presses:
                 if key_press.key == Keys.ControlD:
                     self._quit_requested = True
                     request_cancellation()
                     return
-                if key_press.key == Keys.Escape:
-                    request_cancellation()
-                    return
+            # VT input represents Alt/Meta combinations as Escape followed by
+            # the modified key in one decoded batch. Only a trailing Escape is
+            # standalone; an Escape with a following key is a prefix.
+            if key_presses and key_presses[-1].key == Keys.Escape:
+                request_cancellation()
 
         def flush_pending_escape() -> None:
             nonlocal flush_handle
@@ -839,14 +638,17 @@ class TerminalUI:
 
         def input_ready() -> None:
             nonlocal flush_handle
+            if flush_handle is not None:
+                flush_handle.cancel()
+                flush_handle = None
             keys = prompt_input.read_keys()
             handle_keys(keys)
             if prompt_input.closed:
                 self._quit_requested = True
                 request_cancellation()
-            elif not keys and flush_handle is None:
+            elif monitor_active:
                 flush_handle = loop.call_later(
-                    _ESCAPE_FLUSH_SECONDS,
+                    self._turn_input_timeout(prompt_input),
                     flush_pending_escape,
                 )
 
@@ -856,14 +658,19 @@ class TerminalUI:
             stack.enter_context(prompt_input.attach(input_ready))
         except EOFError, NotImplementedError, OSError, RuntimeError:
             stack.close()
+            self._restore_terminal_input()
             yield
             return
 
         try:
-            # prompt_toolkit can retain keys read in the same chunk as Enter,
-            # while a lone Escape can remain pending in its VT parser.
+            # prompt_toolkit can retain decoded keys read in the same chunk as
+            # Enter. A lone Escape may instead remain pending in its VT parser;
+            # defer that parser flush so a split arrow/Meta sequence can finish.
             handle_keys(get_typeahead(prompt_input))
-            handle_keys(prompt_input.flush_keys())
+            flush_handle = loop.call_later(
+                self._turn_input_timeout(prompt_input),
+                flush_pending_escape,
+            )
             yield
         finally:
             monitor_active = False
@@ -877,7 +684,7 @@ class TerminalUI:
         """Preserve cooked tty state across termination while the prompt is raw."""
 
         if (
-            self._prompt_input is not None
+            self._composer.prompt_input is not None
             or self._terminal_input_attributes is not None
         ):
             return
@@ -1004,49 +811,34 @@ class TerminalUI:
     def _use_prompt_toolkit(self) -> bool:
         if not self.interactive:
             return False
-        if self._prompt_input is not None:
+        if self._composer.prompt_input is not None:
             return True
         return _isatty(self.input_stream) and (
-            self.console.is_terminal or self._prompt_output is not None
+            self.console.is_terminal or self._composer.prompt_output is not None
         )
 
-    def _get_prompt_session(self) -> PromptSession[str]:
-        if self._prompt_session is None:
-            prompt_input = self._prompt_input
-            if prompt_input is None and self.input_stream is not sys.stdin:
-                assert self.input_stream is not None
-                prompt_input = create_input(stdin=self.input_stream)
-                self._owned_prompt_input = prompt_input
+    def _turn_input(self) -> Input | None:
+        return self._composer.input_for_turn(self.input_stream)
 
-            self._prompt_session = PromptSession(
-                message=FormattedText([("class:prompt", "\n> ")]),
-                multiline=True,
-                wrap_lines=True,
-                editing_mode=(EditingMode.VI if self.vim_mode else EditingMode.EMACS),
-                history=self._history,
-                enable_history_search=False,
-                completer=self._completer,
-                complete_while_typing=False,
-                enable_suspend=True,
-                key_bindings=_key_bindings(),
-                bottom_toolbar=self._bottom_toolbar,
-                rprompt=self._rprompt,
-                mouse_support=False,
-                erase_when_done=False,
-                reserve_space_for_menu=4,
-                style=Style.from_dict(
-                    {
-                        "bottom-toolbar": "noreverse",
-                        "prompt": "bold ansicyan",
-                        "rprompt": "ansibrightblack",
-                        "status.rule": "ansibrightblack",
-                        "status.value": "ansibrightblack",
-                    }
-                ),
-                input=prompt_input,
-                output=self._prompt_output,
-            )
-        return self._prompt_session
+    def _turn_input_timeout(self, prompt_input: Input) -> float:
+        """Use the composer's VT-prefix timeout when it owns this input."""
+
+        if (
+            self._composer.session is not None
+            and self._composer.session.app.input is prompt_input
+        ):
+            return self._composer.session.app.ttimeoutlen
+        return _DEFAULT_TTIMEOUT_SECONDS
+
+    def _get_prompt_history(self) -> PrivateHistory:
+        """Return composer history (kept as a test seam)."""
+
+        return self._composer.get_history()
+
+    def _get_prompt_session(self) -> PromptSession[str]:
+        """Return the prompt session (kept as a test seam)."""
+
+        return self._composer.get_session(self.input_stream)
 
     def _rprompt(self) -> FormattedText:
         app = get_app_or_none()
@@ -1082,8 +874,8 @@ class TerminalUI:
 
     def _mode_label(self) -> str:
         app = get_app_or_none()
-        if app is None and self._prompt_active and self._prompt_session is not None:
-            app = self._prompt_session.app
+        if app is None and self._prompt_active and self._composer.session is not None:
+            app = self._composer.session.app
         input_mode = (
             app.vi_state.input_mode
             if self._prompt_active and app is not None

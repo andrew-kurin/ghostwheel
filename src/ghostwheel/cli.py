@@ -9,7 +9,6 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
-from pydantic import ValidationError
 from rich.console import Console
 
 from ghostwheel.event_dispatcher import EventDispatcher
@@ -88,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         config = Settings().resolve()
-    except ValidationError as error:
+    except ValueError as error:
         parser.error(str(error))
 
     configure_observability(config.observability)
