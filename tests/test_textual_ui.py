@@ -124,7 +124,9 @@ def test_shift_enter_inserts_a_newline_and_plain_enter_submits() -> None:
         app = make_app(session, vim_mode=False)
         async with app.run_test(size=(100, 30)) as pilot:
             assert app.composer.vim_enabled is False
-            assert str(app.composer_prompt.render()) == "You ›"
+            assert app.composer.placeholder == ""
+            assert str(app.context.render()) == "~0/16k"
+            assert not list(app.query("#composer-prompt"))
             await pilot.press(
                 "t", "e", "s", "t", "shift+enter", "s", "t", "i", "l", "l"
             )
@@ -150,6 +152,21 @@ def test_shift_enter_inserts_a_newline_and_plain_enter_submits() -> None:
     asyncio.run(scenario())
 
 
+def test_composer_cursor_blinks_with_a_high_contrast_style() -> None:
+    async def scenario() -> None:
+        app = make_app()
+        async with app.run_test(size=(100, 30)):
+            cursor_style = app.composer.get_component_styles("text-area--cursor")
+
+            assert app.composer.cursor_blink is True
+            assert cursor_style.text_style.reverse is not True
+            assert cursor_style.background != app.composer.styles.background
+            assert sum(cursor_style.background.rgb) > sum(cursor_style.color.rgb)
+            app.exit()
+
+    asyncio.run(scenario())
+
+
 def test_composer_grows_upward_and_shrinks_after_submit() -> None:
     async def scenario() -> None:
         session = FakeSession()
@@ -159,8 +176,8 @@ def test_composer_grows_upward_and_shrinks_after_submit() -> None:
             initial_visible_rows = app.composer.region.intersection(
                 app.composer_shell.content_region
             ).height
-            assert initial_region.height == 3
-            assert initial_visible_rows == 2
+            assert initial_region.height == 2
+            assert initial_visible_rows == 1
 
             await pilot.press(*"one", "shift+enter", *"two", "shift+enter", *"three")
             await pilot.pause()
@@ -180,7 +197,7 @@ def test_composer_grows_upward_and_shrinks_after_submit() -> None:
             await pilot.pause()
 
             assert app.composer.text == ""
-            assert app.composer_shell.region.height == 3
+            assert app.composer_shell.region.height == 2
             assert (
                 app.composer.region.intersection(
                     app.composer_shell.content_region
@@ -208,7 +225,7 @@ def test_composer_resizes_for_multiline_prompt_history() -> None:
             await pilot.press("up")
             await pilot.pause()
             assert app.composer.text == "short"
-            assert app.composer_shell.region.height == 3
+            assert app.composer_shell.region.height == 2
 
             await pilot.press("down")
             await pilot.pause()
@@ -218,7 +235,7 @@ def test_composer_resizes_for_multiline_prompt_history() -> None:
             await pilot.press("down")
             await pilot.pause()
             assert app.composer.text == ""
-            assert app.composer_shell.region.height == 3
+            assert app.composer_shell.region.height == 2
             app.exit()
 
     asyncio.run(scenario())
@@ -231,7 +248,7 @@ def test_composer_tracks_soft_wrap_and_keeps_transcript_visible() -> None:
             app.composer.load_text("x" * 60)
             await pilot.pause()
             assert app.composer.wrapped_document.height == 1
-            assert app.composer_shell.region.height == 3
+            assert app.composer_shell.region.height == 2
 
             await pilot.resize_terminal(35, 30)
             await pilot.pause()
@@ -242,7 +259,7 @@ def test_composer_tracks_soft_wrap_and_keeps_transcript_visible() -> None:
             await pilot.resize_terminal(100, 30)
             await pilot.pause()
             assert app.composer.wrapped_document.height == 1
-            assert app.composer_shell.region.height == 3
+            assert app.composer_shell.region.height == 2
 
             app.composer.load_text("\n".join(f"line {index}" for index in range(20)))
             app.composer.move_cursor(app.composer.document.end)
@@ -265,16 +282,24 @@ def test_context_status_distinguishes_exact_and_estimated_token_usage() -> None:
         session = FakeSession()
         session.estimated_context_tokens = 1_250
         app = make_app(session)
-        async with app.run_test(size=(100, 30)):
-            assert str(app.context.render()) == "ctx ~1.2k/16k"
+        async with app.run_test(size=(100, 30)) as pilot:
+            assert str(app.context.render()) == "~1.2k/16k · I"
+            assert app.context.region.right == app.composer_shell.content_region.right
 
             session.context_tokens_estimated = False
             app.update_context()
-            assert str(app.context.render()) == "ctx 1.2k/16k"
+            assert str(app.context.render()) == "1.2k/16k · I"
 
+            await pilot.resize_terminal(35, 30)
             session.compaction_enabled = False
             app.update_context()
-            assert str(app.context.render()) == "ctx 1.2k/16k · off"
+            await pilot.pause()
+            assert str(app.context.render()) == "1.2k/16k · off · I"
+            assert app.context.region.right == app.composer_shell.content_region.right
+
+            session.context_window_tokens = 0
+            app.update_context()
+            assert str(app.context.render()) == "I"
             app.exit()
 
     asyncio.run(scenario())
@@ -300,12 +325,12 @@ def test_vim_mode_starts_in_insert_and_resets_after_submit() -> None:
         app = make_app(session, vim_mode=True)
         async with app.run_test(size=(100, 30)) as pilot:
             assert app.composer.vim_mode is VimMode.INSERT
-            assert str(app.composer_prompt.render()) == "You I›"
+            assert str(app.context.render()) == "~0/16k · I"
 
             await pilot.press(*"hello", "escape")
             assert app.composer.vim_mode is VimMode.NORMAL
             assert app.composer.cursor_location == (0, 4)
-            assert str(app.composer_prompt.render()) == "You N›"
+            assert str(app.context.render()) == "~0/16k · N"
 
             await pilot.press("h", "q")
             assert app.composer.text == "hello"
@@ -317,7 +342,7 @@ def test_vim_mode_starts_in_insert_and_resets_after_submit() -> None:
             assert session.sent == ["hel!lo"]
             assert app.composer.text == ""
             assert app.composer.vim_mode is VimMode.INSERT
-            assert str(app.composer_prompt.render()) == "You I›"
+            assert str(app.context.render()) == "~0/16k · I"
             app.exit()
 
     asyncio.run(scenario())

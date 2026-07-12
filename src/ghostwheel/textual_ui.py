@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 MODIFY_OTHER_KEYS_ENABLE = "\x1b[>4;2m"
 MODIFY_OTHER_KEYS_RESET = "\x1b[>4;m"
-COMPOSER_MIN_HEIGHT = 3
+COMPOSER_MIN_HEIGHT = 2
 COMPOSER_BORDER_HEIGHT = 1
 TRANSCRIPT_MIN_HEIGHT = 4
 
@@ -252,7 +252,6 @@ class Composer(TextArea):
             soft_wrap=True,
             show_line_numbers=False,
             highlight_cursor_line=False,
-            placeholder="Message Ghostwheel",
             id="composer",
         )
         self.prompt_history = history or InputHistory(None)
@@ -1290,22 +1289,10 @@ class GhostwheelApp(App[None]):
     }
 
     #composer-shell {
-        height: 3;
+        height: 2;
         padding: 0 1;
         background: $surface;
         border-top: solid $primary-darken-3;
-    }
-
-    #composer-prompt {
-        width: 6;
-        height: 1fr;
-        color: $accent;
-        text-style: bold;
-        background: $surface;
-    }
-
-    #composer-prompt.vim-mode {
-        width: 7;
     }
 
     #composer {
@@ -1317,8 +1304,12 @@ class GhostwheelApp(App[None]):
         color: $text;
     }
 
+    #composer .text-area--cursor {
+        text-style: none;
+    }
+
     #context {
-        width: 16;
+        width: auto;
         height: 1fr;
         content-align: right top;
         color: $text-muted;
@@ -1352,14 +1343,8 @@ class GhostwheelApp(App[None]):
         self.header = SelectableStatic(_header(app_info), id="app-header")
         self.transcript = VerticalScroll(id="transcript")
         self.composer = Composer(self.history, vim_enabled=vim_mode)
-        self.composer_prompt = Static(
-            self._composer_prompt(),
-            id="composer-prompt",
-            classes="vim-mode" if vim_mode else "",
-        )
         self.context = Static(id="context")
         self.composer_shell = Horizontal(
-            self.composer_prompt,
             self.composer,
             self.context,
             id="composer-shell",
@@ -1416,7 +1401,7 @@ class GhostwheelApp(App[None]):
         self.input_reader.submit(value)
 
     def on_composer_mode_changed(self, _message: Composer.ModeChanged) -> None:
-        self.composer_prompt.update(self._composer_prompt())
+        self.update_context()
 
     def on_composer_visual_height_changed(
         self,
@@ -1485,12 +1470,18 @@ class GhostwheelApp(App[None]):
         compaction_enabled = getattr(self.session, "compaction_enabled", True)
         estimate_marker = "~" if is_estimate else ""
         compaction_marker = "" if compaction_enabled else " · off"
-        label = (
-            f"ctx {estimate_marker}{_format_token_count(estimated_tokens)}/"
+        context_label = (
+            f"{estimate_marker}{_format_token_count(estimated_tokens)}/"
             f"{_format_token_count(context_window)}{compaction_marker}"
             if context_window
             else ""
         )
+        mode_label = (
+            ("I" if self.composer.vim_mode is VimMode.INSERT else "N")
+            if self.vim_mode
+            else ""
+        )
+        label = " · ".join(part for part in (context_label, mode_label) if part)
         self.context.update(Text(label, style="dim"))
 
     def _resize_composer(self) -> None:
@@ -1510,12 +1501,6 @@ class GhostwheelApp(App[None]):
             self._composer_height = target_height
             self.composer_shell.styles.height = target_height
             self.call_after_refresh(self._resize_composer)
-
-    def _composer_prompt(self) -> str:
-        if not self.vim_mode:
-            return "You ›"
-        mode = "I" if self.composer.vim_mode is VimMode.INSERT else "N"
-        return f"You {mode}›"
 
 
 def _header(app_info: AppInfo) -> Group:

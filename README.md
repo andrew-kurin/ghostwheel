@@ -57,9 +57,9 @@ summaries are memory-only and disappear when Ghostwheel exits.
 
 Vim-style prompt editing is enabled by default. It starts each prompt in Insert
 mode; Escape switches to Normal mode, and `i`, `a`, `I`, `A`, `o`, or `O` return
-to Insert mode. The compact `I` or `N` beside `You` shows the current mode. Run
-`/help` for the available motions and editing commands, or use `--no-vim` to
-restore the standard prompt editor.
+to Insert mode. The compact `I` or `N` following the right-aligned context usage
+shows the current mode. Run `/help` for the available motions and editing
+commands, or use `--no-vim` to restore the standard prompt editor.
 
 The interactive UI supports mouse-wheel transcript scrolling and dragging or
 clicking its scrollbar. Drag outside the scrollbar to select text; Textual keeps
@@ -269,8 +269,8 @@ with `~`. This proxy can differ from the model server's tokenizer, and its first
 use may need network access to populate tiktoken's encoding cache. When a
 successful chat response includes provider usage, Ghostwheel uses it to calibrate
 otherwise invisible system-instruction, tool-schema, chat-template, and tokenizer
-overhead. That calibrated overhead remains visible after `/clear`. The footer
-shows `ctx USED/WINDOW`; `~` marks an estimate and `· off` means automatic
+overhead. That calibrated overhead remains visible after `/clear`. The composer
+status shows `USED/WINDOW`; `~` marks an estimate and `· off` means automatic
 compaction is disabled. The 4,096-token default reserve leaves response capacity;
 the 4,096-token recent target and 2,048-token summary cap leave working room in
 the default 16K window. Oversized summarizer inputs are processed as bounded
