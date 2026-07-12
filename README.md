@@ -47,9 +47,8 @@ redirected, the same UI reads and writes line-oriented streams without terminal
 control sequences. Run `uv run ghostwheel --help` for all command-line options.
 
 The prompt supports multiline editing, command and review-path completion, and
-prompt history. Enter submits; Ctrl+J inserts a newline. Shift+Enter also inserts
-a newline in terminals that encode it as Ctrl+J. Prompt history is stored in
-`$XDG_STATE_HOME/ghostwheel/input-history` (or
+prompt history. Enter submits and Shift+Enter inserts a newline. Prompt history
+is stored in `$XDG_STATE_HOME/ghostwheel/input-history` (or
 `~/.local/state/ghostwheel/input-history`); use `--no-history` to keep it only in
 memory or `--history-file PATH` to choose another location. History contains
 prompts in plain text, so disable it when prompts may contain secrets. Model
@@ -70,10 +69,10 @@ In the chat prompt:
 - Use `/model`, `/tools`, or `/help` for runtime information.
 - Use `/quit` to exit.
 
-During an active turn, Ctrl+C cancels that turn and returns to the composer;
-while idle, Ctrl+C exits, and Ctrl+Q also exits from the interactive prompt.
-Text entered while a turn is running is discarded so it cannot corrupt the
-live preview or leak into the next prompt.
+During an active turn, Esc cancels and returns to the composer. Ctrl+C clears
+the current prompt, and Ctrl+D exits unconditionally. Other text entered while a
+turn is running is discarded so it cannot corrupt the live preview or leak into
+the next prompt.
 Active turns use a bounded live preview; completed assistant replies are
 committed to scrollback as Markdown. Tool calls remain visible as compact status
 rows with completion time, and review findings switch to stacked cards on narrow

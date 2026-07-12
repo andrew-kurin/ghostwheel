@@ -121,6 +121,8 @@ ResultT = TypeVar("ResultT")
 
 
 class CancellationPort(Protocol):
+    def cancel(self) -> bool: ...
+
     async def run(self, awaitable: Awaitable[ResultT]) -> object: ...
 
 

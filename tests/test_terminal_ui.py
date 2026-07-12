@@ -45,6 +45,11 @@ class FakeSession:
         self.history = ()
 
 
+class FakeReviews:
+    async def review(self, *_args: object, **_kwargs: object) -> object:
+        raise AssertionError("review was not expected")
+
+
 class RecordingOutput(DummyOutput):
     def __init__(self) -> None:
         self.alternate_screen_entries = 0
@@ -60,6 +65,7 @@ class RecordingOutput(DummyOutput):
 def make_ui(
     *,
     workspace: Path,
+    session: FakeSession | None = None,
     app_info: AppInfo | None = None,
     output: StringIO | None = None,
     force_terminal: bool = False,
@@ -73,13 +79,16 @@ def make_ui(
             force_terminal=force_terminal,
             width=width,
         ),
-        session=FakeSession(),
+        session=session or FakeSession(),
         app_info=app_info or AppInfo(str(workspace), "provider", "model", "read-only"),
         **kwargs,
     )
 
 
-async def wait_for_prompt(ui: TerminalUI, task: asyncio.Task[str]) -> None:
+async def wait_for_prompt[ResultT](
+    ui: TerminalUI,
+    task: asyncio.Task[ResultT],
+) -> None:
     for _attempt in range(100):
         if ui._get_prompt_session().app.is_running:
             return
@@ -153,6 +162,14 @@ def test_prompt_is_inline_mouse_free_and_distinguishes_submit_from_newline(
                 assert await feed_prompt(ui, pipe_input, "first\nsecond\r") == (
                     "first\nsecond"
                 )
+                assert (
+                    await feed_prompt(
+                        ui,
+                        pipe_input,
+                        "third\x1b[27;2;13~fourth\r",
+                    )
+                    == "third\nfourth"
+                )
                 session = ui._get_prompt_session()
                 assert session.app.full_screen is False
                 assert session.app.erase_when_done is False
@@ -161,10 +178,118 @@ def test_prompt_is_inline_mouse_free_and_distinguishes_submit_from_newline(
                 assert output.alternate_screen_entries == 0
                 assert output.mouse_support_entries == 0
 
-                with pytest.raises(EOFError):
-                    await feed_prompt(ui, pipe_input, "\x11")
             finally:
                 ui.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("vim_mode", [True, False])
+def test_prompt_shortcuts_clear_the_draft_ignore_ctrl_q_and_quit(
+    tmp_path: Path,
+    vim_mode: bool,
+) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                vim_mode=vim_mode,
+                live=False,
+            )
+            try:
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("discard this\x03")
+                await wait_for_buffer_text(ui, "")
+                assert not prompt_task.done()
+                if vim_mode:
+                    assert (
+                        ui._get_prompt_session().app.vi_state.input_mode
+                        is InputMode.INSERT
+                    )
+
+                pipe_input.send_text("unfinished\x11")
+                await wait_for_buffer_text(ui, "unfinished")
+                assert not prompt_task.done()
+
+                pipe_input.send_text("\x04")
+                with pytest.raises(EOFError):
+                    await asyncio.wait_for(prompt_task, 1)
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
+def test_active_turn_uses_escape_to_cancel_and_ctrl_d_to_quit(
+    tmp_path: Path,
+) -> None:
+    class BlockingSession(FakeSession):
+        def __init__(self) -> None:
+            self.started: asyncio.Queue[str] = asyncio.Queue()
+            self.cancelled: list[str] = []
+
+        async def send(self, prompt: str) -> TurnSucceeded[str]:
+            await self.started.put(prompt)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(prompt)
+                raise
+            raise AssertionError("unreachable")
+
+    async def wait_for_cancelled_output(output: StringIO, count: int) -> None:
+        for _attempt in range(100):
+            if output.getvalue().count("Turn cancelled.") == count:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"turn cancellation count did not reach {count}")
+
+    async def scenario() -> None:
+        output = StringIO()
+        session = BlockingSession()
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                session=session,
+                output=output,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                live=False,
+            )
+            run_task = asyncio.create_task(ui.run(FakeReviews()))
+
+            await wait_for_prompt(ui, run_task)
+            pipe_input.send_text("first\r")
+            assert await asyncio.wait_for(session.started.get(), 1) == "first"
+
+            pipe_input.send_text("\x03\x1b[A")
+            await asyncio.sleep(0.1)
+            assert session.cancelled == []
+            assert not run_task.done()
+
+            pipe_input.send_text("\x1b")
+            await wait_for_cancelled_output(output, 1)
+            assert session.cancelled == ["first"]
+            await wait_for_prompt(ui, run_task)
+
+            # Escape can arrive in the same terminal read as prompt submission.
+            pipe_input.send_text("second\r\x1b")
+            await wait_for_cancelled_output(output, 2)
+            await wait_for_prompt(ui, run_task)
+
+            pipe_input.send_text("third\r")
+            assert await asyncio.wait_for(session.started.get(), 1) == "third"
+            pipe_input.send_text("\x04")
+            await asyncio.wait_for(run_task, 1)
+
+            assert session.cancelled[-1] == "third"
+            assert output.getvalue().count("Turn cancelled.") == 2
+            assert "Goodbye!" in output.getvalue()
 
     asyncio.run(scenario())
 
@@ -576,7 +701,7 @@ def test_active_turn_silences_and_discards_terminal_typeahead(
     try:
         ui.turn_started()
         active_attributes = termios.tcgetattr(slave)
-        assert active_attributes[local_flags] & termios.ISIG
+        assert not active_attributes[local_flags] & termios.ISIG
         assert not active_attributes[local_flags] & termios.ECHO
         assert not active_attributes[local_flags] & termios.ECHONL
         assert not active_attributes[local_flags] & termios.ICANON
@@ -707,7 +832,7 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
         active_flags = termios.tcgetattr(slave)[local_flags]
         assert not active_flags & termios.ECHO
         assert not active_flags & termios.ICANON
-        assert active_flags & termios.ISIG
+        assert not active_flags & termios.ISIG
         process.send_signal(signal.SIGTERM)
         assert process.wait(timeout=2) == -signal.SIGTERM
         restored_flags = termios.tcgetattr(slave)[local_flags]
@@ -867,8 +992,12 @@ def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None
     ui.history_compacted(12_000, 4_200)
 
     rendered = output.getvalue()
-    assert "Ctrl+J" in rendered
-    assert "Ctrl+Q" in rendered
+    assert "Shift+Enter" in rendered
+    assert "Ctrl+C" in rendered
+    assert "Ctrl+D" in rendered
+    assert "Esc" in rendered
+    assert "Ctrl+J" not in rendered
+    assert "Ctrl+Q" not in rendered
     assert "Ctrl+O" not in rendered
     assert "list available tools and the active profile" in rendered
     assert "Context compacted: 12k → ~4.2k." in rendered

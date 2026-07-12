@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
 
 import pytest
 
@@ -78,26 +76,3 @@ def test_cancelling_run_cancels_child_and_propagates() -> None:
         assert controller.active is False
 
     asyncio.run(scenario())
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX signal handling required")
-def test_sigint_cancels_turn_and_restores_previous_handler() -> None:
-    previous_sigint = signal.getsignal(signal.SIGINT)
-
-    async def scenario() -> None:
-        controller = TurnCancellation(handle_sigint=True)
-        started = asyncio.Event()
-
-        async def turn() -> None:
-            started.set()
-            await asyncio.Event().wait()
-
-        running = asyncio.create_task(controller.run(turn()))
-        await started.wait()
-        os.kill(os.getpid(), signal.SIGINT)
-
-        assert await asyncio.wait_for(running, 1) is CANCELLED
-        assert controller.active is False
-
-    asyncio.run(scenario())
-    assert signal.getsignal(signal.SIGINT) is previous_sigint

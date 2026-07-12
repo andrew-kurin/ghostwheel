@@ -1,6 +1,4 @@
 import asyncio
-import os
-import signal
 from types import SimpleNamespace
 from typing import Any
 
@@ -110,7 +108,7 @@ async def run_commands(
         reviews,
         presenter=presenter,
         input_reader=FakeInput(inputs),
-        cancellation=cancellation or TurnCancellation(handle_sigint=True),
+        cancellation=cancellation or TurnCancellation(),
     )
 
 
@@ -218,7 +216,7 @@ def test_command_loop_reports_compaction_token_reduction() -> None:
     assert ("compacted", (12_000, 4_200)) in presenter.calls
 
 
-def test_sigint_cancels_repeated_turns_and_keeps_the_loop_alive() -> None:
+def test_programmatic_cancellation_keeps_the_loop_alive_across_turns() -> None:
     class BlockingSession(FakeSession):
         def __init__(self) -> None:
             super().__init__()
@@ -237,18 +235,20 @@ def test_sigint_cancels_repeated_turns_and_keeps_the_loop_alive() -> None:
     async def scenario() -> tuple[BlockingSession, FakePresenter]:
         session = BlockingSession()
         presenter = FakePresenter()
+        cancellation = TurnCancellation()
         loop_task = asyncio.create_task(
             run_commands(
                 ["one", "two", "/quit"],
                 session,
                 FakeReviews(),
                 presenter,
+                cancellation=cancellation,
             )
         )
         assert await asyncio.wait_for(session.started.get(), 1) == "one"
-        os.kill(os.getpid(), signal.SIGINT)
+        assert cancellation.cancel() is True
         assert await asyncio.wait_for(session.started.get(), 1) == "two"
-        os.kill(os.getpid(), signal.SIGINT)
+        assert cancellation.cancel() is True
         await asyncio.wait_for(loop_task, 1)
         return session, presenter
 

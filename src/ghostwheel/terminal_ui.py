@@ -15,7 +15,8 @@ import stat
 import sys
 import termios
 import time
-from collections.abc import Iterable
+from collections.abc import Awaitable, Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import FrameType
 from typing import TextIO
@@ -41,8 +42,9 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import History
 from prompt_toolkit.input import Input
 from prompt_toolkit.input.defaults import create_input
+from prompt_toolkit.input.typeahead import get_typeahead
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from prompt_toolkit.key_binding.key_processor import KeyPress, KeyPressEvent
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output
@@ -94,6 +96,8 @@ __all__ = ["TerminalUI", "default_history_path"]
 _LIVE_TOOL_LIMIT = 2
 _LIVE_ANSWER_MAX_LINES = 1
 _LIVE_ANSWER_MAX_CHARACTERS = 400
+_ESCAPE_FLUSH_SECONDS = 0.05
+_XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
 _TERMIOS_LOCAL_FLAGS = 3
 _TERMINAL_GUARDED_SIGNALS = (
     signal.SIGHUP,
@@ -242,12 +246,31 @@ def _key_bindings() -> KeyBindings:
     history_navigation_focused = composer_focused & (emacs_insert_mode | vi_insert_mode)
 
     @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
-    def _submit(event: KeyPressEvent) -> None:
-        event.current_buffer.validate_and_handle()
+    def _submit_or_modified_shift_enter(event: KeyPressEvent) -> None:
+        if event.key_sequence[-1].data == _XTERM_SHIFT_ENTER:
+            event.current_buffer.insert_text("\n")
+        else:
+            event.current_buffer.validate_and_handle()
 
     @bindings.add(Keys.ControlJ, filter=editing_focused, eager=True)
-    def _newline(event: KeyPressEvent) -> None:
+    def _shift_enter_newline(event: KeyPressEvent) -> None:
+        # Ghostty can map Shift+Enter to LF, which prompt_toolkit exposes as
+        # ControlJ. The physical shortcuts are indistinguishable in that mode.
         event.current_buffer.insert_text("\n")
+
+    @bindings.add(Keys.ControlC, filter=composer_focused, eager=True)
+    def _clear_prompt(event: KeyPressEvent) -> None:
+        event.current_buffer.reset()
+        if event.app.editing_mode is EditingMode.VI:
+            event.app.vi_state.input_mode = InputMode.INSERT
+
+    @bindings.add(Keys.ControlD, eager=True, is_global=True)
+    def _quit(event: KeyPressEvent) -> None:
+        event.app.exit(exception=EOFError())
+
+    @bindings.add(Keys.ControlQ, eager=True, is_global=True)
+    def _ignore_removed_quit_shortcut(_event: KeyPressEvent) -> None:
+        pass
 
     @bindings.add(Keys.ControlI, filter=editing_focused, eager=True)
     def _complete(event: KeyPressEvent) -> None:
@@ -298,11 +321,22 @@ def _key_bindings() -> KeyBindings:
     def _ignore_insert_shortcuts_in_vi_navigation(_event: KeyPressEvent) -> None:
         pass
 
-    @bindings.add(Keys.ControlQ, eager=True, is_global=True)
-    def _quit(event: KeyPressEvent) -> None:
-        event.app.exit(exception=EOFError())
-
     return bindings
+
+
+class _TerminalCancellation:
+    """Add terminal-key cancellation around the UI-neutral controller."""
+
+    def __init__(self, ui: TerminalUI, delegate: CancellationPort) -> None:
+        self._ui = ui
+        self._delegate = delegate
+
+    def cancel(self) -> bool:
+        return self._delegate.cancel()
+
+    async def run(self, awaitable: Awaitable[object]) -> object:
+        with self._ui._capture_turn_input(self._delegate):
+            return await self._delegate.run(awaitable)
 
 
 class TerminalUI:
@@ -358,6 +392,7 @@ class TerminalUI:
         self._owned_prompt_input: Input | None = None
         self._prompt_session: PromptSession[str] | None = None
         self._prompt_active = False
+        self._quit_requested = False
         self._line_buffer = bytearray()
         self._line_eof = False
         self._terminal_input_descriptor: int | None = None
@@ -407,7 +442,10 @@ class TerminalUI:
     ) -> None:
         """Run the neutral command loop with this object as both UI ports."""
 
-        cancellation = cancellation or TurnCancellation(handle_sigint=True)
+        cancellation = _TerminalCancellation(
+            self,
+            cancellation or TurnCancellation(),
+        )
         try:
             await run_command_loop(
                 self.session,
@@ -424,6 +462,8 @@ class TerminalUI:
 
         if self._active:
             raise RuntimeError("cannot open the prompt while a turn is active")
+        if self._quit_requested:
+            raise EOFError
         self._stop_live()
         self._restore_terminal_input()
 
@@ -481,11 +521,10 @@ class TerminalUI:
             body.append(description)
         body.append("\n\nShortcuts\n", style="bold")
         body.append("Enter               submit\n", style="dim")
-        body.append("Ctrl+J              insert a newline\n", style="dim")
-        body.append(
-            "Ctrl+Q              quit from the interactive prompt\n", style="dim"
-        )
-        body.append("Ctrl+C              cancel a turn; quit while idle\n", style="dim")
+        body.append("Shift+Enter         insert a newline\n", style="dim")
+        body.append("Ctrl+C              clear the current prompt\n", style="dim")
+        body.append("Ctrl+D              quit\n", style="dim")
+        body.append("Esc                 cancel the active turn\n", style="dim")
         body.append("Tab                 complete commands and paths", style="dim")
         self.console.print(Panel(body, title="Commands", border_style="cyan"))
 
@@ -547,7 +586,8 @@ class TerminalUI:
 
     def turn_cancelled(self) -> None:
         self._finish_activity()
-        self.console.print(Text("Turn cancelled.", style="yellow"))
+        if not self._quit_requested:
+            self.console.print(Text("Turn cancelled.", style="yellow"))
         self._reset_turn()
 
     def turn_outcome(self, outcome: TurnOutcome) -> None:
@@ -736,7 +776,7 @@ class TerminalUI:
             attributes = termios.tcgetattr(descriptor)
             quiet_attributes = attributes.copy()
             quiet_attributes[_TERMIOS_LOCAL_FLAGS] &= ~(
-                termios.ECHO | termios.ECHONL | termios.ICANON
+                termios.ECHO | termios.ECHONL | termios.ICANON | termios.ISIG
             )
         except AttributeError, OSError, termios.error:
             return
@@ -749,6 +789,89 @@ class TerminalUI:
             termios.tcsetattr(descriptor, termios.TCSANOW, quiet_attributes)
         except OSError, termios.error:
             self._restore_terminal_input()
+
+    @contextmanager
+    def _capture_turn_input(
+        self,
+        cancellation: CancellationPort,
+    ) -> Iterator[None]:
+        """Drain active-turn keys, using Escape to cancel and Ctrl+D to quit."""
+
+        if not self._use_prompt_toolkit():
+            yield
+            return
+
+        prompt_input = self._get_prompt_session().app.input
+        loop = asyncio.get_running_loop()
+        flush_handle: asyncio.TimerHandle | None = None
+        monitor_active = True
+        cancellation_requested = False
+
+        def cancel_if_active() -> None:
+            nonlocal cancellation_requested
+            if monitor_active and not cancellation.cancel():
+                cancellation_requested = False
+
+        def request_cancellation() -> None:
+            nonlocal cancellation_requested
+            if cancellation_requested:
+                return
+            cancellation_requested = True
+            # Controller presenters start the activity immediately before
+            # CancellationPort.run owns its task. Deferring avoids losing a key
+            # that was typed in the same input chunk as prompt submission.
+            loop.call_soon(cancel_if_active)
+
+        def handle_keys(keys: Iterable[KeyPress]) -> None:
+            for key_press in keys:
+                if key_press.key == Keys.ControlD:
+                    self._quit_requested = True
+                    request_cancellation()
+                    return
+                if key_press.key == Keys.Escape:
+                    request_cancellation()
+                    return
+
+        def flush_pending_escape() -> None:
+            nonlocal flush_handle
+            flush_handle = None
+            handle_keys(prompt_input.flush_keys())
+
+        def input_ready() -> None:
+            nonlocal flush_handle
+            keys = prompt_input.read_keys()
+            handle_keys(keys)
+            if prompt_input.closed:
+                self._quit_requested = True
+                request_cancellation()
+            elif not keys and flush_handle is None:
+                flush_handle = loop.call_later(
+                    _ESCAPE_FLUSH_SECONDS,
+                    flush_pending_escape,
+                )
+
+        stack = ExitStack()
+        try:
+            stack.enter_context(prompt_input.raw_mode())
+            stack.enter_context(prompt_input.attach(input_ready))
+        except EOFError, NotImplementedError, OSError, RuntimeError:
+            stack.close()
+            yield
+            return
+
+        try:
+            # prompt_toolkit can retain keys read in the same chunk as Enter,
+            # while a lone Escape can remain pending in its VT parser.
+            handle_keys(get_typeahead(prompt_input))
+            handle_keys(prompt_input.flush_keys())
+            yield
+        finally:
+            monitor_active = False
+            if flush_handle is not None:
+                flush_handle.cancel()
+            stack.close()
+            prompt_input.flush_keys()
+            get_typeahead(prompt_input)
 
     def _guard_prompt_terminal(self) -> None:
         """Preserve cooked tty state across termination while the prompt is raw."""
