@@ -239,6 +239,7 @@ def _key_bindings() -> KeyBindings:
     editing_focused = composer_focused & (
         emacs_insert_mode | vi_insert_mode | vi_insert_multiple_mode
     )
+    history_navigation_focused = composer_focused & (emacs_insert_mode | vi_insert_mode)
 
     @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
     def _submit(event: KeyPressEvent) -> None:
@@ -255,6 +256,34 @@ def _key_bindings() -> KeyBindings:
             buffer.start_completion(select_first=True)
         else:
             buffer.complete_next()
+
+    @bindings.add(Keys.Up, filter=history_navigation_focused, eager=True)
+    def _history_previous_or_cursor_up(event: KeyPressEvent) -> None:
+        event.current_buffer.auto_up(count=event.arg)
+
+    @bindings.add(Keys.Down, filter=history_navigation_focused, eager=True)
+    def _history_next_or_cursor_down(event: KeyPressEvent) -> None:
+        buffer = event.current_buffer
+        working_index = buffer.working_index
+        buffer.auto_down(count=event.arg)
+        if buffer.working_index != working_index:
+            buffer.cursor_position = len(buffer.text)
+
+    @bindings.add(
+        Keys.Up,
+        filter=composer_focused & vi_navigation_mode,
+        eager=True,
+    )
+    def _cursor_up_in_vi_navigation(event: KeyPressEvent) -> None:
+        event.current_buffer.cursor_up(count=event.arg)
+
+    @bindings.add(
+        Keys.Down,
+        filter=composer_focused & vi_navigation_mode,
+        eager=True,
+    )
+    def _cursor_down_in_vi_navigation(event: KeyPressEvent) -> None:
+        event.current_buffer.cursor_down(count=event.arg)
 
     @bindings.add(
         Keys.ControlJ,
@@ -859,7 +888,7 @@ class TerminalUI:
                 wrap_lines=True,
                 editing_mode=(EditingMode.VI if self.vim_mode else EditingMode.EMACS),
                 history=self._history,
-                enable_history_search=True,
+                enable_history_search=False,
                 completer=self._completer,
                 complete_while_typing=False,
                 enable_suspend=True,

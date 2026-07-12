@@ -96,6 +96,34 @@ async def feed_prompt(ui: TerminalUI, pipe_input: object, value: str) -> str:
     return await asyncio.wait_for(task, 1)
 
 
+async def wait_for_buffer_text(ui: TerminalUI, expected: str) -> None:
+    for _attempt in range(100):
+        if ui._get_prompt_session().default_buffer.text == expected:
+            return
+        await asyncio.sleep(0.01)
+    actual = ui._get_prompt_session().default_buffer.text
+    raise AssertionError(f"buffer did not become {expected!r}; got {actual!r}")
+
+
+async def wait_for_cursor_row(ui: TerminalUI, expected: int) -> None:
+    for _attempt in range(100):
+        row = ui._get_prompt_session().default_buffer.document.cursor_position_row
+        if row == expected:
+            return
+        await asyncio.sleep(0.01)
+    actual = ui._get_prompt_session().default_buffer.document.cursor_position_row
+    raise AssertionError(f"cursor row did not become {expected}; got {actual}")
+
+
+async def wait_for_input_mode(ui: TerminalUI, expected: InputMode) -> None:
+    for _attempt in range(100):
+        if ui._get_prompt_session().app.vi_state.input_mode is expected:
+            return
+        await asyncio.sleep(0.01)
+    actual = ui._get_prompt_session().app.vi_state.input_mode
+    raise AssertionError(f"input mode did not become {expected}; got {actual}")
+
+
 def read_until(descriptor: int, marker: bytes, timeout: float = 2) -> bytes:
     deadline = time.monotonic() + timeout
     output = bytearray()
@@ -154,6 +182,142 @@ def test_bracketed_paste_is_inserted_exactly_once(tmp_path: Path) -> None:
                 pasted = "inserted\nonce"
                 encoded = f"\x1b[200~{pasted}\x1b[201~\r"
                 assert await feed_prompt(ui, pipe_input, encoded) == pasted
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("vim_mode", [True, False])
+def test_up_and_down_cycle_all_history_then_restore_the_draft(
+    tmp_path: Path,
+    vim_mode: bool,
+) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                vim_mode=vim_mode,
+                live=False,
+            )
+            try:
+                assert await feed_prompt(ui, pipe_input, "first prompt\r") == (
+                    "first prompt"
+                )
+                assert await feed_prompt(ui, pipe_input, "second prompt\r") == (
+                    "second prompt"
+                )
+
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("unmatched draft")
+                await wait_for_buffer_text(ui, "unmatched draft")
+
+                pipe_input.send_text("\x1b[A")
+                await wait_for_buffer_text(ui, "second prompt")
+                pipe_input.send_text("\x1b[A")
+                await wait_for_buffer_text(ui, "first prompt")
+                pipe_input.send_text("\x1b[B")
+                await wait_for_buffer_text(ui, "second prompt")
+                pipe_input.send_text("\x1b[B")
+                await wait_for_buffer_text(ui, "unmatched draft")
+
+                pipe_input.send_text("\r")
+                assert await asyncio.wait_for(prompt_task, 1) == "unmatched draft"
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
+def test_history_arrows_move_within_multiline_input_before_recall(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                live=False,
+            )
+            try:
+                assert await feed_prompt(ui, pipe_input, "historic prompt\r") == (
+                    "historic prompt"
+                )
+
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("top\nbottom")
+                await wait_for_buffer_text(ui, "top\nbottom")
+                await wait_for_cursor_row(ui, 1)
+
+                pipe_input.send_text("\x1b[A")
+                await wait_for_cursor_row(ui, 0)
+                assert ui._get_prompt_session().default_buffer.text == "top\nbottom"
+
+                pipe_input.send_text("\x1b[A")
+                await wait_for_buffer_text(ui, "historic prompt")
+                pipe_input.send_text("\x1b[B")
+                await wait_for_buffer_text(ui, "top\nbottom")
+                await wait_for_cursor_row(ui, 1)
+
+                pipe_input.send_text("\x1b[A")
+                await wait_for_cursor_row(ui, 0)
+                pipe_input.send_text("\x1b[B")
+                await wait_for_cursor_row(ui, 1)
+                assert ui._get_prompt_session().default_buffer.text == "top\nbottom"
+
+                pipe_input.send_text("\r")
+                assert await asyncio.wait_for(prompt_task, 1) == "top\nbottom"
+            finally:
+                ui.close()
+
+    asyncio.run(scenario())
+
+
+def test_history_arrows_only_move_vertically_in_vim_navigation(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=tmp_path,
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                vim_mode=True,
+                live=False,
+            )
+            try:
+                assert await feed_prompt(ui, pipe_input, "historic prompt\r") == (
+                    "historic prompt"
+                )
+
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("top\nbottom\x1b")
+                await wait_for_input_mode(ui, InputMode.NAVIGATION)
+                await wait_for_cursor_row(ui, 1)
+
+                pipe_input.send_text("\x1b[A")
+                await wait_for_cursor_row(ui, 0)
+                pipe_input.send_text("\x1b[A")
+                await asyncio.sleep(0.01)
+                assert ui._get_prompt_session().default_buffer.text == "top\nbottom"
+
+                pipe_input.send_text("\x1b[B")
+                await wait_for_cursor_row(ui, 1)
+                pipe_input.send_text("\x1b[B")
+                await asyncio.sleep(0.01)
+                assert ui._get_prompt_session().default_buffer.text == "top\nbottom"
+
+                pipe_input.send_text("\r")
+                assert await asyncio.wait_for(prompt_task, 1) == "top\nbottom"
             finally:
                 ui.close()
 
