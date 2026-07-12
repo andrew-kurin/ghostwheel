@@ -26,7 +26,7 @@ from ghostwheel.session import FailureKind, TurnFailed, TurnNoResult, TurnSuccee
 from ghostwheel.tools.bash import bash
 from ghostwheel.tools.command import CommandResult
 from ghostwheel.tools.deps import ToolDeps
-from ghostwheel.tools.filesystem import DirectoryListing, ls
+from ghostwheel.tools.filesystem import DirectoryListing, ReadResult, ls, read
 from ghostwheel.tools.search import GrepResult, grep
 
 
@@ -125,6 +125,8 @@ def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
     module = importlib.import_module("ghostwheel.agent")
     config = Settings(
         max_output_bytes=123,
+        max_read_lines=3,
+        max_read_scan_bytes=333,
         max_entries=4,
         max_directory_scan_entries=9,
         max_matches=5,
@@ -142,6 +144,8 @@ def test_create_tool_deps_maps_resolved_limits(tmp_path: Path) -> None:
     assert deps.cwd == tmp_path.resolve()
     assert deps.filesystem_roots == (tmp_path.resolve(),)
     assert deps.limits.max_output_bytes == 123
+    assert deps.limits.max_read_lines == 3
+    assert deps.limits.max_read_scan_bytes == 333
     assert deps.limits.max_entries == 4
     assert deps.limits.max_directory_scan_entries == 9
     assert deps.limits.max_matches == 5
@@ -244,6 +248,48 @@ def test_pydantic_runner_awaits_async_tools(tmp_path: Path) -> None:
 
     assert isinstance(outcome, TurnSucceeded)
     assert command_runner.called is True
+
+
+def test_read_sends_compact_text_and_retains_structured_metadata(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a").write_text("first\nsecond\n", encoding="utf-8")
+    agent = Agent(
+        TestModel(call_tools=["read"]),
+        deps_type=ToolDeps,
+        tools=(read,),
+    )
+    deps = ToolDeps(cwd=tmp_path)
+
+    try:
+        outcome = asyncio.run(
+            PydanticAgentRunner(agent, deps).run("inspect", (), output_type=str)
+        )
+    finally:
+        deps.close()
+
+    assert isinstance(outcome, TurnSucceeded)
+    tool_returns = [
+        part
+        for message in outcome.new_messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    assert isinstance(tool_returns[0].content, str)
+    assert tool_returns[0].content.startswith(
+        'read "a" lines=1-2 returned=2 bytes=13 eof=true complete=true reasons=-'
+    )
+    assert "\n1:first\n2:second" in tool_returns[0].content
+    assert '"path":' not in tool_returns[0].content
+    assert isinstance(tool_returns[0].metadata, ReadResult)
+    assert tool_returns[0].metadata.lines_returned == 2
+
+    function_schema = agent._function_toolset.tools["read"].function_schema
+    properties = function_schema.json_schema["properties"]
+    assert {"path", "start_line", "limit", "cursor"} <= properties.keys()
+    assert properties["start_line"]["minimum"] == 1
+    assert properties["cursor"]["anyOf"][0]["maxLength"] == 4_096
 
 
 def test_ls_sends_compact_text_and_retains_structured_metadata(tmp_path: Path) -> None:

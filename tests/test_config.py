@@ -27,6 +27,8 @@ def test_default_config_uses_ollama_and_formatter_inherits_chat_model() -> None:
     assert config.formatter.retries == 5
     assert config.review.raw_fallback is True
     assert config.tools.max_output_bytes == 100_000
+    assert config.tools.max_read_lines == 200
+    assert config.tools.max_read_scan_bytes == 5_000_000
     assert config.tools.max_entries == 200
     assert config.tools.max_directory_scan_entries == 10_000
     assert config.tools.max_matches == 200
@@ -62,6 +64,18 @@ def test_llama_cpp_config_normalizes_provider_and_formatter_inherits() -> None:
         base_url="http://localhost:8080/v1",
     )
     assert config.formatter.model == config.chat_model
+
+
+def test_read_limits_load_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GHOSTWHEEL_MAX_READ_LINES", "321")
+    monkeypatch.setenv("GHOSTWHEEL_MAX_READ_SCAN_BYTES", "7654321")
+
+    config = Settings(_env_file=None).resolve()
+
+    assert config.tools.max_read_lines == 321
+    assert config.tools.max_read_scan_bytes == 7_654_321
 
 
 def test_compaction_settings_load_from_environment(
@@ -173,6 +187,8 @@ def test_formatter_retries_cannot_be_negative() -> None:
 @pytest.mark.parametrize(
     "field",
     [
+        "max_read_lines",
+        "max_read_scan_bytes",
         "max_entries",
         "max_directory_scan_entries",
         "max_matches",

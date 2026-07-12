@@ -175,6 +175,8 @@ when no review-model override is set. Review retries independently fall back to
 
 ```env
 GHOSTWHEEL_MAX_OUTPUT_BYTES=100000
+GHOSTWHEEL_MAX_READ_LINES=200
+GHOSTWHEEL_MAX_READ_SCAN_BYTES=5000000
 GHOSTWHEEL_MAX_ENTRIES=200
 GHOSTWHEEL_MAX_DIRECTORY_SCAN_ENTRIES=10000
 GHOSTWHEEL_MAX_MATCHES=200
@@ -201,6 +203,18 @@ paths relative to allowed-root descriptors and do not traverse symlinks. The
 `read-only` profile registers `read`, `ls`, and `grep`; `shell-only` registers
 unrestricted `bash`; and `full` registers all four. Chat and review profiles are
 configured independently.
+
+`read` returns UTF-8 text as compact `LINE:TEXT` rows, with at most
+`GHOSTWHEEL_MAX_READ_LINES` rows per page. Callers can request a smaller limit,
+jump to a 1-based starting line, or continue sequentially with the returned
+cursor. Cursors seek directly to the next line and are rejected if the path or
+opened file changes. The header reports the returned range, byte size,
+completeness, and whether a page, output, or long-line limit was reached. Output
+contains only complete rows; exceptionally long lines end with an explicit
+truncation marker. NUL-containing and invalid UTF-8 files are rejected instead
+of being returned as replacement-character noise when encountered. To keep
+random line jumps and pathological single lines bounded,
+`GHOSTWHEEL_MAX_READ_SCAN_BYTES` caps bytes inspected by each call.
 
 `ls` returns JSON-escaped rows in sorted relative-path order, with `f`, `d`, `l`,
 and `o` markers for files, directories, symlinks, and other filesystem entries.
@@ -265,9 +279,9 @@ rolling chunks. Review transcripts do not enter chat history. Set
 turn-count limit is applied, but Ghostwheel will no longer trim growing context,
 so the provider may reject or truncate oversized requests.
 
-`GHOSTWHEEL_MAX_OUTPUT_BYTES` caps the complete compact text that `ls` and `grep`
-send to the model. For structured file-read and process results it caps retained
-variable payload; their small result envelope is additional.
+`GHOSTWHEEL_MAX_OUTPUT_BYTES` caps the complete compact text that `read`, `ls`,
+and `grep` send to the model. For structured process results it caps retained
+variable payload; its small result envelope is additional.
 
 ## Observability
 

@@ -11,12 +11,14 @@ from ghostwheel.tools.workspace import Workspace
 class ToolLimits:
     """Resource limits shared by all tool implementations.
 
-    ``max_output_bytes`` bounds complete compact model text for ``ls`` and
-    ``grep``. For other tools it bounds retained variable payload; their small
-    structured result envelope and field names are additional.
+    ``max_output_bytes`` bounds complete compact model text for ``read``, ``ls``,
+    and ``grep``. For other tools it bounds retained variable payload; their
+    small structured result envelope and field names are additional.
     """
 
     max_output_bytes: int = 100_000
+    max_read_lines: int = 200
+    max_read_scan_bytes: int = 5_000_000
     max_entries: int = 200
     max_directory_scan_entries: int = 10_000
     max_matches: int = 200
@@ -30,6 +32,8 @@ class ToolLimits:
     def __post_init__(self) -> None:
         positive_values = {
             "max_output_bytes": self.max_output_bytes,
+            "max_read_lines": self.max_read_lines,
+            "max_read_scan_bytes": self.max_read_scan_bytes,
             "max_entries": self.max_entries,
             "max_directory_scan_entries": self.max_directory_scan_entries,
             "max_matches": self.max_matches,
@@ -67,6 +71,8 @@ class ToolDeps:
         bash_timeout_seconds: float | None = None,
         dry_run: bool = False,
         *,
+        max_read_lines: int | None = None,
+        max_read_scan_bytes: int | None = None,
         max_entries: int | None = None,
         max_directory_scan_entries: int | None = None,
         max_matches: int | None = None,
@@ -97,6 +103,8 @@ class ToolDeps:
 
         scalar_limits = (
             max_output_bytes,
+            max_read_lines,
+            max_read_scan_bytes,
             max_entries,
             max_directory_scan_entries,
             max_matches,
@@ -113,6 +121,10 @@ class ToolDeps:
             limits = ToolLimits(
                 max_output_bytes=(
                     100_000 if max_output_bytes is None else max_output_bytes
+                ),
+                max_read_lines=(200 if max_read_lines is None else max_read_lines),
+                max_read_scan_bytes=(
+                    5_000_000 if max_read_scan_bytes is None else max_read_scan_bytes
                 ),
                 max_entries=200 if max_entries is None else max_entries,
                 max_directory_scan_entries=(
@@ -170,6 +182,14 @@ class ToolDeps:
     @property
     def max_output_bytes(self) -> int:
         return self.limits.max_output_bytes
+
+    @property
+    def max_read_lines(self) -> int:
+        return self.limits.max_read_lines
+
+    @property
+    def max_read_scan_bytes(self) -> int:
+        return self.limits.max_read_scan_bytes
 
     @property
     def max_entries(self) -> int:

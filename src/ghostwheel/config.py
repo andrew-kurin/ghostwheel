@@ -20,6 +20,8 @@ MIN_COMPACTION_INPUT_TOKENS = 1_024
 @dataclass(frozen=True)
 class ToolConfig:
     max_output_bytes: int
+    max_read_lines: int
+    max_read_scan_bytes: int
     max_entries: int
     max_directory_scan_entries: int
     max_matches: int
@@ -146,6 +148,8 @@ class Settings(BaseSettings):
     review_raw_fallback: bool = True
 
     max_output_bytes: int = Field(default=100_000, gt=0)
+    max_read_lines: int = Field(default=200, gt=0)
+    max_read_scan_bytes: int = Field(default=5_000_000, gt=0)
     max_entries: int = Field(default=200, gt=0)
     max_directory_scan_entries: int = Field(default=10_000, gt=0)
     max_matches: int = Field(default=200, gt=0)
@@ -185,6 +189,8 @@ class Settings(BaseSettings):
             ),
             tools=ToolConfig(
                 max_output_bytes=self.max_output_bytes,
+                max_read_lines=self.max_read_lines,
+                max_read_scan_bytes=self.max_read_scan_bytes,
                 max_entries=self.max_entries,
                 max_directory_scan_entries=self.max_directory_scan_entries,
                 max_matches=self.max_matches,
