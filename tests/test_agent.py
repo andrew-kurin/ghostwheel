@@ -26,6 +26,7 @@ from ghostwheel.session import FailureKind, TurnFailed, TurnNoResult, TurnSuccee
 from ghostwheel.tools.bash import bash
 from ghostwheel.tools.command import CommandResult
 from ghostwheel.tools.deps import ToolDeps
+from ghostwheel.tools.filesystem import DirectoryListing, ls
 
 
 class FakeResult:
@@ -238,6 +239,37 @@ def test_pydantic_runner_awaits_async_tools(tmp_path: Path) -> None:
 
     assert isinstance(outcome, TurnSucceeded)
     assert command_runner.called is True
+
+
+def test_ls_sends_compact_text_and_retains_structured_metadata(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("value", encoding="utf-8")
+    agent = Agent(
+        TestModel(call_tools=["ls"]),
+        deps_type=ToolDeps,
+        tools=(ls,),
+    )
+    deps = ToolDeps(cwd=tmp_path)
+
+    try:
+        outcome = asyncio.run(
+            PydanticAgentRunner(agent, deps).run("inspect", (), output_type=str)
+        )
+    finally:
+        deps.close()
+
+    assert isinstance(outcome, TurnSucceeded)
+    tool_returns = [
+        part
+        for message in outcome.new_messages
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(tool_returns) == 1
+    assert tool_returns[0].content.startswith(
+        'ls "." depth=1 returned=1 scanned=1 complete=true reasons=-'
+    )
+    assert isinstance(tool_returns[0].metadata, DirectoryListing)
+    assert [entry.name for entry in tool_returns[0].metadata.entries] == ["value.txt"]
 
 
 def test_runner_only_classifies_structured_output_failures_for_fallback() -> None:

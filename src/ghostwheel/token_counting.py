@@ -34,19 +34,25 @@ class TokenCountingError(RuntimeError):
     """Raised when the configured tokenizer cannot be loaded."""
 
 
+_NON_PROMPT_FIELD_NAMES = {
+    "usage",
+    "model_name",
+    "timestamp",
+    "provider_name",
+    "provider_url",
+    "provider_details",
+    "provider_response_id",
+    "finish_reason",
+    "run_id",
+    "conversation_id",
+    "metadata",
+}
 _NON_PROMPT_FIELDS = {
     "__all__": {
-        "usage",
-        "model_name",
-        "timestamp",
-        "provider_name",
-        "provider_url",
-        "provider_details",
-        "provider_response_id",
-        "finish_reason",
-        "run_id",
-        "conversation_id",
-        "metadata",
+        **{name: True for name in _NON_PROMPT_FIELD_NAMES},
+        "parts": {
+            "__all__": {name: True for name in _NON_PROMPT_FIELD_NAMES},
+        },
     }
 }
 

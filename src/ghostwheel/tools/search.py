@@ -10,6 +10,7 @@ from pydantic_ai import RunContext
 
 from .deps import ToolDeps
 from .output import OutputBudget, normalize_utf8, truncate_utf8
+from .path_filters import NOISE_DIRECTORY_NAMES, glob_matches
 from .workspace import Workspace
 
 
@@ -25,13 +26,6 @@ class GrepResult(BaseModel):
     truncated: bool
     files_searched: int
     files_skipped: int = 0
-
-
-_NOISE_DIRS = {".git", "node_modules", "__pycache__", ".venv"}
-
-
-def _glob_matches(path: Path, pattern: str) -> bool:
-    return path.full_match(pattern) or path.full_match(f"**/{pattern}")
 
 
 def _walk_candidates(
@@ -55,8 +49,6 @@ def _walk_candidates(
                         if entries_seen > max_entries:
                             limit_reached = True
                             break
-                        if entry.name in _NOISE_DIRS:
-                            continue
                         try:
                             entry_stat = os.stat(
                                 entry.name,
@@ -68,11 +60,13 @@ def _walk_candidates(
                             continue
                         relative = relative_directory / entry.name
                         if stat.S_ISDIR(entry_stat.st_mode):
+                            if entry.name in NOISE_DIRECTORY_NAMES:
+                                continue
                             pending_directories.append(relative)
                             continue
                         if not stat.S_ISREG(entry_stat.st_mode):
                             continue
-                        if _glob_matches(relative, file_glob):
+                        if glob_matches(relative, file_glob):
                             directory_candidates.append(root / relative)
         except OSError:
             # A subtree disappeared or became inaccessible while walking. The

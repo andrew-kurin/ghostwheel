@@ -1,5 +1,11 @@
 import pytest
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.usage import RequestUsage
 
 from ghostwheel.token_counting import TiktokenTokenCounter, TokenCountingError
@@ -29,6 +35,25 @@ def test_tiktoken_counter_excludes_response_usage_metadata() -> None:
     )
 
     assert counter.count_messages((first,)) == counter.count_messages((second,))
+
+
+def test_tiktoken_counter_excludes_application_tool_metadata() -> None:
+    counter = TiktokenTokenCounter()
+    compact = ModelRequest(
+        parts=[ToolReturnPart("ls", "same listing", tool_call_id="call-1")]
+    )
+    structured = ModelRequest(
+        parts=[
+            ToolReturnPart(
+                "ls",
+                "same listing",
+                tool_call_id="call-1",
+                metadata={"entries": ["large metadata"] * 1_000},
+            )
+        ]
+    )
+
+    assert counter.count_messages((compact,)) == counter.count_messages((structured,))
 
 
 def test_tiktoken_counter_truncates_text_with_its_library_encoding() -> None:

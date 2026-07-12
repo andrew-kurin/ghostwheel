@@ -192,6 +192,16 @@ paths relative to allowed-root descriptors and do not traverse symlinks. The
 unrestricted `bash`; and `full` registers all four. Chat and review profiles are
 configured independently.
 
+`ls` returns JSON-escaped rows in sorted relative-path order, with `f`, `d`, `l`,
+and `o` markers for files, directories, symlinks, and other filesystem entries.
+It lists one level without file sizes by default; callers can request a depth
+from 1–3, a case-sensitive glob, exact file sizes, common dependency/cache
+directories, a smaller page limit, or the next page using the returned cursor.
+The configured scan, entry, and output limits remain hard ceilings shared across
+the requested tree. Listings report why they are incomplete and omit a
+continuation cursor after scan or entry errors; a scan-limited subset is sorted
+but cannot guarantee complete deterministic membership.
+
 Chat history uses rolling summaries rather than a turn-count limit. Before each
 new chat request, Ghostwheel projects context usage including the pending prompt.
 When that projection exceeds `context window - reserve tokens`, older messages
