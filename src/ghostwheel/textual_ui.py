@@ -365,6 +365,11 @@ class Composer(TextArea):
             event.prevent_default()
             return
         await super()._on_paste(event)
+        # Textual dispatches default handlers for every class in the MRO. Since
+        # the base handler was invoked explicitly above, prevent it from being
+        # dispatched a second time after this override returns.
+        event.stop()
+        event.prevent_default()
 
     async def _on_mouse_down(self, event: events.MouseDown) -> None:
         self._vim_pending = None

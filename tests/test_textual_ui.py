@@ -546,6 +546,20 @@ def test_vim_normal_mode_blocks_terminal_paste_but_keeps_newline_shortcuts() -> 
     asyncio.run(scenario())
 
 
+def test_terminal_paste_is_inserted_once() -> None:
+    async def scenario() -> None:
+        for vim_mode in (True, False):
+            app = make_app(vim_mode=vim_mode)
+            async with app.run_test(size=(100, 30)) as pilot:
+                app.composer.post_message(events.Paste("inserted\nonce"))
+                await pilot.pause()
+
+                assert app.composer.text == "inserted\nonce"
+                app.exit()
+
+    asyncio.run(scenario())
+
+
 def test_vim_shortcuts_only_appear_in_vim_help() -> None:
     def rendered(vim_mode: bool) -> str:
         output = StringIO()
