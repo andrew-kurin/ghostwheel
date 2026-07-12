@@ -22,7 +22,7 @@ from ghostwheel.agent_factory import (
     review_fallback_agent_blueprint,
 )
 from ghostwheel.agent_blueprint import AgentBlueprint
-from ghostwheel.app_info import AppInfo
+from ghostwheel.app_info import AppInfo, ToolInfo
 from ghostwheel.compaction import HistoryCompactor
 from ghostwheel.config import AppConfig
 from ghostwheel.event_dispatcher import EventSink, deliver_event
@@ -330,14 +330,21 @@ def build_runtime(
     deps = create_tool_deps(config, cwd)
     agents: list[Agent[Any, Any]] = []
     try:
+        chat_blueprint = chat_agent_blueprint(config, catalog=catalog)
         app_info = AppInfo(
             workspace=str(deps.cwd),
             provider=config.chat_model.provider.value,
             model=config.chat_model.model,
             tool_profile=config.tools.profile.value,
+            tools=tuple(
+                ToolInfo(
+                    tool.name,
+                    _short_tool_description(tool.description),
+                )
+                for tool in chat_blueprint.tools
+            ),
         )
         token_counter = TiktokenTokenCounter()
-        chat_blueprint = chat_agent_blueprint(config, catalog=catalog)
         initial_overhead_tokens = _estimate_chat_overhead(
             chat_blueprint,
             token_counter,
@@ -413,3 +420,10 @@ def _estimate_chat_overhead(
         token_counter.count_text(blueprint.static_context_json())
         + PROVIDER_FRAMING_TOKENS
     )
+
+
+def _short_tool_description(description: str) -> str:
+    """Collapse a tool's first prose paragraph into one display line."""
+
+    first_paragraph = description.partition("\n\n")[0]
+    return " ".join(first_paragraph.split()) or "No description available."

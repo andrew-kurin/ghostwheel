@@ -24,7 +24,7 @@ from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.key_binding.vi_state import InputMode
 from rich.console import Console
 
-from ghostwheel.app_info import AppInfo
+from ghostwheel.app_info import AppInfo, ToolInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.runtime_contracts import TurnSucceeded
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
@@ -60,6 +60,7 @@ class RecordingOutput(DummyOutput):
 def make_ui(
     *,
     workspace: Path,
+    app_info: AppInfo | None = None,
     output: StringIO | None = None,
     force_terminal: bool = False,
     width: int = 80,
@@ -73,7 +74,7 @@ def make_ui(
             width=width,
         ),
         session=FakeSession(),
-        app_info=AppInfo(str(workspace), "provider", "model", "read-only"),
+        app_info=app_info or AppInfo(str(workspace), "provider", "model", "read-only"),
         **kwargs,
     )
 
@@ -869,7 +870,59 @@ def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None
     assert "Ctrl+J" in rendered
     assert "Ctrl+Q" in rendered
     assert "Ctrl+O" not in rendered
+    assert "list available tools and the active profile" in rendered
     assert "Context compacted: 12k → ~4.2k." in rendered
+
+
+def test_tools_info_lists_every_available_tool_and_description(tmp_path: Path) -> None:
+    output = StringIO()
+    tools = (
+        ToolInfo("read", "Read a text file."),
+        ToolInfo("ls", "List a directory."),
+        ToolInfo("grep", "Search text files."),
+        ToolInfo("bash", "Run a shell command."),
+    )
+    ui = make_ui(
+        workspace=tmp_path,
+        app_info=AppInfo(
+            str(tmp_path),
+            "provider",
+            "model",
+            "full",
+            tools,
+        ),
+        output=output,
+        width=120,
+        interactive=False,
+        live=False,
+    )
+
+    ui.tools_info()
+
+    rendered = output.getvalue()
+    assert "Tool profile  full" in rendered
+    assert "Available tools (4)" in rendered
+    for tool in tools:
+        assert tool.name in rendered
+        assert tool.description in rendered
+    assert "Shell commands run with unrestricted environment access." in rendered
+
+
+def test_tools_info_handles_a_profile_with_no_tools(tmp_path: Path) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        interactive=False,
+        live=False,
+    )
+
+    ui.tools_info()
+
+    rendered = output.getvalue()
+    assert "Available tools (0)" in rendered
+    assert "None for this profile." in rendered
+    assert "unrestricted environment access" not in rendered
 
 
 @pytest.mark.parametrize("width", [20, 40, 80])

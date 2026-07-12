@@ -4,11 +4,12 @@ from pathlib import Path
 import pytest
 
 import ghostwheel.bootstrap as bootstrap_module
-from ghostwheel.app_info import AppInfo
+from ghostwheel.app_info import AppInfo, ToolInfo
 from ghostwheel.bootstrap import Runtime, build_runtime
 from ghostwheel.config import Settings
 from ghostwheel.review import ReviewService
 from ghostwheel.session import ChatSession
+from ghostwheel.tools import ToolCatalog
 
 
 def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> None:
@@ -24,8 +25,44 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
         assert runtime.app_info.provider == config.chat_model.provider.value
         assert runtime.app_info.model == config.chat_model.model
         assert runtime.app_info.tool_profile == config.tools.profile.value
+        assert runtime.app_info.tools == (
+            ToolInfo(
+                "read", "Read a UTF-8 text file as a compact, line-numbered page."
+            ),
+            ToolInfo("ls", "List a directory as compact, sorted text."),
+            ToolInfo(
+                "grep",
+                "Search UTF-8 text files with a bounded line-oriented regular expression.",
+            ),
+            ToolInfo("bash", "Run a shell command in the project working directory."),
+        )
         assert runtime.session.estimated_context_tokens > 256
         assert runtime.session.context_tokens_estimated is True
+    finally:
+        runtime.close()
+
+
+def test_build_runtime_reports_tools_from_the_active_custom_catalog(tmp_path) -> None:
+    def inspect_workspace(path: str) -> str:
+        """Inspect one workspace path.
+
+        Additional model-only guidance should not appear in the short description.
+        """
+
+        return path
+
+    config = Settings(
+        tool_profile="read-only",
+        review_tool_profile="read-only",
+        _env_file=None,
+    ).resolve()
+    catalog = ToolCatalog(read_only=(inspect_workspace,), shell=())
+
+    runtime = build_runtime(config, cwd=tmp_path, catalog=catalog)
+    try:
+        assert runtime.app_info.tools == (
+            ToolInfo("inspect_workspace", "Inspect one workspace path."),
+        )
     finally:
         runtime.close()
 
@@ -412,6 +449,8 @@ def test_build_runtime_closes_agents_created_before_composition_failure(
             self.exited += 1
 
     class FakeBlueprint:
+        tools: tuple[object, ...] = ()
+
         def __init__(self, agent: ManagedAgent) -> None:
             self.agent = agent
 

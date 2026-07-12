@@ -470,7 +470,7 @@ class TerminalUI:
             ("/retry", "repeat the previous chat or review"),
             ("/clear", "clear model conversation history"),
             ("/model", "show the active provider and model"),
-            ("/tools", "show the active tool profile"),
+            ("/tools", "list available tools and the active profile"),
             ("/quit", "exit Ghostwheel"),
         )
         body = Text()
@@ -502,8 +502,21 @@ class TerminalUI:
             Text("Tool profile  ", style="bold"),
             Text(self.app_info.tool_profile, style="yellow"),
         )
-        if self.app_info.tool_profile == "full":
-            body.append("\nShell commands run with unrestricted environment access.")
+        body.append(f"\n\nAvailable tools ({len(self.app_info.tools)})", style="bold")
+        if self.app_info.tools:
+            name_width = max(len(tool.name) for tool in self.app_info.tools)
+            for tool in self.app_info.tools:
+                body.append("\n")
+                body.append(f"{tool.name:<{name_width}}", style="bold cyan")
+                body.append("  ")
+                body.append(tool.description)
+        else:
+            body.append("\nNone for this profile.", style="dim")
+        if self.app_info.tool_profile in {"full", "shell-only"}:
+            body.append(
+                "\n\nShell commands run with unrestricted environment access.",
+                style="yellow",
+            )
         self.console.print(Panel(body, title="Tools", border_style="yellow"))
 
     def unknown_command(self, command: str, suggestion: str | None = None) -> None:
