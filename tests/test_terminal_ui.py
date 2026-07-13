@@ -32,8 +32,9 @@ import ghostwheel.terminal_io as terminal_io
 import ghostwheel.terminal_ui as terminal_ui_module
 from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
-from ghostwheel.review import ReviewFailed
-from ghostwheel.runtime_contracts import TurnSucceeded
+from ghostwheel.review import RawReview, ReviewFailed
+from ghostwheel.runtime_contracts import TurnFailed, TurnNoResult, TurnSucceeded
+from ghostwheel.terminal_composer import ComposerWarning
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
 
 
@@ -1793,6 +1794,83 @@ def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
     tool_output = lines[streamed_answer_line + 1 :]
     assert tool_output[0].lstrip().startswith("▸ read")
     assert all(line for line in tool_output)
+
+
+def test_all_dynamic_terminal_output_neutralizes_csi_and_osc(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    csi = "\x1b[2J"
+    osc = "\x1b]52;c;Y2xpcGJvYXJk\x1b\\"
+    surrogate_csi = "\udc9b2J"
+    surrogate_osc = "\udc9d52;c;c3Vycm9nYXRl\udc9c"
+    unsafe = f"before{csi}{osc}{surrogate_csi}{surrogate_osc}after"
+    app_info = AppInfo(
+        unsafe,
+        ModelInfo(unsafe, unsafe),
+        ModelInfo(unsafe, unsafe),
+        ToolSetInfo(unsafe, (ToolInfo(unsafe, unsafe),)),
+        ToolSetInfo(unsafe, (ToolInfo(unsafe, unsafe),)),
+    )
+    ui = make_ui(
+        workspace=tmp_path,
+        app_info=app_info,
+        output=output,
+        interactive=False,
+        live=False,
+    )
+
+    ui.welcome()
+    ui.model_info()
+    ui.tools_info()
+    ui.unknown_command(unsafe, unsafe)
+
+    ui.turn_started(unsafe)
+    asyncio.run(ui.handle_event(TextOutput(unsafe, starts_part=True)))
+    asyncio.run(ui.handle_event(ToolStarted(unsafe, repr({"path": unsafe}), "1")))
+    asyncio.run(ui.handle_event(ToolFailed(unsafe, unsafe, "1")))
+    ui.console.print(ui._active_renderable())
+    ui.turn_outcome(TurnSucceeded(unsafe, ()))
+
+    ui.turn_started()
+    ui.turn_outcome(TurnSucceeded(unsafe, ()))
+
+    ui.turn_started()
+    ui._turn_uses_live = True
+    ui.turn_outcome(TurnSucceeded(unsafe, ()))
+
+    ui.turn_started()
+    ui.turn_outcome(TurnNoResult(unsafe))
+
+    ui.turn_started()
+    ui.turn_outcome(TurnFailed(RuntimeError(unsafe)))
+
+    ui.turn_started()
+    ui.review_outcome(RawReview(unsafe, unsafe))
+
+    ui.turn_started()
+    ui.review_outcome(ReviewFailed(unsafe))
+
+    ui.console.print(
+        ui._composer_warning_text(
+            ComposerWarning(
+                code="test",
+                message=unsafe,
+                path=Path(unsafe),
+                detail=unsafe,
+            )
+        )
+    )
+
+    rendered = output.getvalue()
+    encoded = rendered.encode("utf-8", errors="surrogateescape")
+    assert "\x1b" not in rendered
+    assert "\x9b" not in rendered
+    assert "Y2xpcGJvYXJk" not in rendered
+    assert "c3Vycm9nYXRl" not in rendered
+    assert encoded.decode("utf-8") == rendered
+    assert b"\x1b" not in encoded
+    assert "beforeafter" in rendered
 
 
 def test_non_live_success_without_text_events_prints_literal_fallback(

@@ -36,6 +36,7 @@ from prompt_toolkit.filters import (
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import History
 from prompt_toolkit.input import Input
+from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
 from prompt_toolkit.input.defaults import create_input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -47,6 +48,14 @@ from prompt_toolkit.styles import Style
 from ghostwheel.controller import COMMANDS
 
 _XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
+_CSI_U_SHIFT_ENTER = "\x1b[13;2u"
+_SHIFT_ENTER_SEQUENCES = frozenset({_XTERM_SHIFT_ENTER, _CSI_U_SHIFT_ENTER})
+
+# prompt_toolkit 3.0.52 recognizes xterm's modifyOtherKeys encoding for
+# Shift+Enter but not the equivalent CSI-u/Kitty encoding. Teach its VT parser
+# to surface both as Control-M; ``KeyPress.data`` still preserves the original
+# sequence so the binding below can distinguish modified Enter from bare Enter.
+ANSI_SEQUENCES.setdefault(_CSI_U_SHIFT_ENTER, Keys.ControlM)
 
 
 def default_history_path() -> Path | None:
@@ -231,7 +240,7 @@ def _key_bindings() -> KeyBindings:
     @bindings.add(Keys.ControlM, filter=composer_focused, eager=True)
     def _submit_or_modified_shift_enter(event: KeyPressEvent) -> None:
         data = event.key_sequence[-1].data
-        if data == _XTERM_SHIFT_ENTER:
+        if data in _SHIFT_ENTER_SEQUENCES:
             event.current_buffer.insert_text("\n")
         else:
             event.current_buffer.validate_and_handle()

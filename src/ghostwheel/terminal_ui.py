@@ -53,7 +53,7 @@ from ghostwheel.presentation import (
     preview,
     primary_argument,
 )
-from ghostwheel.rendering import render_review
+from ghostwheel.rendering import render_review, sanitize_terminal_text
 from ghostwheel.review import RawReview, ReviewFailed, ReviewOutcome, StructuredReview
 from ghostwheel.runtime_contracts import (
     TurnFailed,
@@ -189,9 +189,10 @@ class TerminalUI:
                         end="",
                     )
                     self._stream_at_line_start = True
-                self.console.print(Text(event.content), end="", soft_wrap=True)
-                if event.content:
-                    self._stream_at_line_start = event.content.endswith("\n")
+                safe_content = sanitize_terminal_text(event.content)
+                self.console.print(Text(safe_content), end="", soft_wrap=True)
+                if safe_content:
+                    self._stream_at_line_start = safe_content.endswith("\n")
             elif isinstance(event, ToolStarted | ToolFinished | ToolFailed):
                 assert activity is not None
                 self._ensure_stream_line_start()
@@ -208,14 +209,17 @@ class TerminalUI:
         details.append("  ·  review ", style="dim")
         self._append_model(details, self.app_info.review_model)
         details.append("  ·  ")
-        details.append(self.app_info.workspace)
+        details.append(sanitize_terminal_text(self.app_info.workspace))
         for label, tool_set in (
             ("chat", self.app_info.chat_tools),
             ("review", self.app_info.review_tools),
         ):
             details.append(f"  ·  {label} ")
             tool_style = "bold yellow" if tool_set.has_shell_access else "green"
-            details.append(tool_set.profile.upper(), style=tool_style)
+            details.append(
+                sanitize_terminal_text(tool_set.profile.upper()),
+                style=tool_style,
+            )
             if tool_set.has_shell_access:
                 details.append(" (unrestricted shell)", style="yellow")
         self.console.print(heading)
@@ -301,7 +305,9 @@ class TerminalUI:
                 )
                 self._live.start(refresh=True)
             else:
-                self.console.print(Text(f"\n{label}", style="dim"))
+                self.console.print(
+                    Text(f"\n{sanitize_terminal_text(label)}", style="dim")
+                )
         except BaseException:
             self._reset_turn()
             raise
@@ -340,7 +346,9 @@ class TerminalUI:
 
     @staticmethod
     def _append_model(body: Text, model: ModelInfo) -> None:
-        body.append(f"{model.provider}/{model.model}", style="cyan")
+        provider = sanitize_terminal_text(model.provider)
+        model_name = sanitize_terminal_text(model.model)
+        body.append(f"{provider}/{model_name}", style="cyan")
 
     def tools_info(self) -> None:
         body = Text()
@@ -353,15 +361,22 @@ class TerminalUI:
     def _append_tool_set(body: Text, title: str, tool_set: ToolSetInfo) -> None:
         body.append(title, style="bold")
         body.append("\nTool profile  ", style="bold")
-        body.append(tool_set.profile, style="yellow")
+        body.append(sanitize_terminal_text(tool_set.profile), style="yellow")
         body.append(f"\nAvailable tools ({len(tool_set.tools)})", style="bold")
         if tool_set.tools:
-            name_width = max(len(tool.name) for tool in tool_set.tools)
-            for tool in tool_set.tools:
+            safe_tools = tuple(
+                (
+                    sanitize_terminal_text(tool.name),
+                    sanitize_terminal_text(tool.description),
+                )
+                for tool in tool_set.tools
+            )
+            name_width = max(len(name) for name, _description in safe_tools)
+            for name, description in safe_tools:
                 body.append("\n")
-                body.append(f"{tool.name:<{name_width}}", style="bold cyan")
+                body.append(f"{name:<{name_width}}", style="bold cyan")
                 body.append("  ")
-                body.append(tool.description)
+                body.append(description)
         else:
             body.append("\nNone for this profile.", style="dim")
         if tool_set.has_shell_access:
@@ -373,10 +388,13 @@ class TerminalUI:
     def unknown_command(self, command: str, suggestion: str | None = None) -> None:
         message = Text.assemble(
             Text("Unknown command: ", style="yellow"),
-            Text(command),
+            Text(sanitize_terminal_text(command)),
         )
         if suggestion:
-            message.append(f"\nDid you mean {suggestion}?", style="dim")
+            message.append(
+                f"\nDid you mean {sanitize_terminal_text(suggestion)}?",
+                style="dim",
+            )
         message.append("\nType /help to list commands.", style="dim")
         self.console.print(message)
 
@@ -411,15 +429,20 @@ class TerminalUI:
             if isinstance(outcome, TurnSucceeded):
                 if managed_live:
                     self.console.print(Text("\nGhostwheel", style="bold magenta"))
-                    self.console.print(Markdown(outcome.output))
+                    self.console.print(Markdown(sanitize_terminal_text(outcome.output)))
                 elif not self._turn.answer:
                     self.console.print(
                         Text("\nGhostwheel\n", style="bold magenta"),
                         end="",
                     )
-                    self.console.print(Text(outcome.output), soft_wrap=True)
+                    self.console.print(
+                        Text(sanitize_terminal_text(outcome.output)),
+                        soft_wrap=True,
+                    )
             elif isinstance(outcome, TurnNoResult):
-                self.console.print(Text(outcome.message, style="yellow"))
+                self.console.print(
+                    Text(sanitize_terminal_text(outcome.message), style="yellow")
+                )
             elif isinstance(outcome, TurnFailed):
                 self._render_turn_failure(outcome)
         finally:
@@ -442,14 +465,17 @@ class TerminalUI:
                 body = Text()
                 body.append("Couldn't produce a structured review.\n", style="yellow")
                 body.append("Reason: ", style="dim")
-                body.append(outcome.structured_failure, style="dim")
+                body.append(
+                    sanitize_terminal_text(outcome.structured_failure),
+                    style="dim",
+                )
                 body.append("\n\nShowing the raw review instead:\n\n", style="bold")
-                body.append(outcome.prose)
+                body.append(sanitize_terminal_text(outcome.prose))
                 self.console.print(
                     Panel(body, title="Structured Review Failed", border_style="yellow")
                 )
             elif isinstance(outcome, ReviewFailed):
-                body = Text(outcome.message)
+                body = Text(sanitize_terminal_text(outcome.message))
                 body.append(
                     "\n\nCheck the review model configuration, then use /retry.",
                     style="dim",
@@ -510,11 +536,14 @@ class TerminalUI:
 
     @staticmethod
     def _composer_warning_text(warning: ComposerWarning) -> Text:
-        body = Text(warning.message, style="yellow")
+        body = Text(sanitize_terminal_text(warning.message), style="yellow")
         if warning.path is not None:
-            body.append(f"\nPath: {warning.path}", style="dim")
+            body.append(
+                f"\nPath: {sanitize_terminal_text(str(warning.path))}",
+                style="dim",
+            )
         if warning.detail:
-            body.append(f"\n{warning.detail}", style="dim")
+            body.append(f"\n{sanitize_terminal_text(warning.detail)}", style="dim")
         body.append(
             "\nChoose a writable --history-file path or use --no-history.",
             style="dim",
@@ -523,16 +552,25 @@ class TerminalUI:
 
     def _render_turn_failure(self, outcome: TurnFailed) -> None:
         presentation = failure_presentation(outcome.kind)
-        body = Text(outcome.message)
-        body.append(f"\n\n{presentation.hint}", style="dim")
-        self.console.print(Panel(body, title=presentation.title, border_style="red"))
+        body = Text(sanitize_terminal_text(outcome.message))
+        body.append(
+            f"\n\n{sanitize_terminal_text(presentation.hint)}",
+            style="dim",
+        )
+        self.console.print(
+            Panel(
+                body,
+                title=sanitize_terminal_text(presentation.title),
+                border_style="red",
+            )
+        )
 
     def _active_renderable(self) -> Group:
         renderables: list[object] = [
             Spinner(
                 "dots",
                 Text(
-                    self._turn.status,
+                    sanitize_terminal_text(self._turn.status),
                     style="bold cyan",
                     no_wrap=True,
                     overflow="ellipsis",
@@ -546,7 +584,7 @@ class TerminalUI:
                 (
                     Text("Ghostwheel", style="bold magenta"),
                     Text(
-                        _live_answer_tail(self._turn.answer),
+                        _live_answer_tail(sanitize_terminal_text(self._turn.answer)),
                         no_wrap=True,
                         overflow="ellipsis",
                     ),
@@ -618,8 +656,8 @@ class TerminalUI:
             no_wrap=True,
             overflow="ellipsis",
         )
-        line.append(activity.name, style=f"bold {style}")
-        argument = primary_argument(activity.arguments)
+        line.append(sanitize_terminal_text(activity.name), style=f"bold {style}")
+        argument = sanitize_terminal_text(primary_argument(activity.arguments))
         if argument:
             line.append("  ")
             line.append(preview(argument, 72))
@@ -631,7 +669,8 @@ class TerminalUI:
             )
         if activity.status == "failed" and activity.detail:
             line.append("  ·  ", style="red")
-            line.append(preview(" ".join(activity.detail.split()), 100), style="red")
+            detail = sanitize_terminal_text(activity.detail)
+            line.append(preview(" ".join(detail.split()), 100), style="red")
         return line
 
     def _reset_turn(self, label: str = "Thinking…") -> None:

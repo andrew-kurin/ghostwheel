@@ -27,19 +27,23 @@ build-backend = "hatchling.build"
 exclude = ["/.logfire"]
 
 [tool.hatch.build.targets.sdist]
-only-include = [
-    ".env.example",
-    ".github",
-    ".gitignore",
-    ".python-version",
-    "AGENTS.md",
-    "ARCHITECTURE.md",
-    "README.md",
-    "pyproject.toml",
-    "src",
-    "tests",
-    "uv.lock",
+include = [
+    "/.env.example",
+    "/.github/workflows/*.yml",
+    "/.gitignore",
+    "/.python-version",
+    "/AGENTS.md",
+    "/ARCHITECTURE.md",
+    "/README.md",
+    "/pyproject.toml",
+    "/src/ghostwheel/**/*.py",
+    "/tests/**/*.py",
+    "/uv.lock",
 ]
+
+[tool.hatch.build.targets.wheel]
+include = ["/src/ghostwheel/**/*.py"]
+sources = ["src"]
 
 [tool.uv]
 package = true

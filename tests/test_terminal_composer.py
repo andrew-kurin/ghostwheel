@@ -68,22 +68,33 @@ async def _wait_until(predicate: Callable[[], bool]) -> None:
 
 
 @pytest.mark.parametrize(
-    "input_mode",
+    ("editing_mode", "input_mode"),
     [
-        InputMode.INSERT,
-        InputMode.NAVIGATION,
-        InputMode.REPLACE,
-        InputMode.INSERT_MULTIPLE,
+        (EditingMode.EMACS, None),
+        (EditingMode.VI, InputMode.INSERT),
+        (EditingMode.VI, InputMode.NAVIGATION),
+        (EditingMode.VI, InputMode.REPLACE),
+        (EditingMode.VI, InputMode.INSERT_MULTIPLE),
     ],
 )
-def test_shift_enter_inserts_newline_in_every_vim_mode(
-    input_mode: InputMode,
+@pytest.mark.parametrize(
+    "sequence",
+    [
+        "\x1b[27;2;13~",
+        "\x1b[13;2u",
+    ],
+    ids=["legacy-xterm", "csi-u"],
+)
+def test_shift_enter_inserts_newline_in_emacs_and_every_vim_mode(
+    editing_mode: EditingMode,
+    input_mode: InputMode | None,
+    sequence: str,
 ) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe_input:
             session: PromptSession[str] = PromptSession(
                 multiline=True,
-                editing_mode=EditingMode.VI,
+                editing_mode=editing_mode,
                 key_bindings=terminal_composer._key_bindings(),
                 input=pipe_input,
                 output=DummyOutput(),
@@ -91,9 +102,10 @@ def test_shift_enter_inserts_newline_in_every_vim_mode(
             prompt_task = asyncio.create_task(session.prompt_async())
             await _wait_until(lambda: session.app.is_running)
             session.default_buffer.insert_text("before")
-            session.app.vi_state.input_mode = input_mode
+            if input_mode is not None:
+                session.app.vi_state.input_mode = input_mode
 
-            pipe_input.send_text("\x1b[27;2;13~")
+            pipe_input.send_text(sequence)
             await _wait_until(lambda: "\n" in session.default_buffer.text)
 
             assert session.default_buffer.text == "before\n"
