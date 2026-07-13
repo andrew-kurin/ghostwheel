@@ -44,7 +44,8 @@ tool catalog ---- ToolDeps ---- Workspace / CommandRunner
   and Pydantic-AI construction. `agent.py` is a compatibility facade.
 - `model_config.py` and `tool_config.py` contain lightweight resolved values;
   `providers.py` and `tools/` contain implementation adapters.
-- `tools/workspace.py` is the sole owner of descriptor-safe filesystem access.
+- `tools/workspace.py` is the sole owner of descriptor-safe filesystem access,
+  including atomic workspace mutations.
 
 ## Dependency rules
 

@@ -40,6 +40,10 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
                 "grep",
                 "Search UTF-8 text files with a bounded line-oriented regular expression.",
             ),
+            ToolInfo(
+                "edit",
+                "Replace exact text in an existing UTF-8 workspace file.",
+            ),
             ToolInfo("bash", "Run a shell command in the project working directory."),
         )
         assert runtime.app_info.chat_tools.has_shell_access is True

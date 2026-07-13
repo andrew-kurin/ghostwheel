@@ -23,7 +23,14 @@ def test_turn_state_reduces_output_and_correlates_concurrent_tools() -> None:
     state.apply(TextOutput("continued"))
     state.apply(ToolStarted("read", "{'path': 'a'}", call_id="a"))
     state.apply(ToolStarted("read", "{'path': 'b'}", call_id="b"))
-    state.apply(ToolFinished("read", "first", call_id="a"))
+    state.apply(
+        ToolFinished(
+            "read",
+            "first",
+            call_id="a",
+            metadata={"summary": "1 replacement"},
+        )
+    )
     state.apply(ToolFailed("read", "second", call_id="b"))
 
     assert state.thinking == "reason continued"
@@ -33,6 +40,7 @@ def test_turn_state_reduces_output_and_correlates_concurrent_tools() -> None:
         ("b", "failed", "second"),
     ]
     assert state.tools[0].finished_at == 3.0
+    assert state.tools[0].metadata == {"summary": "1 replacement"}
     assert state.tools[1].finished_at == 4.0
     assert state.status == "read failed"
 
@@ -45,6 +53,7 @@ def test_turn_state_handles_completion_without_a_start_and_resets() -> None:
     assert activity is not None
     assert activity.arguments == ""
     assert activity.status == "succeeded"
+    assert activity.metadata is None
     assert state.tools == [activity]
 
     state.reset("Reviewing…")

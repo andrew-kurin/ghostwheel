@@ -1,6 +1,7 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, TypeVar
 
+from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import (
     ModelAPIError,
@@ -40,8 +41,10 @@ from ghostwheel.runtime_contracts import (
     TurnNoResult,
     TurnSucceeded,
 )
+from ghostwheel.tools.edit import EditCommittedDuringCancellation
 
 OutputT = TypeVar("OutputT")
+_TOOL_SUMMARY_MAX_CHARACTERS = 256
 
 
 class PydanticAgentRunner:
@@ -155,6 +158,7 @@ async def _handle_tool_event(event: Any, sink: EventSink | None) -> None:
                     result.tool_name,
                     str(result.content),
                     call_id=result.tool_call_id,
+                    metadata=_tool_result_metadata(result.metadata),
                 ),
             )
         elif isinstance(result, RetryPromptPart):
@@ -174,7 +178,29 @@ async def _emit(sink: EventSink | None, event: AgentEvent) -> None:
     await deliver_event(sink, event)
 
 
+def _tool_result_metadata(value: object) -> dict[str, object] | None:
+    """Extract the one bounded metadata field understood by presenters."""
+
+    try:
+        if isinstance(value, BaseModel):
+            summary = getattr(value, "summary", None)
+        elif isinstance(value, Mapping):
+            summary = value.get("summary")
+        else:
+            return None
+        if not isinstance(summary, str) or not summary:
+            return None
+        return {"summary": summary[:_TOOL_SUMMARY_MAX_CHARACTERS]}
+    except Exception:
+        # Tool metadata is optional presentation data. It must not turn an
+        # already-completed, potentially side-effecting tool call into a failed
+        # agent turn.
+        return None
+
+
 def _failure_kind(error: Exception) -> FailureKind:
+    if isinstance(error, EditCommittedDuringCancellation):
+        return FailureKind.TOOL
     if isinstance(error, ToolRetryError):
         return FailureKind.TOOL
     if isinstance(error, ModelHTTPError) and _is_structured_output_error(error):

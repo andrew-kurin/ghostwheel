@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from ghostwheel.tools.bash import bash
 from ghostwheel.tools.deps import ToolDeps
+from ghostwheel.tools.edit import EditResult
 from ghostwheel.tools.filesystem import DirectoryListing, ReadResult
 from ghostwheel.tools.search import GrepResult
 
@@ -28,6 +29,12 @@ def run_bash(ctx: SimpleNamespace, command: str):
 def listing_metadata(result: object) -> DirectoryListing:
     metadata = getattr(result, "metadata", None)
     assert isinstance(metadata, DirectoryListing)
+    return metadata
+
+
+def edit_metadata(result: object) -> EditResult:
+    metadata = getattr(result, "metadata", None)
+    assert isinstance(metadata, EditResult)
     return metadata
 
 

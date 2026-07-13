@@ -31,6 +31,7 @@ class ToolActivity:
     started_at: float
     status: ToolStatus = "running"
     detail: str = ""
+    metadata: dict[str, object] | None = None
     finished_at: float | None = None
 
 
@@ -81,6 +82,7 @@ class TurnState:
                 event.call_id,
                 "succeeded",
                 event.result,
+                event.metadata,
             )
             self.status = "Thinking…"
             return activity
@@ -102,6 +104,7 @@ class TurnState:
         call_id: str | None,
         status: ToolStatus,
         detail: str,
+        metadata: dict[str, object] | None = None,
     ) -> ToolActivity:
         activity = next(
             (
@@ -125,6 +128,7 @@ class TurnState:
             self.tools.append(activity)
         activity.status = status
         activity.detail = detail
+        activity.metadata = metadata
         activity.finished_at = self.clock()
         return activity
 
@@ -146,7 +150,7 @@ _FAILURE_PRESENTATIONS = {
     ),
     FailureKind.TOOL: FailurePresentation(
         "Tool Error",
-        "Inspect the tool output above, adjust the request, or use /retry.",
+        "Verify the workspace state and tool output, then adjust the request.",
     ),
     FailureKind.MODEL_OUTPUT: FailurePresentation(
         "Model Output Error",

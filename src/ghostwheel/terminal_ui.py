@@ -686,6 +686,17 @@ class TerminalUI:
         if argument:
             line.append("  ")
             line.append(preview(argument, 72))
+        summary = (
+            activity.metadata.get("summary")
+            if activity.status == "succeeded" and activity.metadata is not None
+            else None
+        )
+        if isinstance(summary, str) and summary:
+            line.append("  ·  ", style="dim")
+            line.append(
+                preview(sanitize_terminal_line(summary), 72),
+                style="dim",
+            )
         if activity.finished_at is not None:
             line.append("  ·  ", style="dim")
             line.append(

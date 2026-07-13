@@ -35,7 +35,12 @@ import ghostwheel.terminal_ui as terminal_ui_module
 from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.review import RawReview, ReviewFailed
-from ghostwheel.runtime_contracts import TurnFailed, TurnNoResult, TurnSucceeded
+from ghostwheel.runtime_contracts import (
+    FailureKind,
+    TurnFailed,
+    TurnNoResult,
+    TurnSucceeded,
+)
 from ghostwheel.terminal_composer import ComposerWarning
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
 
@@ -2363,6 +2368,60 @@ def test_non_live_tools_start_on_the_line_after_streamed_text_without_gaps(
     answer_line = lines.index("partial answer")
     assert lines[answer_line + 1].lstrip().startswith("▸ read")
     assert lines[answer_line + 2].lstrip().startswith("✓ read")
+
+
+def test_successful_edit_activity_shows_sanitized_summary(tmp_path: Path) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        width=120,
+        interactive=False,
+        live=False,
+    )
+
+    ui.turn_started()
+    asyncio.run(
+        ui.handle_event(ToolStarted("edit", "{'path': 'src/app.py'}", call_id="1"))
+    )
+    asyncio.run(
+        ui.handle_event(
+            ToolFinished(
+                "edit",
+                "edited",
+                call_id="1",
+                metadata={"summary": "1 replacement, +2 −1\nforged"},
+            )
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "✓ edit  src/app.py  ·  1 replacement, +2 −1 forged" in rendered
+    assert "\nforged" not in rendered
+
+
+def test_tool_failure_guidance_requires_workspace_verification(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        interactive=False,
+        live=False,
+    )
+
+    ui.turn_started()
+    ui.turn_outcome(
+        TurnFailed(
+            RuntimeError("Edit committed; inspect git diff and do not retry blindly."),
+            FailureKind.TOOL,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Verify the workspace state and tool output" in rendered
+    assert "/retry" not in rendered
 
 
 def test_line_oriented_help_and_compaction_reflect_available_controls(

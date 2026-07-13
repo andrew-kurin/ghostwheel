@@ -2,8 +2,11 @@ from pydantic_ai.models.test import TestModel
 
 import ghostwheel.agent_blueprint as blueprint_module
 from ghostwheel.agent_blueprint import AgentBlueprint
+from ghostwheel.agent_factory import chat_agent_blueprint
 from ghostwheel.config import Settings
+from ghostwheel.tools.catalog import DEFAULT_TOOL_CATALOG
 from ghostwheel.tools.deps import ToolDeps
+from ghostwheel.tools.edit import edit
 from ghostwheel.tools.filesystem import read
 
 
@@ -41,3 +44,15 @@ def test_blueprint_serialization_is_stable() -> None:
     assert blueprint.static_context_json() == (
         '{"instructions": "instructions", "tools": []}'
     )
+
+
+def test_default_edit_tool_keeps_sequential_execution_in_chat_blueprint() -> None:
+    config = Settings(_env_file=None).resolve()
+    prepared_edit = DEFAULT_TOOL_CATALOG.write[0]
+
+    blueprint = chat_agent_blueprint(config)
+    blueprint_edit = next(tool for tool in blueprint.tools if tool.name == "edit")
+
+    assert blueprint_edit is prepared_edit
+    assert blueprint_edit.function is edit
+    assert blueprint_edit.sequential is True

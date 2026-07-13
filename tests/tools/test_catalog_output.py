@@ -1,10 +1,12 @@
 from pathlib import Path
 
+from pydantic_ai import Tool
 import pytest
 
 from ghostwheel.tools.bash import bash
 from ghostwheel.tools.catalog import DEFAULT_TOOL_CATALOG, ToolProfile
 from ghostwheel.tools.deps import ToolLimits
+from ghostwheel.tools.edit import edit
 from ghostwheel.tools.filesystem import ls, read
 from ghostwheel.tools.output import OutputBudget, truncate_utf8
 from ghostwheel.tools.search import grep
@@ -38,9 +40,22 @@ def test_output_budget_normalizes_surrogateescaped_names() -> None:
 
 
 def test_tool_catalog_exposes_immutable_capability_profiles() -> None:
+    edit_tool = DEFAULT_TOOL_CATALOG.write[0]
+
     assert DEFAULT_TOOL_CATALOG.for_profile(ToolProfile.READ_ONLY) == (
         read,
         ls,
         grep,
+    )
+    assert DEFAULT_TOOL_CATALOG.for_profile(ToolProfile.SHELL_ONLY) == (bash,)
+    assert isinstance(edit_tool, Tool)
+    assert edit_tool.function is edit
+    assert edit_tool.sequential is True
+    assert DEFAULT_TOOL_CATALOG.for_profile(ToolProfile.FULL) == (
+        read,
+        ls,
+        grep,
+        edit_tool,
+        bash,
     )
     assert DEFAULT_TOOL_CATALOG.for_profile(ToolProfile.FULL)[-1] is bash

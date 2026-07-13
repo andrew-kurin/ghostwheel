@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 from pydantic_ai import Agent, Tool
 from pydantic_ai.settings import ModelSettings
@@ -16,6 +16,7 @@ from ghostwheel.providers import build_model
 DepsT = TypeVar("DepsT")
 OutputT = TypeVar("OutputT")
 ToolCallable = Callable[..., object]
+ToolDefinition: TypeAlias = Tool[Any] | ToolCallable
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +39,7 @@ class AgentBlueprint(Generic[DepsT, OutputT]):
         instructions: str,
         deps_type: type[DepsT],
         output_type: type[OutputT],
-        tools: Sequence[ToolCallable] = (),
+        tools: Sequence[ToolDefinition] = (),
         model_settings: ModelSettings | None = None,
         retries: int = 1,
     ) -> AgentBlueprint[DepsT, OutputT]:

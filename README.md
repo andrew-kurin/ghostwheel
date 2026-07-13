@@ -16,8 +16,8 @@ Configured model endpoints receive prompts and tool results, which can include
 source code, so use only endpoints you trust.
 
 Ghostwheel currently requires a POSIX environment (macOS or Linux), including
-`bash`, `openat`, and `O_NOFOLLOW`. It fails fast where the secure workspace
-adapter cannot provide those guarantees.
+`bash`, `openat`, `renameat`, and `O_NOFOLLOW`. It fails fast where the secure
+workspace adapter cannot provide those guarantees.
 
 ## Install
 
@@ -197,8 +197,8 @@ GHOSTWHEEL_COMPACTION_SUMMARY_TOKENS=2048
 Filesystem tools share one canonical workspace policy and output budget. They open
 paths relative to allowed-root descriptors and do not traverse symlinks. The
 `read-only` profile registers `read`, `ls`, and `grep`; `shell-only` registers
-unrestricted `bash`; and `full` registers all four. Chat and review profiles are
-configured independently.
+unrestricted `bash`; and `full` adds the workspace-scoped `edit` tool and registers
+all five. Chat and review profiles are configured independently.
 
 `read` returns UTF-8 text as compact `LINE:TEXT` rows, with at most
 `GHOSTWHEEL_MAX_READ_LINES` rows per page. Callers can request a smaller limit,
@@ -211,6 +211,21 @@ truncation marker. NUL-containing and invalid UTF-8 files are rejected instead
 of being returned as replacement-character noise when encountered. To keep
 random line jumps and pathological single lines bounded,
 `GHOSTWHEEL_MAX_READ_SCAN_BYTES` caps bytes inspected by each call.
+
+`edit` changes an existing UTF-8 file through an exact text replacement. It
+requires one unique match by default, so callers should read the target and
+include enough unchanged context to disambiguate it; `replace_all=true` must be
+explicit. The replacement may be empty, but the search text may not. The tool
+does not create files or follow symlinks. It stages the complete result beside
+the descriptor-opened target and atomically renames it into place after checking
+that the file did not change, preserving its owner, group, ordinary POSIX mode,
+ACLs, ordinary extended attributes, and consistent CRLF line endings. It rejects
+hard-linked files, setuid/setgid files, privileged or integrity-bearing Linux
+attributes, and semantic platform flags rather than silently changing their
+meaning. Source and result sizes are bounded by
+`GHOSTWHEEL_MAX_READ_SCAN_BYTES`. The terminal reports the path, replacement
+count, and compact line-change statistics without echoing the full diff; use
+`git diff` to inspect the complete change.
 
 `ls` returns JSON-escaped rows in sorted relative-path order, with `f`, `d`, `l`,
 and `o` markers for files, directories, symlinks, and other filesystem entries.

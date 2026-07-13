@@ -26,6 +26,7 @@ class ToolFinished:
     name: str
     result: str
     call_id: str | None = None
+    metadata: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)

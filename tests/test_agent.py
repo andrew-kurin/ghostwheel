@@ -2,6 +2,7 @@ import asyncio
 import importlib
 from pathlib import Path
 
+from pydantic import BaseModel, ConfigDict
 import pytest
 from pydantic_ai import Agent, Tool
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
@@ -19,14 +20,17 @@ from ghostwheel.event_dispatcher import EventDeliveryError, EventDispatcher
 from ghostwheel.events import TextOutput, ToolFailed, ToolFinished, ToolStarted
 from ghostwheel.pydantic_runner import (
     PydanticAgentRunner,
+    _TOOL_SUMMARY_MAX_CHARACTERS,
     _failure_kind,
     _handle_tool_event,
+    _tool_result_metadata,
 )
 from ghostwheel.schemas import ReviewResult
 from ghostwheel.session import FailureKind, TurnFailed, TurnNoResult, TurnSucceeded
 from ghostwheel.tools.bash import bash
 from ghostwheel.tools.command import CommandResult
 from ghostwheel.tools.deps import ToolDeps
+from ghostwheel.tools.edit import EditCommittedDuringCancellation, EditResult
 from ghostwheel.tools.filesystem import DirectoryListing, ReadResult, ls, read
 from ghostwheel.tools.search import GrepResult, grep
 
@@ -275,7 +279,12 @@ def test_runner_correlates_tool_events() -> None:
     asyncio.run(
         _handle_tool_event(
             FunctionToolResultEvent(
-                ToolReturnPart("read", "contents", tool_call_id=call_id)
+                ToolReturnPart(
+                    "read",
+                    "contents",
+                    tool_call_id=call_id,
+                    metadata={"summary": "1 replacement"},
+                )
             ),
             events.append,
         )
@@ -295,8 +304,72 @@ def test_runner_correlates_tool_events() -> None:
 
     assert events == [
         ToolStarted("read", "{'path': 'README.md'}", call_id=call_id),
-        ToolFinished("read", "contents", call_id=call_id),
+        ToolFinished(
+            "read",
+            "contents",
+            call_id=call_id,
+            metadata={"summary": "1 replacement"},
+        ),
         ToolFailed("read", "outside workspace", call_id=call_id),
+    ]
+
+
+def test_runner_converts_structured_tool_metadata_to_neutral_values() -> None:
+    metadata = EditResult(
+        path="value.py",
+        replacements=1,
+        bytes_before=10,
+        bytes_after=12,
+        added_lines=1,
+        removed_lines=1,
+        applied=True,
+        dry_run=False,
+        durable=True,
+        warning=None,
+        summary="1 replacement, +1 −1",
+    )
+
+    assert _tool_result_metadata(metadata) == {"summary": metadata.summary}
+
+
+def test_runner_bounds_summary_and_ignores_other_mapping_metadata() -> None:
+    summary = "x" * (_TOOL_SUMMARY_MAX_CHARACTERS + 10)
+
+    assert _tool_result_metadata({"summary": summary, "unrelated": object()}) == {
+        "summary": "x" * _TOOL_SUMMARY_MAX_CHARACTERS
+    }
+
+
+def test_unsupported_tool_metadata_cannot_fail_a_completed_tool_event() -> None:
+    class UnsupportedMetadata(BaseModel):
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        payload: object
+
+    events: list[object] = []
+    call_id = "side-effecting-call"
+
+    asyncio.run(
+        _handle_tool_event(
+            FunctionToolResultEvent(
+                ToolReturnPart(
+                    "custom_write",
+                    "completed",
+                    tool_call_id=call_id,
+                    metadata=UnsupportedMetadata(payload=object()),
+                )
+            ),
+            events.append,
+        )
+    )
+
+    assert events == [
+        ToolFinished(
+            "custom_write",
+            "completed",
+            call_id=call_id,
+            metadata=None,
+        )
     ]
 
 
@@ -450,6 +523,12 @@ def test_grep_sends_compact_text_and_retains_structured_metadata(
     assert properties["pattern"]["maxLength"] == 10_000
     assert properties["file_glob"]["maxLength"] == 4_096
     assert function_schema.return_schema == {"type": "string"}
+
+
+def test_runner_classifies_committed_cancelled_edit_as_tool_failure() -> None:
+    assert (
+        _failure_kind(EditCommittedDuringCancellation("value.py")) is FailureKind.TOOL
+    )
 
 
 def test_runner_only_classifies_structured_output_failures_for_fallback() -> None:
