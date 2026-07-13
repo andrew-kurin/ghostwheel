@@ -10,7 +10,9 @@ and path completion, editor key bindings, and construction of the inline
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import os
+import stat
 import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -120,18 +122,22 @@ class InputHistory:
                 f"\n# {dt.datetime.now().isoformat()}\n"
                 + "".join(f"+{line}\n" for line in value.split("\n"))
             ).encode("utf-8", errors="surrogateescape")
-            self._ensure_file()
-            with self.path.open("ab") as history_file:
+            descriptor = self._open_for_append()
+            with os.fdopen(descriptor, "ab") as history_file:
                 history_file.write(record)
         except (OSError, UnicodeError) as error:
             self._disable_persistence(error)
 
     def _load(self) -> list[str]:
-        if self.path is None or not self.path.exists():
+        if self.path is None:
+            return []
+        try:
+            descriptor = self._open_regular_file(os.O_RDONLY)
+        except FileNotFoundError:
             return []
         entries: list[str] = []
         lines: list[str] = []
-        with self.path.open("rb") as history_file:
+        with os.fdopen(descriptor, "rb") as history_file:
             for raw_line in history_file:
                 # History records use LF as their only structural separator.
                 # Decoding the whole file and calling str.splitlines() would
@@ -149,15 +155,53 @@ class InputHistory:
         return entries
 
     def _ensure_file(self) -> None:
+        descriptor = self._open_for_append()
+        os.close(descriptor)
+
+    def _open_for_append(self) -> int:
         assert self.path is not None
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = self._open_regular_file(
+            os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _open_regular_file(self, flags: int) -> int:
+        assert self.path is not None
+        try:
+            existing = self.path.lstat()
+        except FileNotFoundError:
+            if not flags & os.O_CREAT:
+                raise
+        else:
+            if not stat.S_ISREG(existing.st_mode):
+                raise self._non_regular_file_error()
+
         descriptor = os.open(
             self.path,
-            os.O_CREAT | os.O_APPEND | os.O_WRONLY,
+            flags | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
         )
-        os.close(descriptor)
-        self.path.chmod(0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise self._non_regular_file_error()
+        except OSError:
+            os.close(descriptor)
+            raise
+        return descriptor
+
+    def _non_regular_file_error(self) -> OSError:
+        assert self.path is not None
+        return OSError(
+            errno.EINVAL,
+            "prompt history path is not a regular file",
+            self.path,
+        )
 
     def _disable_persistence(
         self,

@@ -668,6 +668,7 @@ def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> 
             )
             try:
                 assert await feed_prompt(ui, pipe_input, "hello\r") == "hello"
+                assert ui._get_prompt_session().app.output is prompt_output
             finally:
                 ui.close()
         return terminal_bytes.getvalue()
@@ -680,6 +681,51 @@ def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> 
     assert "\x1b[3J" not in output
     for mode in (9, 47, 1047, 1049, 1000, 1002, 1003, 1006, 1015, 1016):
         assert f"\x1b[?{mode}h" not in output
+
+
+def test_prompt_defaults_to_the_rich_console_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    console_master, console_slave = os.openpty()
+    ambient_master, ambient_slave = os.openpty()
+    console_stream = os.fdopen(console_slave, "w", encoding="utf-8", buffering=1)
+    ambient_stream = os.fdopen(ambient_slave, "w", encoding="utf-8", buffering=1)
+    monkeypatch.setenv("PROMPT_TOOLKIT_NO_CPR", "1")
+
+    try:
+        with monkeypatch.context() as patch, create_pipe_input() as pipe_input:
+            patch.setattr(sys, "stdout", ambient_stream)
+            ui = TerminalUI(
+                Console(file=console_stream, color_system=None),
+                session=FakeSession(),
+                app_info=AppInfo(
+                    str(tmp_path),
+                    ModelInfo("provider", "model"),
+                    ModelInfo("provider", "model"),
+                    ToolSetInfo("read-only"),
+                    ToolSetInfo("read-only"),
+                ),
+                interactive=True,
+                prompt_input=pipe_input,
+                live=False,
+            )
+            try:
+                prompt_output = ui._get_prompt_session().app.output
+                assert isinstance(prompt_output, Vt100_Output)
+                assert prompt_output.stdout is console_stream
+                assert asyncio.run(feed_prompt(ui, pipe_input, "hello\r")) == "hello"
+            finally:
+                ui.close()
+
+        console_stream.flush()
+        assert b">" in read_until(console_master, b">")
+        assert select.select([ambient_master], [], [], 0.05)[0] == []
+    finally:
+        console_stream.close()
+        ambient_stream.close()
+        os.close(console_master)
+        os.close(ambient_master)
 
 
 def test_redirected_input_uses_the_same_ui_without_terminal_control(
@@ -931,7 +977,7 @@ def test_history_write_failure_keeps_prompt_history_in_memory_and_warns_once(
     async def scenario() -> None:
         history_path = tmp_path / "input-history"
         output = StringIO()
-        original_open = Path.open
+        original_open = os.open
         with create_pipe_input() as pipe_input:
             ui = make_ui(
                 workspace=tmp_path,
@@ -947,16 +993,15 @@ def test_history_write_failure_keeps_prompt_history_in_memory_and_warns_once(
                 await wait_for_prompt(ui, first_prompt)
 
                 def deny_history_append(
-                    path: Path,
-                    mode: str = "r",
-                    *args: object,
-                    **kwargs: object,
-                ) -> object:
-                    if path == history_path and "a" in mode:
+                    path: os.PathLike[str] | str,
+                    flags: int,
+                    mode: int = 0o777,
+                ) -> int:
+                    if Path(path) == history_path and flags & (os.O_WRONLY | os.O_RDWR):
                         raise PermissionError("write denied")
-                    return original_open(path, mode, *args, **kwargs)
+                    return original_open(path, flags, mode)
 
-                monkeypatch.setattr(Path, "open", deny_history_append)
+                monkeypatch.setattr(os, "open", deny_history_append)
                 pipe_input.send_text("first prompt\r")
                 assert await asyncio.wait_for(first_prompt, 1) == "first prompt"
 

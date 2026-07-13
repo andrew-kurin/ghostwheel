@@ -7,7 +7,9 @@ raw-mode restoration, active-turn key monitoring, and redirected line reads.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import os
+import select
 import signal
 import stat
 import termios
@@ -340,12 +342,59 @@ class ActiveTurnInputMonitor:
             )
             yield
         finally:
-            monitor_active = False
-            if flush_handle is not None:
-                flush_handle.cancel()
-            stack.close()
-            prompt_input.flush_keys()
-            get_typeahead(prompt_input)
+            try:
+                # The event-loop callback may not have run for bytes written
+                # immediately before the turn completed. Consume everything
+                # already readable before detaching so it cannot become the
+                # next prompt's typeahead.
+                while self._input_is_ready(prompt_input):
+                    handle_keys(prompt_input.read_keys())
+                    if prompt_input.closed:
+                        self.quit_requested = True
+                        request_cancellation()
+                        break
+            finally:
+                monitor_active = False
+                if flush_handle is not None:
+                    flush_handle.cancel()
+                stack.close()
+                self._discard_input_state(prompt_input)
+
+    @staticmethod
+    def _input_is_ready(prompt_input: Input) -> bool:
+        """Return whether a prompt-toolkit input has unread bytes now."""
+
+        try:
+            descriptor = prompt_input.fileno()
+            return bool(select.select([descriptor], [], [], 0)[0])
+        except AttributeError, NotImplementedError, OSError, TypeError, ValueError:
+            return False
+
+    @staticmethod
+    def _discard_input_state(prompt_input: Input) -> None:
+        """Discard both emitted keys and incomplete VT decoding state.
+
+        ``flush_keys`` only resolves a pending VT prefix. It does not clear a
+        bracketed paste or a partial multibyte character from a reusable
+        prompt-toolkit input. Those states otherwise become part of the next
+        prompt even though they were received during the active turn.
+        """
+
+        prompt_input.flush_keys()
+        get_typeahead(prompt_input)
+
+        parser = getattr(prompt_input, "vt100_parser", None)
+        reset_parser = getattr(parser, "reset", None)
+        if callable(reset_parser):
+            reset_parser()
+
+        # prompt-toolkit's POSIX Input has no public operation that resets the
+        # incremental decoder retained by its stdin reader.
+        stdin_reader = getattr(prompt_input, "stdin_reader", None)
+        decoder = getattr(stdin_reader, "_stdin_decoder", None)
+        reset_decoder = getattr(decoder, "reset", None)
+        if callable(reset_decoder):
+            reset_decoder()
 
 
 class RedirectedLineReader:
@@ -359,7 +408,8 @@ class RedirectedLineReader:
 
     def __init__(self, input_stream: TextIO) -> None:
         self._input_stream = input_stream
-        self._buffer = bytearray()
+        self._buffer = ""
+        self._decoder: codecs.IncrementalDecoder | None = None
         self._eof = False
         self._terminal_read_active = False
         self._terminal_guard = RawTerminalGuard(
@@ -394,26 +444,35 @@ class RedirectedLineReader:
                 on_line_cleared=on_terminal_line_cleared,
             )
 
-        while b"\n" not in self._buffer and not self._eof:
+        while "\n" not in self._buffer and not self._eof:
             chunk = await self._read_ready_chunk(descriptor)
             if chunk:
-                self._buffer.extend(chunk)
+                self._buffer += self._decode(chunk)
             else:
                 self._eof = True
+                self._buffer += self._decode(b"", final=True)
 
-        newline = self._buffer.find(b"\n")
+        newline = self._buffer.find("\n")
         if newline >= 0:
-            raw_value = bytes(self._buffer[: newline + 1])
-            del self._buffer[: newline + 1]
+            value = self._buffer[: newline + 1]
+            self._buffer = self._buffer[newline + 1 :]
         elif self._buffer:
-            raw_value = bytes(self._buffer)
-            self._buffer.clear()
+            value = self._buffer
+            self._buffer = ""
         else:
             raise EOFError
 
+        return value.rstrip("\r\n")
+
+    def _decode(self, value: bytes, *, final: bool = False) -> str:
+        """Incrementally decode redirected bytes before finding text lines."""
+
         encoding = getattr(self._input_stream, "encoding", None) or "utf-8"
         errors = getattr(self._input_stream, "errors", None) or "strict"
-        return raw_value.decode(encoding, errors).rstrip("\r\n")
+        if self._decoder is None:
+            decoder_type = codecs.getincrementaldecoder(encoding)
+            self._decoder = decoder_type(errors=errors)
+        return self._decoder.decode(value, final=final)
 
     async def _read_terminal_line(
         self,

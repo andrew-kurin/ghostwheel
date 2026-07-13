@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
+import subprocess
+import sys
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
@@ -266,19 +270,18 @@ def test_history_read_error_falls_back_to_memory_once(
 ) -> None:
     history_path = tmp_path / "input-history"
     history_path.touch()
-    original_open = Path.open
+    original_open = os.open
 
     def deny_history_read(
-        path: Path,
-        mode: str = "r",
-        *args: object,
-        **kwargs: object,
-    ) -> object:
-        if path == history_path and mode == "rb":
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        if Path(path) == history_path and not flags & (os.O_WRONLY | os.O_RDWR):
             raise PermissionError("read denied")
-        return original_open(path, mode, *args, **kwargs)
+        return original_open(path, flags, mode)
 
-    monkeypatch.setattr(Path, "open", deny_history_read)
+    monkeypatch.setattr(os, "open", deny_history_read)
     composer = _composer(history_path)
 
     history = composer.get_history()
@@ -291,6 +294,92 @@ def test_history_read_error_falls_back_to_memory_once(
     assert warning.path == history_path
     assert warning.detail == "read denied"
     assert composer.take_warning() is None
+
+
+def test_history_fifo_falls_back_without_blocking(tmp_path: Path) -> None:
+    history_path = tmp_path / "input-history"
+    os.mkfifo(history_path)
+    script = """
+from pathlib import Path
+from ghostwheel.terminal_composer import InputHistory
+
+errors = []
+history = InputHistory(Path(__import__('sys').argv[1]), on_error=lambda path, error: errors.append(error))
+assert history.path is None
+assert len(errors) == 1
+assert 'not a regular file' in str(errors[0])
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(history_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_history_symlink_does_not_modify_target(tmp_path: Path) -> None:
+    target = tmp_path / "unrelated"
+    target.write_text("original", encoding="utf-8")
+    target.chmod(0o644)
+    history_path = tmp_path / "input-history"
+    history_path.symlink_to(target)
+    errors: list[OSError | RuntimeError | UnicodeError] = []
+
+    history = terminal_composer.InputHistory(
+        history_path,
+        on_error=lambda path, error: errors.append(error),
+    )
+    history.append("kept only in memory")
+
+    assert history.path is None
+    assert history.entries == ["kept only in memory"]
+    assert len(errors) == 1
+    assert target.read_text(encoding="utf-8") == "original"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_history_append_rejects_symlink_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "input-history"
+    target = tmp_path / "unrelated"
+    target.write_text("original", encoding="utf-8")
+    target.chmod(0o644)
+    errors: list[OSError | RuntimeError | UnicodeError] = []
+    history = terminal_composer.InputHistory(
+        history_path,
+        on_error=lambda path, error: errors.append(error),
+    )
+    original_open = os.open
+    swapped = False
+
+    def swap_before_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+    ) -> int:
+        nonlocal swapped
+        if Path(path) == history_path and not swapped:
+            swapped = True
+            history_path.unlink()
+            history_path.symlink_to(target)
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+
+    history.append("kept only in memory")
+
+    assert swapped
+    assert history.path is None
+    assert history.entries == ["kept only in memory"]
+    assert len(errors) == 1
+    assert target.read_text(encoding="utf-8") == "original"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
 
 
 def test_history_round_trips_surrogateescaped_terminal_bytes(tmp_path: Path) -> None:

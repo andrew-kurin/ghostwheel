@@ -98,6 +98,7 @@ include = [
     "/tests/test_session.py",
     "/tests/test_telemetry.py",
     "/tests/test_terminal_composer.py",
+    "/tests/test_terminal_io.py",
     "/tests/test_terminal_ui.py",
     "/tests/test_token_counting.py",
     "/tests/tools/__init__.py",

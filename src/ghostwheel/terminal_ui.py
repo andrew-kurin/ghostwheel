@@ -20,6 +20,7 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.input import Input
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.output import Output
+from prompt_toolkit.output.defaults import create_output
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, Group
 from rich.live import Live
@@ -141,6 +142,16 @@ class TerminalUI:
             if interactive is None
             else interactive
         )
+        resolved_prompt_output = prompt_output
+        if (
+            resolved_prompt_output is None
+            and self.interactive
+            and (
+                prompt_input is not None
+                or (_isatty(self.input_stream) and console.is_terminal)
+            )
+        ):
+            resolved_prompt_output = create_output(stdout=console.file)
         self.live_enabled = (
             live
             and self.interactive
@@ -162,7 +173,7 @@ class TerminalUI:
             history_path=history_path,
             vim_mode=vim_mode,
             prompt_input=prompt_input,
-            prompt_output=prompt_output,
+            prompt_output=resolved_prompt_output,
             bottom_toolbar=self._bottom_toolbar,
             rprompt=self._rprompt,
         )
