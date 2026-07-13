@@ -27,3 +27,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run pytest -q
+      - name: Build release artifacts
+        run: uv build --out-dir dist
+      - name: Smoke test built wheel
+        run: uv run --isolated --no-project --with ./dist/ghostwheel-*.whl ghostwheel --help

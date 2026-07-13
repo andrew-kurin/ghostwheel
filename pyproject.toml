@@ -26,6 +26,21 @@ build-backend = "hatchling.build"
 [tool.hatch.build]
 exclude = ["/.logfire"]
 
+[tool.hatch.build.targets.sdist]
+only-include = [
+    ".env.example",
+    ".github",
+    ".gitignore",
+    ".python-version",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "README.md",
+    "pyproject.toml",
+    "src",
+    "tests",
+    "uv.lock",
+]
+
 [tool.uv]
 package = true
 

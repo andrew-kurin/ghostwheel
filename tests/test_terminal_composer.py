@@ -218,6 +218,35 @@ def test_history_create_error_falls_back_to_memory_once(
     assert composer.take_warning() is None
 
 
+def test_history_expanduser_error_falls_back_to_memory_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history_path = Path("~/input-history")
+
+    def fail_expansion(path: Path) -> Path:
+        assert path == history_path
+        raise RuntimeError("home directory unavailable")
+
+    monkeypatch.setattr(Path, "expanduser", fail_expansion)
+    composer = _composer(history_path)
+
+    history = composer.get_history()
+
+    assert history.store.path is None
+    assert history.store.entries == []
+    warning = composer.take_warning()
+    assert warning is not None
+    assert warning.code == "history_unavailable"
+    assert warning.path == history_path
+    assert warning.detail == "home directory unavailable"
+    assert composer.take_warning() is None
+
+    history.store.append("kept for this session")
+
+    assert history.store.entries == ["kept for this session"]
+    assert composer.take_warning() is None
+
+
 def test_history_read_error_falls_back_to_memory_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

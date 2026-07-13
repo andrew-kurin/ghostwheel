@@ -83,16 +83,17 @@ class InputHistory:
         self,
         path: Path | None,
         *,
-        on_error: Callable[[Path, OSError], None] | None = None,
+        on_error: Callable[[Path, OSError | RuntimeError], None] | None = None,
     ) -> None:
-        self.path = path.expanduser() if path is not None else None
+        self.path = path
         self._on_error = on_error
         self.entries: list[str] = []
         try:
+            self.path = path.expanduser() if path is not None else None
             self.entries = self._load()
             if self.path is not None:
                 self._ensure_file()
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             self._disable_persistence(error)
 
     def append(self, value: str) -> None:
@@ -139,7 +140,7 @@ class InputHistory:
         os.close(descriptor)
         self.path.chmod(0o600)
 
-    def _disable_persistence(self, error: OSError) -> None:
+    def _disable_persistence(self, error: OSError | RuntimeError) -> None:
         path = self.path
         if path is None:
             return
@@ -351,7 +352,11 @@ class TerminalComposer:
         self._warning = None
         return warning
 
-    def _record_history_error(self, path: Path, error: OSError) -> None:
+    def _record_history_error(
+        self,
+        path: Path,
+        error: OSError | RuntimeError,
+    ) -> None:
         if self._warning is not None:
             return
         self._warning = ComposerWarning(
