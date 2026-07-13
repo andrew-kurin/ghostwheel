@@ -164,6 +164,8 @@ def start_fallback_tty_reader(
     *,
     controlling: bool = True,
     no_flush: bool = False,
+    render_prompt: bool = False,
+    verify_sigint_handler: bool = False,
     line_delimiter_slot: str | None = None,
     line_delimiter: bytes = b";",
 ) -> tuple[subprocess.Popen[bytes], int, int]:
@@ -179,6 +181,7 @@ def start_fallback_tty_reader(
         import asyncio
         import fcntl
         import os
+        import signal
         import sys
         import termios
         from io import StringIO
@@ -195,8 +198,9 @@ def start_fallback_tty_reader(
             attributes = termios.tcgetattr(sys.stdin.fileno())
             attributes[3] |= termios.NOFLSH
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attributes)
+        console_output = sys.stdout if {render_prompt!r} else StringIO()
         ui = TerminalUI(
-            Console(file=StringIO()),
+            Console(file=console_output, color_system=None),
             session=object(),
             app_info=AppInfo(
                 {str(tmp_path)!r},
@@ -211,7 +215,11 @@ def start_fallback_tty_reader(
         )
 
         async def main():
-            asyncio.get_running_loop().call_later(
+            loop = asyncio.get_running_loop()
+            sigint_received = asyncio.Event()
+            if {verify_sigint_handler!r}:
+                loop.add_signal_handler(signal.SIGINT, sigint_received.set)
+            loop.call_later(
                 0.05,
                 lambda: os.write(1, b"READY\\n"),
             )
@@ -221,6 +229,10 @@ def start_fallback_tty_reader(
                 os.write(1, b"EOF\\n")
             else:
                 os.write(1, f"VALUE:{{value!r}}\\n".encode())
+                if {verify_sigint_handler!r}:
+                    os.kill(os.getpid(), signal.SIGINT)
+                    await asyncio.wait_for(sigint_received.wait(), 1)
+                    os.write(1, b"SIGINT-PRESERVED\\n")
             finally:
                 ui.close()
 
@@ -656,8 +668,10 @@ def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> 
 def test_redirected_input_uses_the_same_ui_without_terminal_control(
     tmp_path: Path,
 ) -> None:
+    output = StringIO()
     ui = make_ui(
         workspace=tmp_path,
+        output=output,
         interactive=False,
         input_stream=StringIO("first\nsecond\n"),
         live=True,
@@ -671,6 +685,97 @@ def test_redirected_input_uses_the_same_ui_without_terminal_control(
 
     asyncio.run(scenario())
     assert ui.live_enabled is False
+    assert output.getvalue() == ""
+
+
+def test_fallback_prompt_requires_tty_input_and_output(tmp_path: Path) -> None:
+    input_master, input_slave = os.openpty()
+    input_stream = os.fdopen(os.dup(input_slave), "r", encoding="utf-8")
+    redirected_output = StringIO()
+    tty_input_ui = make_ui(
+        workspace=tmp_path,
+        output=redirected_output,
+        interactive=False,
+        input_stream=input_stream,
+        live=False,
+    )
+
+    async def read_tty_input() -> None:
+        task = asyncio.create_task(tty_input_ui.read())
+        await asyncio.sleep(0)
+        os.write(input_master, b"from tty\n")
+        assert await asyncio.wait_for(task, 1) == "from tty"
+
+    try:
+        asyncio.run(read_tty_input())
+        assert redirected_output.getvalue() == ""
+    finally:
+        tty_input_ui.close()
+        input_stream.close()
+        os.close(input_master)
+        os.close(input_slave)
+
+    output_master, output_slave = os.openpty()
+    output_stream = os.fdopen(os.dup(output_slave), "w", encoding="utf-8")
+    non_tty_input_ui = TerminalUI(
+        Console(file=output_stream, color_system=None),
+        session=FakeSession(),
+        app_info=AppInfo(
+            str(tmp_path),
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
+        interactive=False,
+        input_stream=StringIO("from stream\n"),
+        live=False,
+    )
+    try:
+        assert asyncio.run(non_tty_input_ui.read()) == "from stream"
+        assert select.select([output_master], [], [], 0.05)[0] == []
+    finally:
+        non_tty_input_ui.close()
+        output_stream.close()
+        os.close(output_master)
+        os.close(output_slave)
+
+
+@pytest.mark.parametrize(
+    "term",
+    ["", "   ", "dumb", "DUMB", "unknown", "UnKnOwN"],
+)
+def test_terminal_ui_auto_detection_rejects_unsupported_terminals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    term: str,
+) -> None:
+    class TTYStringIO(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    monkeypatch.setenv("TERM", term)
+    input_stream = TTYStringIO()
+    console = Console(file=TTYStringIO(), color_system=None)
+    ui = TerminalUI(
+        console,
+        session=FakeSession(),
+        app_info=AppInfo(
+            str(tmp_path),
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
+        input_stream=input_stream,
+        live=False,
+    )
+
+    try:
+        assert ui.interactive is False
+        assert not ui._use_prompt_toolkit()
+    finally:
+        ui.close()
 
 
 def test_redirected_pipe_input_is_async_and_preserves_buffered_lines(
@@ -1360,6 +1465,55 @@ def test_fallback_tty_accepts_configured_canonical_line_delimiters(
         os.write(master, b"custom delimiter;")
         output = read_until(master, b"VALUE:'custom delimiter'")
         assert b"VALUE:'custom delimiter;'" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_fallback_tty_renders_prompt_and_redraws_after_ctrl_c(
+    tmp_path: Path,
+) -> None:
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        render_prompt=True,
+    )
+
+    try:
+        initial_output = read_until(master, b"READY")
+        assert b"\r\n> " in initial_output
+
+        os.write(master, b"discard this")
+        os.write(master, b"\x03")
+        redrawn_output = read_until(master, b"\r\n> ")
+        assert redrawn_output.endswith(b"\r\n> ")
+
+        os.write(master, b"keep this\n")
+        output = read_until(master, b"VALUE:'keep this'")
+        assert b"VALUE:'discard this" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_fallback_tty_preserves_event_loop_sigint_handler(tmp_path: Path) -> None:
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        verify_sigint_handler=True,
+    )
+
+    try:
+        read_until(master, b"READY")
+        os.write(master, b"complete read\n")
+        output = read_until(master, b"SIGINT-PRESERVED")
+        assert b"VALUE:'complete read'" in output
         assert process.wait(timeout=2) == 0
     finally:
         if process.poll() is None:

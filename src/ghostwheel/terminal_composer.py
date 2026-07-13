@@ -49,11 +49,20 @@ from ghostwheel.controller import COMMANDS
 _XTERM_SHIFT_ENTER = "\x1b[27;2;13~"
 
 
-def default_history_path() -> Path:
-    """Return the private per-user prompt history location."""
+def default_history_path() -> Path | None:
+    """Return a safe absolute prompt-history path, if one is available."""
 
     state_home = os.environ.get("XDG_STATE_HOME")
-    base = Path(state_home).expanduser() if state_home else Path.home() / ".local/state"
+    configured_base = Path(state_home) if state_home else None
+    if configured_base is not None and configured_base.is_absolute():
+        return configured_base / "ghostwheel" / "input-history"
+
+    try:
+        base = Path.home() / ".local/state"
+    except RuntimeError:
+        return None
+    if not base.is_absolute():
+        return None
     return base / "ghostwheel" / "input-history"
 
 

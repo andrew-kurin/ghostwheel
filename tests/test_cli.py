@@ -283,8 +283,18 @@ def test_cli_has_one_automatic_terminal_interface(
             return self.terminal
 
     assert _supports_prompt_toolkit(Stream(True), Stream(True), term="xterm") is True
+    assert _supports_prompt_toolkit(Stream(True), Stream(True), term="XTERM-256COLOR")
     assert _supports_prompt_toolkit(Stream(True), Stream(False), term="xterm") is False
-    assert _supports_prompt_toolkit(Stream(True), Stream(True), term="dumb") is False
+
+    for unsupported_term in ("", "   ", "dumb", "DUMB", "unknown", "UnKnOwN"):
+        assert (
+            _supports_prompt_toolkit(
+                Stream(True),
+                Stream(True),
+                term=unsupported_term,
+            )
+            is False
+        )
 
 
 def test_main_reports_resolution_errors_as_invalid_configuration(

@@ -31,6 +31,13 @@ _TERMINAL_GUARDED_SIGNALS = (
 )
 
 
+def supports_prompt_toolkit(term: str | None = None) -> bool:
+    """Return whether TERM identifies a capable interactive terminal."""
+
+    terminal_name = os.environ.get("TERM", "") if term is None else term
+    return terminal_name.strip().casefold() not in {"", "dumb", "unknown"}
+
+
 class Cancellation(Protocol):
     """Minimal cancellation behavior required by active-turn monitoring."""
 
@@ -355,7 +362,18 @@ class RedirectedLineReader:
             flush_input_on_restore=False,
         )
 
-    async def read(self) -> str:
+    async def read(
+        self,
+        *,
+        on_terminal_line_cleared: Callable[[], None] | None = None,
+    ) -> str:
+        """Read one line, optionally redrawing a cooked-terminal prompt.
+
+        ``on_terminal_line_cleared`` is used only for physical terminals after
+        their interrupt character has cleared the kernel's canonical buffer.
+        Redirected streams never invoke it.
+        """
+
         try:
             descriptor = self._input_stream.fileno()
             descriptor_mode = os.fstat(descriptor).st_mode
@@ -364,7 +382,10 @@ class RedirectedLineReader:
         if stat.S_ISREG(descriptor_mode):
             return self._read_synchronously()
         if os.isatty(descriptor):
-            return await self._read_terminal_line(descriptor)
+            return await self._read_terminal_line(
+                descriptor,
+                on_line_cleared=on_terminal_line_cleared,
+            )
 
         while b"\n" not in self._buffer and not self._eof:
             chunk = await self._read_ready_chunk(descriptor)
@@ -387,7 +408,12 @@ class RedirectedLineReader:
         errors = getattr(self._input_stream, "errors", None) or "strict"
         return raw_value.decode(encoding, errors).rstrip("\r\n")
 
-    async def _read_terminal_line(self, descriptor: int) -> str:
+    async def _read_terminal_line(
+        self,
+        descriptor: int,
+        *,
+        on_line_cleared: Callable[[], None] | None,
+    ) -> str:
         self._terminal_read_active = True
         try:
             if not self._terminal_guard.clear_local_flags(termios.NOFLSH):
@@ -397,6 +423,8 @@ class RedirectedLineReader:
                 try:
                     raw_value = await self._read_terminal_chunk(descriptor)
                 except _TerminalLineCleared:
+                    if on_line_cleared is not None:
+                        on_line_cleared()
                     continue
 
                 # In canonical mode a read which does not end in a line delimiter
@@ -452,13 +480,15 @@ class RedirectedLineReader:
         loop = asyncio.get_running_loop()
         readable: asyncio.Future[bytes] = loop.create_future()
 
-        def clear_pending_line(_signum: int, _frame: FrameType | None) -> None:
+        def clear_pending_line() -> None:
             if not readable.done():
                 readable.set_exception(_TerminalLineCleared())
 
-        previous_sigint = signal.getsignal(signal.SIGINT)
+        def wake_reader(_signum: int, _frame: FrameType | None) -> None:
+            loop.call_soon_threadsafe(clear_pending_line)
+
         try:
-            signal.signal(signal.SIGINT, clear_pending_line)
+            previous_sigint = signal.signal(signal.SIGINT, wake_reader)
         except (OSError, RuntimeError, ValueError) as error:
             raise RuntimeError(
                 "fallback terminal input must run on the main thread"

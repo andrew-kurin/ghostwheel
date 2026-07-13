@@ -71,6 +71,7 @@ from ghostwheel.terminal_io import (
     ActiveTurnInputMonitor,
     RawTerminalGuard,
     RedirectedLineReader,
+    supports_prompt_toolkit,
 )
 
 __all__ = ["TerminalUI", "default_history_path"]
@@ -125,7 +126,12 @@ class TerminalUI:
         self.app_info = app_info
         self.vim_mode = vim_mode
         self.input_stream = sys.stdin if input_stream is None else input_stream
-        terminal_ready = _isatty(self.input_stream) and console.is_terminal
+        terminal_ready = (
+            _isatty(self.input_stream)
+            and console.is_terminal
+            and not console.is_dumb_terminal
+            and supports_prompt_toolkit()
+        )
         self.interactive = (
             prompt_input is not None or terminal_ready
             if interactive is None
@@ -253,7 +259,12 @@ class TerminalUI:
         self._terminal_guard.restore()
 
         if not self._use_prompt_toolkit():
-            return await self._redirected_reader.read()
+            if not self._fallback_prompt_is_visible():
+                return await self._redirected_reader.read()
+            self._render_fallback_prompt()
+            return await self._redirected_reader.read(
+                on_terminal_line_cleared=self._render_fallback_prompt,
+            )
 
         prompt_session = self._composer.get_session(self.input_stream)
         self._render_composer_warning()
@@ -654,6 +665,16 @@ class TerminalUI:
         return _isatty(self.input_stream) and (
             self.console.is_terminal or self._composer.prompt_output is not None
         )
+
+    def _fallback_prompt_is_visible(self) -> bool:
+        """Return whether cooked input and Rich output share terminal UX."""
+
+        return _isatty(self.input_stream) and _isatty(self.console.file)
+
+    def _render_fallback_prompt(self) -> None:
+        """Print a native-scrollback prompt for the cooked TTY reader."""
+
+        self.console.print(Text("\n> ", style="bold cyan"), end="")
 
     def _turn_input_timeout(self, prompt_input: Input) -> float:
         """Use the composer's VT-prefix timeout when it owns this input."""

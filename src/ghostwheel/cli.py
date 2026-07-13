@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError, version
@@ -12,6 +11,7 @@ from typing import TYPE_CHECKING, TextIO
 from rich.console import Console
 
 from ghostwheel.event_dispatcher import EventDispatcher
+from ghostwheel.terminal_io import supports_prompt_toolkit
 from ghostwheel.terminal_ui import TerminalUI, default_history_path
 
 if TYPE_CHECKING:
@@ -75,8 +75,7 @@ def _supports_prompt_toolkit(
     *,
     term: str | None = None,
 ) -> bool:
-    terminal_name = os.environ.get("TERM", "") if term is None else term
-    return _isatty(stdin) and _isatty(stdout) and terminal_name.lower() != "dumb"
+    return _isatty(stdin) and _isatty(stdout) and supports_prompt_toolkit(term)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

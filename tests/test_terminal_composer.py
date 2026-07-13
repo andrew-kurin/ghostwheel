@@ -15,6 +15,50 @@ from prompt_toolkit.output import DummyOutput
 import ghostwheel.terminal_composer as terminal_composer
 
 
+@pytest.mark.parametrize(
+    "state_home",
+    [None, "", "relative-state", "~/.state"],
+)
+def test_default_history_path_ignores_missing_or_relative_xdg_state_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    state_home: str | None,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    if state_home is None:
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", state_home)
+
+    assert terminal_composer.default_history_path() == (
+        home / ".local/state/ghostwheel/input-history"
+    )
+
+
+def test_default_history_path_accepts_absolute_xdg_state_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    state_home = "/var/tmp/ghostwheel-state"
+    monkeypatch.setenv("XDG_STATE_HOME", state_home)
+
+    assert terminal_composer.default_history_path() == (
+        Path(state_home) / "ghostwheel/input-history"
+    )
+
+
+def test_default_history_path_disables_persistence_without_absolute_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", "relative-home")
+
+    assert terminal_composer.default_history_path() is None
+
+
 async def _wait_until(predicate: Callable[[], bool]) -> None:
     for _attempt in range(100):
         if predicate():
