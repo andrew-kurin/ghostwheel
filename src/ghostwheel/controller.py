@@ -72,6 +72,26 @@ class SessionPort(Protocol):
     def clear(self) -> None: ...
 
 
+class ContextStatusPort(Protocol):
+    """Session context metrics consumed by terminal status renderers."""
+
+    @property
+    def estimated_context_tokens(self) -> int: ...
+
+    @property
+    def context_window_tokens(self) -> int: ...
+
+    @property
+    def context_tokens_estimated(self) -> bool: ...
+
+    @property
+    def compaction_enabled(self) -> bool: ...
+
+
+class TerminalSessionPort(SessionPort, ContextStatusPort, Protocol):
+    """Complete session capability required by the terminal adapter."""
+
+
 class ReviewPort(Protocol):
     async def review(
         self,
@@ -121,6 +141,8 @@ ResultT = TypeVar("ResultT")
 
 
 class CancellationPort(Protocol):
+    def cancel(self) -> bool: ...
+
     async def run(self, awaitable: Awaitable[ResultT]) -> object: ...
 
 

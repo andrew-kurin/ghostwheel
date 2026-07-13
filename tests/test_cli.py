@@ -1,38 +1,22 @@
 import asyncio
-import os
-import signal
-from io import StringIO
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from rich.console import Console
 
-from ghostwheel.cli import (
-    _interactive_mode,
-    build_parser,
-    main,
-    run_cli,
-)
-from ghostwheel.controller import (
-    CommandKind,
-    parse_command,
-)
-from ghostwheel.events import (
-    TextOutput,
-    ToolFailed,
-    ToolFinished,
-)
+from ghostwheel.cancellation import TurnCancellation
+from ghostwheel.cli import _supports_prompt_toolkit, build_parser, main
+from ghostwheel.controller import CommandKind, parse_command, run_command_loop
+from ghostwheel.event_dispatcher import EventDispatcher
 from ghostwheel.review import ReviewFailed
-from ghostwheel.rich_ui import RichPresenter
-from ghostwheel.session import CompactionStats, TurnNoResult, TurnSucceeded
+from ghostwheel.session import CompactionStats, TurnNoResult
 
 
-class FakeConsole:
+class FakeInput:
     def __init__(self, inputs: list[str]) -> None:
         self.inputs = iter(inputs)
 
-    def input(self, _prompt: str) -> str:
+    async def read(self) -> str:
         return next(self.inputs)
 
 
@@ -111,6 +95,23 @@ class FakePresenter:
         self.calls.append(("review", outcome))
 
 
+async def run_commands(
+    inputs: list[str],
+    session: FakeSession,
+    reviews: FakeReviews,
+    presenter: FakePresenter,
+    *,
+    cancellation: TurnCancellation | None = None,
+) -> None:
+    await run_command_loop(
+        session,
+        reviews,
+        presenter=presenter,
+        input_reader=FakeInput(inputs),
+        cancellation=cancellation or TurnCancellation(),
+    )
+
+
 def test_parse_command_requires_boundaries_and_keeps_slashes_local() -> None:
     assert parse_command(" /review src ").kind is CommandKind.REVIEW
     assert parse_command("/review\nsrc").value == "src"
@@ -127,17 +128,17 @@ def test_parse_command_requires_boundaries_and_keeps_slashes_local() -> None:
     assert parse_command("   ").kind is CommandKind.EMPTY
 
 
-def test_cli_routes_commands_without_adding_review_to_chat_history() -> None:
+def test_command_loop_routes_review_without_adding_it_to_chat_history() -> None:
     session = FakeSession()
     reviews = FakeReviews()
     presenter = FakePresenter()
 
     asyncio.run(
-        run_cli(
-            FakeConsole(["/review src", "hello", "/clear", "/quit"]),  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            reviews,  # type: ignore[arg-type]
-            presenter=presenter,  # type: ignore[arg-type]
+        run_commands(
+            ["/review src", "hello", "/clear", "/quit"],
+            session,
+            reviews,
+            presenter,
         )
     )
 
@@ -161,42 +162,34 @@ def test_local_commands_do_not_reach_the_model_and_retry_repeats_chat() -> None:
     presenter = FakePresenter()
 
     asyncio.run(
-        run_cli(
-            FakeConsole(
-                [
-                    "/help",
-                    "/model",
-                    "/tools",
-                    "/retrz",
-                    "/retry",
-                    "hello",
-                    "/retry",
-                    "/clear",
-                    "/retry",
-                    "/quit",
-                ]
-            ),  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            reviews,  # type: ignore[arg-type]
-            presenter=presenter,  # type: ignore[arg-type]
+        run_commands(
+            [
+                "/help",
+                "/model",
+                "/tools",
+                "/retrz",
+                "/retry",
+                "hello",
+                "/retry",
+                "/clear",
+                "/retry",
+                "/quit",
+            ],
+            session,
+            reviews,
+            presenter,
         )
     )
 
     assert session.sent == ["hello", "hello"]
     assert reviews.calls == []
     call_names = [name for name, _value in presenter.calls]
-    assert call_names[:5] == [
-        "welcome",
-        "help",
-        "model",
-        "tools",
-        "unknown",
-    ]
+    assert call_names[:5] == ["welcome", "help", "model", "tools", "unknown"]
     assert call_names.count("retry-unavailable") == 2
     assert ("unknown", ("/retrz", "/retry")) in presenter.calls
 
 
-def test_cli_reports_compaction_token_reduction() -> None:
+def test_command_loop_reports_compaction_token_reduction() -> None:
     class CompactingSession(FakeSession):
         async def send(self, prompt: str) -> TurnNoResult:
             self.sent.append(prompt)
@@ -212,18 +205,18 @@ def test_cli_reports_compaction_token_reduction() -> None:
     presenter = FakePresenter()
 
     asyncio.run(
-        run_cli(
-            FakeConsole(["hello", "/quit"]),  # type: ignore[arg-type]
-            session,  # type: ignore[arg-type]
-            FakeReviews(),  # type: ignore[arg-type]
-            presenter=presenter,  # type: ignore[arg-type]
+        run_commands(
+            ["hello", "/quit"],
+            session,
+            FakeReviews(),
+            presenter,
         )
     )
 
     assert ("compacted", (12_000, 4_200)) in presenter.calls
 
 
-def test_sigint_cancels_repeated_turns_and_keeps_the_prompt_alive() -> None:
+def test_programmatic_cancellation_keeps_the_loop_alive_across_turns() -> None:
     class BlockingSession(FakeSession):
         def __init__(self) -> None:
             super().__init__()
@@ -242,19 +235,21 @@ def test_sigint_cancels_repeated_turns_and_keeps_the_prompt_alive() -> None:
     async def scenario() -> tuple[BlockingSession, FakePresenter]:
         session = BlockingSession()
         presenter = FakePresenter()
-        cli_task = asyncio.create_task(
-            run_cli(
-                FakeConsole(["one", "two", "/quit"]),  # type: ignore[arg-type]
-                session,  # type: ignore[arg-type]
-                FakeReviews(),  # type: ignore[arg-type]
-                presenter=presenter,  # type: ignore[arg-type]
+        cancellation = TurnCancellation()
+        loop_task = asyncio.create_task(
+            run_commands(
+                ["one", "two", "/quit"],
+                session,
+                FakeReviews(),
+                presenter,
+                cancellation=cancellation,
             )
         )
         assert await asyncio.wait_for(session.started.get(), 1) == "one"
-        os.kill(os.getpid(), signal.SIGINT)
+        assert cancellation.cancel() is True
         assert await asyncio.wait_for(session.started.get(), 1) == "two"
-        os.kill(os.getpid(), signal.SIGINT)
-        await asyncio.wait_for(cli_task, 1)
+        assert cancellation.cancel() is True
+        await asyncio.wait_for(loop_task, 1)
         return session, presenter
 
     session, presenter = asyncio.run(scenario())
@@ -264,18 +259,21 @@ def test_sigint_cancels_repeated_turns_and_keeps_the_prompt_alive() -> None:
     assert presenter.calls[-1] == ("goodbye", None)
 
 
-def test_cli_help_and_terminal_mode_detection(
+def test_cli_has_one_automatic_terminal_interface(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(SystemExit) as help_exit:
         build_parser().parse_args(["--help"])
     assert help_exit.value.code == 0
     help_output = capsys.readouterr().out
-    assert "--ui" in help_output
+    assert "--ui" not in help_output
     assert "--vim" in help_output
     assert build_parser().parse_args([]).vim is True
     assert build_parser().parse_args(["--vim"]).vim is True
     assert build_parser().parse_args(["--no-vim"]).vim is False
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--ui", "plain"])
 
     class Stream:
         def __init__(self, terminal: bool) -> None:
@@ -284,12 +282,40 @@ def test_cli_help_and_terminal_mode_detection(
         def isatty(self) -> bool:
             return self.terminal
 
-    assert _interactive_mode("auto", Stream(True), Stream(True), term="xterm") is True
-    assert _interactive_mode("auto", Stream(True), Stream(False), term="xterm") is False
-    assert _interactive_mode("auto", Stream(True), Stream(True), term="dumb") is False
-    assert _interactive_mode("plain", Stream(True), Stream(True)) is False
-    with pytest.raises(ValueError, match="requires terminal"):
-        _interactive_mode("interactive", Stream(False), Stream(True))
+    assert _supports_prompt_toolkit(Stream(True), Stream(True), term="xterm") is True
+    assert _supports_prompt_toolkit(Stream(True), Stream(True), term="XTERM-256COLOR")
+    assert _supports_prompt_toolkit(Stream(True), Stream(False), term="xterm") is False
+
+    for unsupported_term in ("", "   ", "dumb", "DUMB", "unknown", "UnKnOwN"):
+        assert (
+            _supports_prompt_toolkit(
+                Stream(True),
+                Stream(True),
+                term=unsupported_term,
+            )
+            is False
+        )
+
+
+def test_main_reports_resolution_errors_as_invalid_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import ghostwheel.config as config_module
+
+    class InvalidSettings:
+        def resolve(self) -> object:
+            raise ValueError("Unknown model provider: invalid")
+
+    monkeypatch.setattr(config_module, "Settings", InvalidSettings)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--no-history"])
+
+    assert exit_info.value.code == 2
+    error_output = capsys.readouterr().err
+    assert "ghostwheel: error: Unknown model provider: invalid" in error_output
+    assert "Traceback" not in error_output
 
 
 def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
@@ -317,7 +343,7 @@ def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
         rejected_coroutine = coroutine
         raise RuntimeError("event loop unavailable")
 
-    monkeypatch.setattr(cli_module, "_interactive_mode", lambda *_args: False)
+    monkeypatch.setattr(cli_module, "_supports_prompt_toolkit", lambda *_args: False)
     monkeypatch.setattr(config_module, "Settings", FakeSettings)
     monkeypatch.setattr(
         telemetry_module,
@@ -328,7 +354,7 @@ def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
     monkeypatch.setattr(cli_module.asyncio, "run", reject_coroutine)
 
     with pytest.raises(RuntimeError, match="event loop unavailable"):
-        main(["--ui", "plain", "--no-history"])
+        main(["--no-history"])
 
     assert runtime_built is False
     assert rejected_coroutine is not None
@@ -339,7 +365,7 @@ def test_main_does_not_build_runtime_before_asyncio_run_accepts_coroutine(
     ("extra_args", "expected"),
     [([], True), (["--vim"], True), (["--no-vim"], False)],
 )
-def test_main_passes_vim_mode_to_the_interactive_app(
+def test_main_constructs_the_single_terminal_ui(
     monkeypatch: pytest.MonkeyPatch,
     extra_args: list[str],
     expected: bool,
@@ -348,7 +374,6 @@ def test_main_passes_vim_mode_to_the_interactive_app(
     import ghostwheel.cli as cli_module
     import ghostwheel.config as config_module
     import ghostwheel.telemetry as telemetry_module
-    import ghostwheel.textual_ui as textual_module
 
     captured: dict[str, object] = {}
 
@@ -365,115 +390,47 @@ def test_main_passes_vim_mode_to_the_interactive_app(
             captured["closed"] = True
 
     runtime = FakeRuntime()
-    config = SimpleNamespace(
-        observability=object(),
-        history=SimpleNamespace(
-            context_window_tokens=16_384,
-            compaction=SimpleNamespace(
-                enabled=True,
-                reserve_tokens=4_096,
-                keep_recent_tokens=4_096,
-                summary_tokens=2_048,
-            ),
-        ),
-    )
+    config = SimpleNamespace(observability=object())
 
     class FakeSettings:
         def resolve(self) -> object:
             return config
 
-    class FakeTextualApp:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            captured["runtime_args"] = args
+    class FakeTerminalUI:
+        def __init__(self, console: object, **kwargs: object) -> None:
+            captured["console"] = console
             captured.update(kwargs)
-            self.presenter = SimpleNamespace(handle_event=lambda _event: None)
 
-        async def run_async(self, **kwargs: object) -> None:
+        async def handle_event(self, _event: object) -> None:
+            return None
+
+        async def run(self, reviews: object) -> None:
+            captured["reviews"] = reviews
             captured["ran"] = True
-            captured["run_kwargs"] = kwargs
 
-    monkeypatch.setattr(cli_module, "_interactive_mode", lambda *_args: True)
+    def build_fake_runtime(*_args: object, **kwargs: object) -> FakeRuntime:
+        captured["event_sink"] = kwargs["event_sink"]
+        return runtime
+
+    monkeypatch.setattr(cli_module, "_supports_prompt_toolkit", lambda *_args: True)
+    monkeypatch.setattr(cli_module, "TerminalUI", FakeTerminalUI)
     monkeypatch.setattr(config_module, "Settings", FakeSettings)
     monkeypatch.setattr(
-        telemetry_module, "configure_observability", lambda _value: None
+        telemetry_module,
+        "configure_observability",
+        lambda _value: None,
     )
-    monkeypatch.setattr(bootstrap_module, "build_runtime", lambda *_a, **_k: runtime)
-    monkeypatch.setattr(textual_module, "GhostwheelApp", FakeTextualApp)
+    monkeypatch.setattr(bootstrap_module, "build_runtime", build_fake_runtime)
 
-    main(["--ui", "interactive", "--no-history", *extra_args])
+    main(["--no-history", *extra_args])
 
-    assert captured["vim_mode"] is expected
-    assert captured["runtime_args"] == (runtime.session, runtime.reviews)
+    assert captured["session"] is runtime.session
     assert captured["app_info"] is runtime.app_info
+    assert captured["reviews"] is runtime.reviews
+    assert captured["history_path"] is None
+    assert captured["vim_mode"] is expected
+    assert captured["interactive"] is True
+    assert isinstance(captured["event_sink"], EventDispatcher)
     assert captured["ran"] is True
-    assert captured["run_kwargs"] == {"mouse": True}
     assert captured["started"] is True
     assert captured["closed"] is True
-
-
-def test_rich_presenter_treats_model_and_tool_content_as_plain_text() -> None:
-    output = StringIO()
-    presenter = RichPresenter(
-        Console(file=output, color_system=None, force_terminal=False, width=120)
-    )
-
-    asyncio.run(presenter.handle_event(TextOutput("[/] [bold]literal[/bold]")))
-    asyncio.run(presenter.handle_event(ToolFinished("read", "[/]")))
-    asyncio.run(presenter.handle_event(ToolFailed("grep", "[bad]")))
-
-    rendered = output.getvalue()
-    assert "[/] [bold]literal[/bold]" in rendered
-    assert "← read: [/]" in rendered
-    assert "← grep failed: [bad]" in rendered
-
-
-def test_rich_presenter_renders_completed_interactive_output_as_markdown() -> None:
-    output = StringIO()
-    presenter = RichPresenter(
-        Console(file=output, color_system=None, force_terminal=True, width=80),
-        live=True,
-    )
-
-    presenter.turn_started()
-    presenter.turn_outcome(
-        TurnSucceeded(
-            output="# Heading\n\n**strong** and [bold]literal[/bold]",
-            new_messages=(),
-        )
-    )
-
-    rendered = output.getvalue()
-    assert "Heading" in rendered
-    assert "strong" in rendered
-    assert "[bold]literal[/bold]" in rendered
-
-
-def test_rich_presenter_shows_compaction_token_reduction() -> None:
-    output = StringIO()
-    presenter = RichPresenter(
-        Console(file=output, color_system=None, force_terminal=False, width=80)
-    )
-
-    presenter.history_compacted(12_000, 4_200)
-
-    assert "Context compacted: 12k → ~4.2k." in output.getvalue()
-
-
-def test_help_is_the_only_place_that_lists_shortcuts() -> None:
-    output = StringIO()
-    presenter = RichPresenter(
-        Console(file=output, color_system=None, force_terminal=False, width=80)
-    )
-
-    presenter.help()
-
-    rendered = output.getvalue()
-    assert "Shortcuts" in rendered
-    assert "Shift+Enter" in rendered
-    assert "Alt+Enter" not in rendered
-    assert "Ctrl+J" not in rendered
-    assert "Ctrl+C" in rendered
-    assert "Ctrl+O" in rendered
-    assert "/thinking" not in rendered
-    assert "/verbose" not in rendered
-    assert "Enter sends" not in rendered

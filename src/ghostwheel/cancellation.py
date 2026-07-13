@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import signal
 from collections.abc import Awaitable
 from typing import TypeVar
 
@@ -24,7 +23,7 @@ ResultT = TypeVar("ResultT")
 
 
 class TurnCancellation:
-    """Own cancellation and optional SIGINT handling for one active turn.
+    """Own programmatic cancellation for one active turn.
 
     A controller is reusable across turns, but only one call to :meth:`run` may
     be active at a time.  Cancelling the controller returns ``CANCELLED`` from
@@ -32,8 +31,7 @@ class TurnCancellation:
     ``asyncio.CancelledError`` to its caller.
     """
 
-    def __init__(self, *, handle_sigint: bool = False) -> None:
-        self._handle_sigint = handle_sigint
+    def __init__(self) -> None:
         self._task: asyncio.Future[object] | None = None
 
     @property
@@ -59,19 +57,6 @@ class TurnCancellation:
 
         task = asyncio.ensure_future(awaitable)
         self._task = task
-        loop = asyncio.get_running_loop()
-        previous_sigint: signal.Handlers | None = None
-        handler_installed = False
-
-        if self._handle_sigint:
-            previous_sigint = signal.getsignal(signal.SIGINT)
-            try:
-                loop.add_signal_handler(signal.SIGINT, self.cancel)
-                handler_installed = True
-            except NotImplementedError, RuntimeError, ValueError:
-                # Signal handlers are only available on supported loops in the
-                # main thread. Programmatic cancellation remains available.
-                pass
 
         try:
             try:
@@ -84,7 +69,4 @@ class TurnCancellation:
                     raise
                 return CANCELLED
         finally:
-            if handler_installed:
-                loop.remove_signal_handler(signal.SIGINT)
-                signal.signal(signal.SIGINT, previous_sigint)
             self._task = None

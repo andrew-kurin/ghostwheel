@@ -2,8 +2,46 @@ from io import StringIO
 
 from rich.console import Console
 
-from ghostwheel.rendering import render_review
+from ghostwheel.rendering import (
+    render_review,
+    sanitize_terminal_line,
+    sanitize_terminal_text,
+)
 from ghostwheel.schemas import Finding, ReviewResult, Severity
+
+
+def test_sanitize_terminal_text_removes_csi_osc_and_other_controls() -> None:
+    value = (
+        "alpha\tbeta\r\n\x00\x1b[2Jgamma\x1b]52;c;Y2xpcGJvYXJk\x1b\\delta\x9b31mepsilon"
+    )
+
+    assert sanitize_terminal_text(value) == "alpha\tbeta\ngammadeltaepsilon"
+
+
+def test_sanitize_terminal_text_blocks_surrogateescaped_c1_bytes() -> None:
+    value = "alpha\udc9b2Jbeta\udc9d52;c;Y2xpcGJvYXJk\udc9cgamma\udc80delta"
+
+    safe_value = sanitize_terminal_text(value)
+    encoded = safe_value.encode("utf-8", errors="surrogateescape")
+
+    assert safe_value == "alphabetagammadelta"
+    assert b"\x1b" not in encoded
+    assert not any(0x80 <= byte <= 0x9F for byte in encoded)
+
+
+def test_sanitize_terminal_text_replaces_surrogates_that_reach_output() -> None:
+    value = "alpha\ud800high\udc00low\udcffomega"
+
+    safe_value = sanitize_terminal_text(value)
+
+    assert safe_value == "alpha�high�low�omega"
+    assert safe_value.encode("utf-8").decode("utf-8") == safe_value
+
+
+def test_sanitize_terminal_line_collapses_all_layout_whitespace() -> None:
+    value = "  read\n\t✓ forged\u2028row\u2029end\x1b[2J  "
+
+    assert sanitize_terminal_line(value) == "read ✓ forged row end"
 
 
 def test_render_review_preserves_line_ranges_and_literal_content() -> None:
@@ -30,6 +68,38 @@ def test_render_review_preserves_line_ranges_and_literal_content() -> None:
     assert "src/app.py:3-5" in rendered
     assert "Contains [literal] markup." in rendered
     assert "A [tag] is literal." in rendered
+
+
+def test_render_review_neutralizes_controls_in_every_model_field() -> None:
+    csi = "\x1b[2J"
+    osc = "\x1b]52;c;Y2xpcGJvYXJk\x1b\\"
+    review = ReviewResult(
+        summary=f"summary{csi} remains",
+        findings=[
+            Finding(
+                file=f"src/{osc}app.py",
+                line=7,
+                severity=Severity.WARNING,
+                category=f"sec{csi}urity",
+                message=f"message{osc} remains",
+                suggestion=f"suggestion{csi} remains",
+            )
+        ],
+    )
+    output = StringIO()
+    console = Console(file=output, color_system=None, force_terminal=False, width=120)
+
+    render_review(review, console)
+
+    rendered = output.getvalue()
+    assert csi not in rendered
+    assert osc not in rendered
+    assert "Y2xpcGJvYXJk" not in rendered
+    assert "summary remains" in rendered
+    assert "src/app.py:7" in rendered
+    assert "security" in rendered
+    assert "message remains" in rendered
+    assert "suggestion remains" in rendered
 
 
 def test_render_review_uses_stacked_findings_on_narrow_terminals() -> None:

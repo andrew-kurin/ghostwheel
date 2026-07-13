@@ -40,43 +40,35 @@ uv sync
 uv run ghostwheel
 ```
 
-With the default `--ui auto`, Ghostwheel uses a persistent full-screen chat
-interface when stdin and stdout are terminals and `TERM` is not `dumb`. It falls
-back to a plain streaming interface for pipes, redirects, and dumb terminals.
-Use `--ui interactive` to require terminal input and output or `--ui plain` to
-force plain mode. Run `uv run ghostwheel --help` for all command-line options.
+Ghostwheel runs inline in the terminal's primary screen buffer. Completed turns
+remain in native scrollback, and the terminal emulator owns text selection,
+copy/paste, search, wheel scrolling, and its scrollbar. When stdout is
+redirected, Ghostwheel writes a line-oriented stream without terminal control
+sequences. Redirecting stdin alone also switches input to a line-oriented
+stream, but output can retain terminal styling when stdout is still a terminal.
+Run `uv run ghostwheel --help` for all command-line options.
 
-Interactive input supports command and review-path completion. In Insert or
-standard editing mode, ↑/↓ moves through multiline input and recalls prompt
-history when the cursor reaches the first or last line. Shift+Enter inserts a
-newline. The composer grows upward for multiline or wrapped prompts and returns
-to its compact height after submission. Interactive input history is stored in
+The interactive prompt-toolkit composer supports multiline editing, command and
+review-path completion, and prompt history. Enter submits and Shift+Enter
+inserts a newline when the terminal sends either xterm's legacy
+modifyOtherKeys sequence (`\x1b[27;2;13~`) or the CSI-u/Kitty sequence
+(`\x1b[13;2u`). Terminals that send ordinary Enter for this shortcut need to
+map Shift+Enter to one of those sequences. Ctrl+J has no action.
+
+When the interactive composer is active, prompt history is stored in
 `$XDG_STATE_HOME/ghostwheel/input-history` (or
 `~/.local/state/ghostwheel/input-history`); use `--no-history` to keep it only in
-memory or `--history-file PATH` to choose another location. History contains
-prompts in plain text, so disable it when prompts may contain secrets. These
-options do not affect plain mode. Model conversation history and rolling
-summaries are memory-only and disappear when Ghostwheel exits.
+memory or `--history-file PATH` to choose another location. These history
+options do not apply to line-oriented input. History contains prompts in plain
+text, so disable it when prompts may contain secrets. If the history file
+cannot be read or written, Ghostwheel warns once and continues with in-memory
+history. Model conversation history and rolling summaries are memory-only and
+disappear when Ghostwheel exits.
 
-Vim-style prompt editing is enabled by default. It starts each prompt in Insert
-mode; Escape switches to Normal mode, and `i`, `a`, `I`, `A`, `o`, or `O` return
-to Insert mode. The compact `I` or `N` following the right-aligned context usage
-shows the current mode. Run `/help` for the available motions and editing
-commands, or use `--no-vim` to restore the standard prompt editor.
-
-The interactive UI supports mouse-wheel transcript scrolling and dragging or
-clicking its scrollbar. Drag outside the scrollbar to select text; Textual keeps
-the scrollbar out of selection hit-testing. Copy selected text with `Cmd+C` on
-macOS, `Ctrl+C`, or a right-click. A right-click without selected text is left
-alone. With no selection, `Ctrl+C` retains its normal cancel/quit behavior.
-
-Ghostty 1.2 and newer forwards its default `Cmd+C` binding to terminal apps
-when there is no native terminal selection. If you override that binding, keep
-the same behavior so Ghostwheel can copy its app-managed selection:
-
-```ini
-keybind = performable:super+c=copy_to_clipboard:mixed
-```
+Vim-style prompt editing is enabled by default through prompt-toolkit. Each
+prompt starts in Insert mode; Escape switches to Normal mode, and the
+ruled status line at the bottom shows context usage and the current `I`, `N`, or
+`R` editing mode. Use `--no-vim` for Emacs-style editing.
 
 In the chat prompt:
 
@@ -84,16 +76,16 @@ In the chat prompt:
 - Use `/review path/to/file.py` to run a focused code review.
 - Use `/clear` to reset conversation history.
 - Use `/retry` to repeat the previous chat or review.
-- Use `/model`, `/tools`, or `/help` for runtime information.
+- Use `/model` for both active models, `/tools` for tool profiles, or `/help`.
 - Use `/quit` to exit.
 
-During an active turn, Ctrl+C cancels that turn and returns to the composer;
-while idle, Ctrl+C exits. Ctrl+Q exits directly. At the composer, Ctrl+O toggles
-expanded thinking traces and tool-call results, including details from existing
-turns in the visible transcript. Detail widgets are collapsed by default and
-are removed from the layout again when collapsed. Assistant replies render as
-Markdown in interactive mode; tool calls remain visible as compact status rows
-with completion time. Review findings switch to stacked cards on narrow
+In the composer, Ctrl+C clears the current prompt and Ctrl+D exits
+unconditionally. During an active turn, Esc cancels and returns to the composer,
+while Ctrl+D cancels and exits. All other input, including Ctrl+C, is discarded
+so it cannot corrupt the live preview or leak into the next prompt.
+Active turns use a bounded live preview; completed assistant replies are
+committed to scrollback as Markdown. Tool calls remain visible as compact status
+rows with completion time, and review findings switch to stacked cards on narrow
 terminals.
 
 ## Configuration
@@ -272,9 +264,11 @@ with `~`. This proxy can differ from the model server's tokenizer, and its first
 use may need network access to populate tiktoken's encoding cache. When a
 successful chat response includes provider usage, Ghostwheel uses it to calibrate
 otherwise invisible system-instruction, tool-schema, chat-template, and tokenizer
-overhead. That calibrated overhead remains visible after `/clear`. The composer
-status shows `USED/WINDOW`; `~` marks an estimate and `· off` means automatic
-compaction is disabled. The 4,096-token default reserve leaves response capacity;
+overhead. That calibrated overhead remains visible after `/clear`. The prompt's
+bottom status shows `USED/WINDOW`; `~` marks an estimate and `· off` means
+automatic compaction is disabled. The value can decrease when `~` disappears:
+that means a provider measurement replaced the conservative tokenizer proxy.
+The 4,096-token default reserve leaves response capacity;
 the 4,096-token recent target and 2,048-token summary cap leave working room in
 the default 16K window. Oversized summarizer inputs are processed as bounded
 rolling chunks. Review transcripts do not enter chat history. Set

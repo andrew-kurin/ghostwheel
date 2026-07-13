@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import weakref
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import Any
 
 from pydantic_ai import Agent
 
@@ -23,10 +22,10 @@ from ghostwheel.agent_factory import (
     review_fallback_agent_blueprint,
 )
 from ghostwheel.agent_blueprint import AgentBlueprint
-from ghostwheel.app_info import AppInfo
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
 from ghostwheel.compaction import HistoryCompactor
 from ghostwheel.config import AppConfig
-from ghostwheel.event_dispatcher import EventDispatcher, EventSink, deliver_event
+from ghostwheel.event_dispatcher import EventSink, deliver_event
 from ghostwheel.events import TextOutput
 from ghostwheel.history import HistoryPolicy
 from ghostwheel.pydantic_runner import PydanticAgentRunner
@@ -35,17 +34,6 @@ from ghostwheel.session import ChatSession
 from ghostwheel.tools import DEFAULT_TOOL_CATALOG, ToolCatalog
 from ghostwheel.tools.deps import ToolDeps
 from ghostwheel.token_counting import TextTokenCounter, TiktokenTokenCounter
-
-if TYPE_CHECKING:
-    from rich.console import Console as _ConsoleType
-
-    from ghostwheel.rich_ui import RichPresenter as _RichPresenterType
-else:
-    # Keep the composition root free of a runtime dependency on either terminal
-    # adapter while leaving its public annotations resolvable through
-    # ``typing.get_type_hints``.
-    _ConsoleType = Any
-    _RichPresenterType = Any
 
 PROVIDER_FRAMING_TOKENS = 256
 
@@ -58,7 +46,7 @@ class _RuntimeState(Enum):
     CLOSED = auto()
 
 
-@dataclass(slots=True, weakref_slot=True)
+@dataclass(slots=True)
 class Runtime:
     """Own application services and every external resource they use."""
 
@@ -197,29 +185,6 @@ class Runtime:
         else:
             transition.set_exception(error)
 
-    def _close_unentered_synchronously(self) -> bool:
-        """Claim and close a new runtime on the synchronous helper loop."""
-
-        with self._state_lock:
-            if self._state is _RuntimeState.CLOSED:
-                return True
-            if self._state is not _RuntimeState.NEW:
-                return False
-            self._state = _RuntimeState.CLOSING
-            self._transition = ConcurrentFuture()
-
-        _run_cleanup(self._start_claimed_close, suppress_errors=False)
-        return True
-
-    async def _start_claimed_close(self) -> None:
-        transition = self._transition
-        assert transition is not None
-        self._cleanup_task = asyncio.create_task(
-            self._close_owned(None),
-            name="ghostwheel-runtime-cleanup",
-        )
-        await _await_close_completion(transition)
-
     def close(self) -> None:
         """Close from synchronous code; async callers must use ``aclose``."""
 
@@ -292,12 +257,6 @@ async def _await_close_completion(transition: ConcurrentFuture[None]) -> None:
         raise cleanup_error
 
 
-_APPLICATION_RUNTIMES: weakref.WeakKeyDictionary[
-    ChatSession,
-    weakref.ReferenceType[Runtime],
-] = weakref.WeakKeyDictionary()
-
-
 async def _enter_agents(
     agents: tuple[Agent[Any, Any], ...],
 ) -> AsyncExitStack:
@@ -323,9 +282,9 @@ def _run_cleanup(
 ) -> None:
     """Finish async cleanup before returning to a synchronous caller.
 
-    Synchronous compatibility and failure paths cannot await when called from an
-    active event loop. Unentered resources have no loop ownership, so a short-lived
-    helper loop can close them before returning.
+    Synchronous close and failure paths cannot await when called from an active
+    event loop. Unentered resources have no loop ownership, so a short-lived helper
+    loop can close them before returning.
     """
 
     errors: list[BaseException] = []
@@ -371,14 +330,30 @@ def build_runtime(
     deps = create_tool_deps(config, cwd)
     agents: list[Agent[Any, Any]] = []
     try:
+        chat_blueprint = chat_agent_blueprint(config, catalog=catalog)
+        review_blueprint = review_agent_blueprint(config, catalog=catalog)
         app_info = AppInfo(
             workspace=str(deps.cwd),
-            provider=config.chat_model.provider.value,
-            model=config.chat_model.model,
-            tool_profile=config.tools.profile.value,
+            chat_model=ModelInfo(
+                provider=config.chat_model.provider.value,
+                model=config.chat_model.model,
+            ),
+            review_model=ModelInfo(
+                provider=config.review.model.provider.value,
+                model=config.review.model.model,
+            ),
+            chat_tools=_tool_set_info(
+                chat_blueprint,
+                profile=config.tools.profile.value,
+                catalog=catalog,
+            ),
+            review_tools=_tool_set_info(
+                review_blueprint,
+                profile=config.tools.review_profile.value,
+                catalog=catalog,
+            ),
         )
         token_counter = TiktokenTokenCounter()
-        chat_blueprint = chat_agent_blueprint(config, catalog=catalog)
         initial_overhead_tokens = _estimate_chat_overhead(
             chat_blueprint,
             token_counter,
@@ -396,7 +371,7 @@ def build_runtime(
                 input_token_budget=config.history.compactor_input_tokens,
                 summary_token_limit=config.history.compaction.summary_tokens,
             )
-        review_agent = review_agent_blueprint(config, catalog=catalog).build()
+        review_agent = review_blueprint.build()
         agents.append(review_agent)
         fallback_runner: PydanticAgentRunner | None = None
         if config.review.raw_fallback:
@@ -456,112 +431,34 @@ def _estimate_chat_overhead(
     )
 
 
-@dataclass(frozen=True)
-class Application:
-    """Rich compatibility facade preserving the original dataclass fields."""
-
-    session: ChatSession
-    reviews: ReviewService
-    presenter: _RichPresenterType
-    tool_deps: ToolDeps
-
-    def __post_init__(self) -> None:
-        try:
-            reference = _APPLICATION_RUNTIMES.get(self.session)
-        except TypeError:
-            # The compatibility constructor accepts arbitrary session-like values,
-            # including objects that cannot participate in a weak-key registry.
-            return
-        runtime = reference() if reference is not None else None
-        if runtime is not None and (
-            self.session is runtime.session
-            and self.reviews is runtime.reviews
-            and self.tool_deps is runtime.tool_deps
-        ):
-            object.__setattr__(self, "_runtime", runtime)
-
-    @property
-    def runtime(self) -> Runtime | None:
-        return cast(Runtime | None, getattr(self, "_runtime", None))
-
-    async def __aenter__(self) -> Application:
-        runtime = self.runtime
-        if runtime is not None:
-            await runtime.__aenter__()
-        return self
-
-    async def __aexit__(self, *_exc_info: object) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        runtime = self.runtime
-        if runtime is not None:
-            await runtime.aclose()
-        else:
-            self.tool_deps.close()
-
-    def close(self) -> None:
-        runtime = self.runtime
-        if runtime is not None:
-            if runtime._close_unentered_synchronously():
-                # Legacy Application callers may invoke synchronous close from an
-                # async embedding without ever entering the new Runtime context.
-                # Those agents have no loop ownership yet, so a helper loop can
-                # close them synchronously without crossing event-loop boundaries.
-                return
-            # An entered runtime belongs to its current event loop and must never
-            # be moved to the helper thread.
-            runtime.close()
-        else:
-            self.tool_deps.close()
-
-
-def build_application(
-    config: AppConfig,
-    console: _ConsoleType,
+def _tool_set_info(
+    blueprint: AgentBlueprint[Any, Any],
     *,
-    cwd: Path | None = None,
-    catalog: ToolCatalog = DEFAULT_TOOL_CATALOG,
-    live_ui: bool = False,
-    event_sink: EventSink | None = None,
-) -> Application:
-    """Build the former Rich-specific application facade."""
+    profile: str,
+    catalog: ToolCatalog,
+) -> ToolSetInfo:
+    """Describe the exact resolved tools and shell exposure for one agent."""
 
-    from ghostwheel.rich_ui import RichPresenter
-
-    dispatcher = EventDispatcher() if event_sink is None else None
-    active_sink = event_sink if event_sink is not None else dispatcher
-    assert active_sink is not None
-    runtime = build_runtime(
-        config,
-        cwd=cwd,
-        catalog=catalog,
-        event_sink=active_sink,
+    selected_tools = catalog.for_profile(profile)
+    has_shell_access = any(
+        selected is shell_tool
+        for selected in selected_tools
+        for shell_tool in catalog.shell
     )
-    try:
-        presenter = RichPresenter(
-            console,
-            app_info=runtime.app_info,
-            live=live_ui,
-        )
-        if dispatcher is not None:
-            dispatcher.bind(presenter.handle_event)
-        _APPLICATION_RUNTIMES[runtime.session] = weakref.ref(runtime)
-        return Application(
-            session=runtime.session,
-            reviews=runtime.reviews,
-            presenter=presenter,
-            tool_deps=runtime.tool_deps,
-        )
-    except BaseException:
-        _close_runtime_after_failure(runtime)
-        raise
+    return ToolSetInfo(
+        profile=profile,
+        tools=tuple(
+            ToolInfo(tool.name, _short_tool_description(tool.description))
+            for tool in blueprint.tools
+        ),
+        has_shell_access=has_shell_access,
+    )
 
 
-def _close_runtime_after_failure(runtime: Runtime) -> None:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        runtime.close()
-        return
-    _run_cleanup(runtime.aclose)
+def _short_tool_description(description: str | None) -> str:
+    """Collapse a tool's first prose paragraph into one display line."""
+
+    if not description:
+        return "No description available."
+    first_paragraph = description.partition("\n\n")[0]
+    return " ".join(first_paragraph.split()) or "No description available."

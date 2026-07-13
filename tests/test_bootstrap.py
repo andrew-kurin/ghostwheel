@@ -1,20 +1,15 @@
 import asyncio
-import gc
-import weakref
-from dataclasses import fields, replace
-from io import StringIO
 from pathlib import Path
-from typing import get_type_hints
 
 import pytest
-from rich.console import Console
 
 import ghostwheel.bootstrap as bootstrap_module
-from ghostwheel.app_info import AppInfo
-from ghostwheel.bootstrap import Application, Runtime, build_application, build_runtime
+from ghostwheel.app_info import AppInfo, ModelInfo, ToolInfo, ToolSetInfo
+from ghostwheel.bootstrap import Runtime, build_runtime
 from ghostwheel.config import Settings
 from ghostwheel.review import ReviewService
 from ghostwheel.session import ChatSession
+from ghostwheel.tools import ToolCatalog
 
 
 def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> None:
@@ -27,73 +22,116 @@ def test_build_runtime_is_ui_neutral_and_owns_resolved_metadata(tmp_path) -> Non
         assert runtime.tool_deps.cwd == tmp_path.resolve()
         assert runtime.tool_deps.limits is config.tools.limits
         assert runtime.app_info.workspace == str(tmp_path.resolve())
-        assert runtime.app_info.provider == config.chat_model.provider.value
-        assert runtime.app_info.model == config.chat_model.model
-        assert runtime.app_info.tool_profile == config.tools.profile.value
+        assert runtime.app_info.chat_model == ModelInfo(
+            config.chat_model.provider.value,
+            config.chat_model.model,
+        )
+        assert runtime.app_info.review_model == ModelInfo(
+            config.review.model.provider.value,
+            config.review.model.model,
+        )
+        assert runtime.app_info.chat_tools.profile == config.tools.profile.value
+        assert runtime.app_info.chat_tools.tools == (
+            ToolInfo(
+                "read", "Read a UTF-8 text file as a compact, line-numbered page."
+            ),
+            ToolInfo("ls", "List a directory as compact, sorted text."),
+            ToolInfo(
+                "grep",
+                "Search UTF-8 text files with a bounded line-oriented regular expression.",
+            ),
+            ToolInfo("bash", "Run a shell command in the project working directory."),
+        )
+        assert runtime.app_info.chat_tools.has_shell_access is True
+        assert runtime.app_info.review_tools == runtime.app_info.chat_tools
         assert runtime.session.estimated_context_tokens > 256
         assert runtime.session.context_tokens_estimated is True
     finally:
         runtime.close()
 
 
-def test_build_application_is_a_rich_compatibility_facade(tmp_path) -> None:
-    config = Settings(_env_file=None).resolve()
-    console = Console(file=StringIO(), force_terminal=False)
+def test_build_runtime_reports_tools_from_the_active_custom_catalog(tmp_path) -> None:
+    def inspect_workspace(path: str) -> str:
+        """Inspect one workspace path.
 
-    application = build_application(config, console, cwd=tmp_path)
+        Additional model-only guidance should not appear in the short description.
+        """
+
+        return path
+
+    def execute(command: str) -> str:
+        """Execute one project command."""
+
+        return command
+
+    config = Settings(
+        tool_profile="read-only",
+        review_tool_profile="full",
+        _env_file=None,
+    ).resolve()
+    catalog = ToolCatalog(read_only=(inspect_workspace,), shell=(execute,))
+
+    runtime = build_runtime(config, cwd=tmp_path, catalog=catalog)
     try:
-        runtime = application.runtime
-        assert runtime is not None
-        assert application.session is runtime.session
-        assert application.reviews is runtime.reviews
-        assert application.tool_deps is runtime.tool_deps
-        assert application.presenter.app_info is runtime.app_info
+        assert runtime.app_info.chat_tools == ToolSetInfo(
+            profile="read-only",
+            tools=(ToolInfo("inspect_workspace", "Inspect one workspace path."),),
+            has_shell_access=False,
+        )
+        assert runtime.app_info.review_tools == ToolSetInfo(
+            profile="full",
+            tools=(
+                ToolInfo("inspect_workspace", "Inspect one workspace path."),
+                ToolInfo("execute", "Execute one project command."),
+            ),
+            has_shell_access=True,
+        )
     finally:
-        application.close()
+        runtime.close()
 
 
-def test_replaced_application_preserves_runtime_ownership(tmp_path) -> None:
-    config = Settings(_env_file=None).resolve()
-    application = build_application(
-        config,
-        Console(file=StringIO(), force_terminal=False),
-        cwd=tmp_path,
-    )
-    runtime = application.runtime
-    assert runtime is not None
-    runtime_reference = weakref.ref(runtime)
-    clients = [agent.model.client for agent in runtime._agents]
+def test_build_runtime_reports_distinct_chat_and_review_models(tmp_path) -> None:
+    config = Settings(
+        model_provider="ollama",
+        model="chat-model",
+        review_provider="llama-cpp",
+        review_model="review-model",
+        _env_file=None,
+    ).resolve()
 
-    def is_closed(client: object) -> bool:
-        value = getattr(client, "is_closed")
-        return bool(value() if callable(value) else value)
-
-    replacement = replace(application)
-    assert replacement.runtime is runtime
-    assert replace(application, reviews=object()).runtime is None
-
-    del application
-    del runtime
-    gc.collect()
-
-    assert replacement.runtime is runtime_reference()
-    replacement.close()
-
-    assert all(is_closed(client) for client in clients)
+    runtime = build_runtime(config, cwd=tmp_path)
+    try:
+        assert runtime.app_info.chat_model == ModelInfo("ollama", "chat-model")
+        assert runtime.app_info.review_model == ModelInfo(
+            "llama-cpp",
+            "review-model",
+        )
+    finally:
+        runtime.close()
 
 
-def test_application_preserves_original_dataclass_construction_shape() -> None:
-    values = [object() for _index in range(4)]
-    application = Application(*values)  # type: ignore[arg-type]
+def test_build_runtime_accepts_a_tool_without_a_description(tmp_path) -> None:
+    def inspect(path: str) -> str:
+        return path
 
-    assert [field.name for field in fields(Application)] == [
-        "session",
-        "reviews",
-        "presenter",
-        "tool_deps",
-    ]
-    assert application.runtime is None
-    assert replace(application, presenter="replacement").presenter == "replacement"
+    config = Settings(
+        tool_profile="read-only",
+        review_tool_profile="read-only",
+        _env_file=None,
+    ).resolve()
+    catalog = ToolCatalog(read_only=(inspect,), shell=())
+
+    runtime = build_runtime(config, cwd=tmp_path, catalog=catalog)
+    try:
+        expected = ToolSetInfo(
+            profile="read-only",
+            tools=(ToolInfo("inspect", "No description available."),),
+            has_shell_access=False,
+        )
+        assert runtime.app_info.chat_tools == expected
+        assert runtime.app_info.review_tools == expected
+    finally:
+        runtime.close()
 
 
 def test_runtime_async_context_owns_agent_and_tool_lifetimes() -> None:
@@ -120,7 +158,13 @@ def test_runtime_async_context_owns_agent_and_tool_lifetimes() -> None:
         session=object(),  # type: ignore[arg-type]
         reviews=object(),  # type: ignore[arg-type]
         tool_deps=deps,  # type: ignore[arg-type]
-        app_info=AppInfo(".", "provider", "model", "read-only"),
+        app_info=AppInfo(
+            ".",
+            ModelInfo("provider", "model"),
+            ModelInfo("provider", "model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
         _agents=(agent,),  # type: ignore[arg-type]
     )
 
@@ -167,7 +211,13 @@ def test_runtime_rejects_a_concurrent_enter_before_entry_finishes() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
 
@@ -219,7 +269,13 @@ def test_runtime_close_waits_for_an_in_progress_enter() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
 
@@ -320,7 +376,13 @@ def test_cancelling_close_owner_does_not_cancel_shared_teardown() -> None:
             session=object(),  # type: ignore[arg-type]
             reviews=object(),  # type: ignore[arg-type]
             tool_deps=deps,  # type: ignore[arg-type]
-            app_info=AppInfo(".", "provider", "model", "read-only"),
+            app_info=AppInfo(
+                ".",
+                ModelInfo("provider", "model"),
+                ModelInfo("provider", "model"),
+                ToolSetInfo("read-only"),
+                ToolSetInfo("read-only"),
+            ),
             _agents=(agent,),  # type: ignore[arg-type]
         )
         await runtime.__aenter__()
@@ -432,64 +494,6 @@ def test_disabled_review_fallback_omits_fallback_agent(
         runtime.close()
 
 
-def test_compatibility_application_close_works_inside_an_active_event_loop(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        application = build_application(
-            Settings(_env_file=None).resolve(),
-            Console(file=StringIO(), force_terminal=False),
-            cwd=tmp_path,
-        )
-        runtime = application.runtime
-        assert runtime is not None
-        clients = [agent.model.client for agent in runtime._agents]
-
-        def is_closed(client: object) -> bool:
-            value = getattr(client, "is_closed")
-            return bool(value() if callable(value) else value)
-
-        application.close()
-
-        assert runtime.is_closed is True
-        assert all(is_closed(client) for client in clients)
-        assert application.tool_deps.workspace.is_closed is True
-
-    asyncio.run(scenario())
-
-
-def test_compatibility_application_does_not_cross_loops_when_runtime_is_entered(
-    tmp_path: Path,
-) -> None:
-    application = build_application(
-        Settings(_env_file=None).resolve(),
-        Console(file=StringIO(), force_terminal=False),
-        cwd=tmp_path,
-    )
-    runtime = application.runtime
-    assert runtime is not None
-
-    async def scenario() -> None:
-        async with application:
-            with pytest.raises(RuntimeError, match="await runtime.aclose"):
-                application.close()
-            assert runtime.is_closed is False
-
-    asyncio.run(scenario())
-
-    assert runtime.is_closed is True
-    assert application.tool_deps.workspace.is_closed is True
-
-
-def test_bootstrap_public_annotations_are_runtime_resolvable() -> None:
-    application_hints = get_type_hints(Application)
-    factory_hints = get_type_hints(build_application)
-
-    assert application_hints["session"] is ChatSession
-    assert "presenter" in application_hints
-    assert factory_hints["return"] is Application
-
-
 def test_build_runtime_closes_owned_dependencies_when_composition_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -536,6 +540,8 @@ def test_build_runtime_closes_agents_created_before_composition_failure(
             self.exited += 1
 
     class FakeBlueprint:
+        tools: tuple[object, ...] = ()
+
         def __init__(self, agent: ManagedAgent) -> None:
             self.agent = agent
 
@@ -570,70 +576,5 @@ def test_build_runtime_closes_agents_created_before_composition_failure(
         # failure, even when its caller already owns an event loop.
         assert agent.entered == 1
         assert agent.exited == 1
-
-    asyncio.run(scenario())
-
-
-def test_build_application_closes_runtime_when_presenter_construction_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ghostwheel.rich_ui as rich_ui_module
-
-    class FakeRuntime:
-        app_info = object()
-        closed = False
-
-        def close(self) -> None:
-            self.closed = True
-
-    runtime = FakeRuntime()
-    config = Settings(_env_file=None).resolve()
-    monkeypatch.setattr(
-        bootstrap_module,
-        "build_runtime",
-        lambda *_args, **_kwargs: runtime,
-    )
-
-    def fail_presenter(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("presenter construction failed")
-
-    monkeypatch.setattr(rich_ui_module, "RichPresenter", fail_presenter)
-
-    with pytest.raises(RuntimeError, match="presenter construction failed"):
-        build_application(config, Console(file=StringIO()))
-
-    assert runtime.closed is True
-
-
-def test_build_application_awaits_failure_cleanup_inside_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ghostwheel.rich_ui as rich_ui_module
-
-    class FakeRuntime:
-        app_info = object()
-        closed = False
-
-        async def aclose(self) -> None:
-            await asyncio.sleep(0)
-            self.closed = True
-
-    runtime = FakeRuntime()
-    config = Settings(_env_file=None).resolve()
-    monkeypatch.setattr(
-        bootstrap_module,
-        "build_runtime",
-        lambda *_args, **_kwargs: runtime,
-    )
-
-    def fail_presenter(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("presenter construction failed")
-
-    monkeypatch.setattr(rich_ui_module, "RichPresenter", fail_presenter)
-
-    async def scenario() -> None:
-        with pytest.raises(RuntimeError, match="presenter construction failed"):
-            build_application(config, Console(file=StringIO()))
-        assert runtime.closed is True
 
     asyncio.run(scenario())

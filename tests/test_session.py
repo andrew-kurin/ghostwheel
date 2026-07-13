@@ -690,6 +690,34 @@ def test_provider_usage_is_preferred_over_local_estimate() -> None:
     assert session.context_tokens_estimated is False
 
 
+def test_provider_measurement_can_replace_a_larger_seeded_estimate() -> None:
+    completed = (
+        request("user"),
+        response("assistant", usage=RequestUsage(input_tokens=2, output_tokens=1)),
+    )
+    session = ChatSession(
+        FakeRunner(TurnSucceeded("done", completed)),
+        history_policy=history_policy(
+            100,
+            token_counter=UnitTokenCounter(),
+        ),
+        initial_overhead_tokens=7,
+    )
+
+    assert session.estimated_context_tokens == 7
+    assert session.context_tokens_estimated is True
+
+    asyncio.run(session.send("go"))
+
+    assert session.estimated_context_tokens == 3
+    assert session.context_tokens_estimated is False
+
+    session.clear()
+
+    assert session.estimated_context_tokens == 7
+    assert session.context_tokens_estimated is True
+
+
 def test_zero_provider_usage_falls_back_to_local_estimate() -> None:
     completed = (request("user"), response("assistant", usage=RequestUsage()))
     runner = FakeRunner(TurnSucceeded("done", completed))

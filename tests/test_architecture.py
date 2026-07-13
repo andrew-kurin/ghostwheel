@@ -17,9 +17,9 @@ CANONICAL_RUNTIME_MODULES = (
     "pydantic_runner",
     "compaction",
     "review",
-    "rich_ui",
-    "textual_composer",
-    "textual_ui",
+    "terminal_composer",
+    "terminal_io",
+    "terminal_ui",
 )
 
 COMPATIBILITY_MODULES = {"agent", "models"}
@@ -90,18 +90,31 @@ def test_internal_modules_do_not_depend_on_compatibility_facades() -> None:
     assert offenders == {}
 
 
-def test_textual_ui_does_not_depend_on_cli_or_private_rich_helpers() -> None:
-    for module in ("textual_ui", "textual_composer"):
-        tree = _module_tree(module)
-        assert "ghostwheel.cli" not in _imported_modules(tree)
-        private_rich_imports = {
-            alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module == "ghostwheel.rich_ui"
-            for alias in node.names
-            if alias.name.startswith("_")
-        }
-        assert private_rich_imports == set()
+def test_terminal_ui_does_not_depend_on_entrypoint_or_composition_root() -> None:
+    imported = _imported_modules(_module_tree("terminal_ui"))
+
+    assert "ghostwheel.cli" not in imported
+    assert "ghostwheel.bootstrap" not in imported
+
+
+def test_terminal_platform_input_is_owned_by_terminal_io() -> None:
+    imported = _imported_modules(_module_tree("terminal_ui"))
+
+    assert "ghostwheel.terminal_io" in imported
+    assert imported.isdisjoint({"os", "signal", "stat", "termios"})
+
+
+def test_legacy_terminal_adapters_are_removed() -> None:
+    assert not any(
+        (PACKAGE_ROOT / filename).exists()
+        for filename in (
+            "input_ui.py",
+            "keyboard.py",
+            "rich_ui.py",
+            "textual_composer.py",
+            "textual_ui.py",
+        )
+    )
 
 
 def test_bootstrap_uses_owned_agent_definitions_not_sdk_private_state() -> None:
