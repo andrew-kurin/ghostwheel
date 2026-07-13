@@ -1412,7 +1412,9 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
 
     try:
         assert process.stdout is not None
-        assert select.select([process.stdout], [], [], 2)[0] == [process.stdout]
+        # Startup imports can be slow on a loaded CI runner; the two-second
+        # responsiveness bound begins only after the child reports readiness.
+        assert select.select([process.stdout], [], [], 10)[0] == [process.stdout]
         assert process.stdout.readline() == "READY\n"
         process.send_signal(signal.SIGINT)
         assert process.wait(timeout=2) == 0
