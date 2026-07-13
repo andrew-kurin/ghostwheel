@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application
 from prompt_toolkit.completion import (
     CompleteEvent,
     Completer,
@@ -378,6 +379,7 @@ class TerminalComposer:
         vim_mode: bool,
         prompt_input: Input | None,
         prompt_output: Output | None,
+        prompt_message: Callable[[], FormattedText],
         bottom_toolbar: Callable[[], FormattedText],
         rprompt: Callable[[], FormattedText],
     ) -> None:
@@ -385,6 +387,7 @@ class TerminalComposer:
         self.vim_mode = vim_mode
         self.prompt_input = prompt_input
         self.prompt_output = prompt_output
+        self.prompt_message = prompt_message
         self.bottom_toolbar = bottom_toolbar
         self.rprompt = rprompt
         self.history_store: InputHistory | None = None
@@ -440,7 +443,7 @@ class TerminalComposer:
                 self.owned_input = prompt_input
 
             self.session = PromptSession(
-                message=FormattedText([("class:prompt", "\n> ")]),
+                message=self.prompt_message,
                 multiline=True,
                 wrap_lines=True,
                 editing_mode=(EditingMode.VI if self.vim_mode else EditingMode.EMACS),
@@ -458,16 +461,27 @@ class TerminalComposer:
                 style=Style.from_dict(
                     {
                         "bottom-toolbar": "noreverse",
+                        "composer.rule": "ansimagenta",
                         "prompt": "bold ansicyan",
                         "rprompt": "ansibrightblack",
-                        "status.rule": "ansibrightblack",
+                        "status.meta": "ansibrightblack",
+                        "status.rule": "ansimagenta",
                         "status.value": "ansibrightblack",
                     }
                 ),
                 input=prompt_input,
                 output=self.prompt_output,
             )
+            self.session.app.before_render += self._fit_toolbar_to_terminal
         return self.session
+
+    def _fit_toolbar_to_terminal(self, app: Application[object]) -> None:
+        """Hide the toolbar before it can displace the editor's final row."""
+
+        if self.session is not None:
+            self.session.bottom_toolbar = (
+                self.bottom_toolbar if app.output.get_size().rows >= 2 else None
+            )
 
     def input_for_turn(self, input_stream: TextIO) -> Input | None:
         """Return VT input for active-turn shortcuts, even without a composer."""

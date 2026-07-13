@@ -67,8 +67,9 @@ disappear when Ghostwheel exits.
 
 Vim-style prompt editing is enabled by default through prompt-toolkit. Each
 prompt starts in Insert mode; Escape switches to Normal mode, and the
-ruled status line at the bottom shows context usage and the current `I`, `N`, or
-`R` editing mode. Use `--no-vim` for Emacs-style editing.
+framed status area shows the workspace and chat model on the left, with context
+usage and the current `I`, `N`, or `R` editing mode on the right. Use `--no-vim`
+for Emacs-style editing.
 
 In the chat prompt:
 

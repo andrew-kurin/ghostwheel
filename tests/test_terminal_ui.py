@@ -20,12 +20,14 @@ from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.data_structures import Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.input.defaults import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.utils import get_cwidth
 from rich.console import Console
 
 import ghostwheel.terminal_io as terminal_io
@@ -68,6 +70,17 @@ class RecordingOutput(DummyOutput):
 
     def enable_mouse_support(self) -> None:
         self.mouse_support_entries += 1
+
+
+class SizedDummyOutput(DummyOutput):
+    def __init__(self, *, rows: int, columns: int) -> None:
+        self.size = Size(rows=rows, columns=columns)
+
+    def get_size(self) -> Size:
+        return self.size
+
+    def get_rows_below_cursor_position(self) -> int:
+        return self.size.rows
 
 
 def make_ui(
@@ -649,9 +662,10 @@ def test_prompt_preserves_unicode_submission(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> None:
+def test_prompt_emits_no_alternate_screen_or_mouse_protocols() -> None:
     async def scenario() -> str:
         terminal_bytes = StringIO()
+        workspace = Path.home() / "gw"
         prompt_output = Vt100_Output(
             terminal_bytes,
             lambda: Size(rows=15, columns=60),
@@ -660,7 +674,7 @@ def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> 
         )
         with create_pipe_input() as pipe_input:
             ui = make_ui(
-                workspace=tmp_path,
+                workspace=workspace,
                 interactive=True,
                 prompt_input=pipe_input,
                 prompt_output=prompt_output,
@@ -677,7 +691,10 @@ def test_prompt_emits_no_alternate_screen_or_mouse_protocols(tmp_path: Path) -> 
 
     assert "\x1b[?2004h" in output
     assert "\x1b[?2004l" in output
+    assert "~/gw" in output
+    assert "provider/model" in output
     assert "~1.2k/16k" in output
+    assert "─" * 20 in output
     assert "\x1b[3J" not in output
     for mode in (9, 47, 1047, 1049, 1000, 1002, 1003, 1006, 1015, 1016):
         assert f"\x1b[?{mode}h" not in output
@@ -1961,11 +1978,19 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
         os.close(slave)
 
 
-def test_context_and_vim_mode_are_exposed_in_the_ruled_status(tmp_path: Path) -> None:
+def test_context_and_vim_mode_are_exposed_in_the_ruled_status() -> None:
     session = FakeSession()
+    workspace = Path.home() / "personal/ghostwheel"
     ui = make_ui(
-        workspace=tmp_path,
+        workspace=workspace,
         session=session,
+        app_info=AppInfo(
+            str(workspace),
+            ModelInfo("provider", "model"),
+            ModelInfo("review-provider", "review-model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
         interactive=True,
         prompt_input=None,
         prompt_output=DummyOutput(),
@@ -1975,15 +2000,137 @@ def test_context_and_vim_mode_are_exposed_in_the_ruled_status(tmp_path: Path) ->
 
     assert ui.context_status == "~1.2k/16k"
     assert ui._status_text() == "~1.2k/16k · I"
-    toolbar = str(ui._bottom_toolbar())
-    assert "─" in toolbar
-    assert "~1.2k/16k · I" in toolbar
+    assert to_plain_text(ui._prompt_message()).splitlines() == ["─" * 80, "> "]
+    toolbar = to_plain_text(ui._bottom_toolbar()).splitlines()
+    assert len(toolbar) == 2
+    assert toolbar[0] == "─" * 80
+    assert toolbar[1].startswith(" ~/personal/ghostwheel · provider/model")
+    assert toolbar[1].endswith(" ~1.2k/16k · I ")
+    assert all(get_cwidth(line) == 80 for line in toolbar)
     assert ui._get_prompt_session().app.editing_mode is EditingMode.VI
 
     session.estimated_context_tokens = 948
     session.context_tokens_estimated = False
     session.compaction_enabled = False
     assert ui._status_text() == "948/16k · off · I"
+
+
+@pytest.mark.parametrize(
+    ("width", "status_suffix"),
+    [
+        (80, " ~1.2k/16k · I "),
+        (40, " ~1.2k/16k · I "),
+        (20, " ~1.2k/16k · I "),
+        (8, " I "),
+    ],
+)
+def test_composer_frame_never_wraps_on_narrow_terminals(
+    width: int,
+    status_suffix: str,
+) -> None:
+    workspace = Path.home() / "personal/a-very-long-workspace-name"
+    ui = make_ui(
+        workspace=workspace,
+        width=width,
+        app_info=AppInfo(
+            str(workspace),
+            ModelInfo("provider", "a-very-long-model-name"),
+            ModelInfo("review-provider", "review-model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
+        interactive=True,
+        prompt_input=None,
+        prompt_output=DummyOutput(),
+        vim_mode=True,
+        live=False,
+    )
+
+    prompt = to_plain_text(ui._prompt_message()).splitlines()
+    toolbar = to_plain_text(ui._bottom_toolbar()).splitlines()
+
+    assert prompt == ["─" * width, "> "]
+    assert len(toolbar) == 2
+    assert toolbar[0] == "─" * width
+    assert toolbar[1].endswith(status_suffix)
+    assert all(get_cwidth(line) == width for line in toolbar)
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_rule_rows"),
+    [(1, 0), (2, 0), (3, 1), (4, 2)],
+)
+def test_composer_keeps_editor_visible_on_short_terminals(
+    rows: int,
+    expected_rule_rows: int,
+) -> None:
+    async def scenario() -> list[str]:
+        with create_pipe_input() as pipe_input:
+            ui = make_ui(
+                workspace=Path.home() / "gw",
+                interactive=True,
+                prompt_input=pipe_input,
+                prompt_output=SizedDummyOutput(rows=rows, columns=20),
+                vim_mode=True,
+                live=False,
+            )
+            try:
+                prompt_task = asyncio.create_task(ui.read())
+                await wait_for_prompt(ui, prompt_task)
+                pipe_input.send_text("draft")
+                await wait_for_buffer_text(ui, "draft")
+
+                for _attempt in range(100):
+                    screen = ui._get_prompt_session().app.renderer._last_screen
+                    lines = [
+                        "".join(
+                            screen.data_buffer[row][column].char for column in range(20)
+                        )
+                        for row in range(rows)
+                    ]
+                    if any("draft" in line for line in lines):
+                        break
+                    await asyncio.sleep(0.01)
+                else:
+                    raise AssertionError(f"draft was not rendered: {lines!r}")
+
+                pipe_input.send_text("\r")
+                assert await asyncio.wait_for(prompt_task, 1) == "draft"
+                return lines
+            finally:
+                ui.close()
+
+    rendered_lines = asyncio.run(scenario())
+
+    assert any("> draft" in line for line in rendered_lines)
+    assert rendered_lines.count("─" * 20) == expected_rule_rows
+
+
+def test_composer_status_sanitizes_dynamic_metadata(tmp_path: Path) -> None:
+    unsafe_workspace = "project\nforged workspace"
+    ui = make_ui(
+        workspace=tmp_path,
+        width=80,
+        app_info=AppInfo(
+            unsafe_workspace,
+            ModelInfo("provider\x1b[2J", "model\nforged model"),
+            ModelInfo("review-provider", "review-model"),
+            ToolSetInfo("read-only"),
+            ToolSetInfo("read-only"),
+        ),
+        interactive=True,
+        prompt_input=None,
+        prompt_output=DummyOutput(),
+        live=False,
+    )
+
+    toolbar = to_plain_text(ui._bottom_toolbar())
+
+    assert "\x1b" not in toolbar
+    assert len(toolbar.splitlines()) == 2
+    assert "forged workspace" in toolbar
+    assert "forged model" in toolbar
+    assert all(get_cwidth(line) == 80 for line in toolbar.splitlines())
 
 
 def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
@@ -2366,9 +2513,46 @@ def test_welcome_labels_mixed_chat_and_review_profiles(tmp_path: Path) -> None:
     rendered = output.getvalue()
     assert "chat chat-provider/chat-model" in rendered
     assert "review review-provider/review-model" in rendered
+    assert str(tmp_path) in rendered
     assert "chat READ-ONLY" in rendered
     assert "review FULL" in rendered
     assert "(unrestricted shell)" in rendered
+
+
+def test_interactive_welcome_moves_model_and_workspace_into_status() -> None:
+    output = StringIO()
+    workspace = Path.home() / "personal/ghostwheel"
+    with create_pipe_input() as pipe_input:
+        ui = make_ui(
+            workspace=workspace,
+            app_info=AppInfo(
+                str(workspace),
+                ModelInfo("chat-provider", "chat-model"),
+                ModelInfo("review-provider", "review-model"),
+                ToolSetInfo("read-only"),
+                ToolSetInfo("full", has_shell_access=True),
+            ),
+            output=output,
+            interactive=True,
+            prompt_input=pipe_input,
+            prompt_output=DummyOutput(),
+            live=False,
+        )
+
+        try:
+            ui.welcome()
+            rendered = output.getvalue()
+            status = to_plain_text(ui._bottom_toolbar())
+        finally:
+            ui.close()
+
+    assert "chat-provider/chat-model" not in rendered
+    assert "review-provider/review-model" not in rendered
+    assert str(workspace) not in rendered
+    assert "chat READ-ONLY" in rendered
+    assert "review FULL" in rendered
+    assert "chat-provider/chat-model" in status
+    assert "~/personal/ghostwheel" in status
 
 
 def test_model_info_lists_distinct_chat_and_review_models(tmp_path: Path) -> None:

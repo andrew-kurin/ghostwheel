@@ -195,6 +195,7 @@ def _composer(history_path: Path | None) -> terminal_composer.TerminalComposer:
         vim_mode=False,
         prompt_input=None,
         prompt_output=None,
+        prompt_message=lambda: FormattedText([("class:prompt", "> ")]),
         bottom_toolbar=FormattedText,
         rprompt=FormattedText,
     )
@@ -435,6 +436,7 @@ def test_prompt_session_persists_surrogateescaped_terminal_bytes(
                 vim_mode=False,
                 prompt_input=pipe_input,
                 prompt_output=DummyOutput(),
+                prompt_message=lambda: FormattedText([("class:prompt", "> ")]),
                 bottom_toolbar=lambda: FormattedText(),
                 rprompt=lambda: FormattedText(),
             )

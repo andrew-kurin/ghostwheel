@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TextIO
 
+import regex
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.formatted_text import FormattedText
@@ -174,6 +175,7 @@ class TerminalUI:
             vim_mode=vim_mode,
             prompt_input=prompt_input,
             prompt_output=resolved_prompt_output,
+            prompt_message=self._prompt_message,
             bottom_toolbar=self._bottom_toolbar,
             rprompt=self._rprompt,
         )
@@ -219,17 +221,20 @@ class TerminalUI:
     def welcome(self) -> None:
         heading = Text("Ghostwheel", style="bold magenta")
         details = Text()
-        details.append("chat ", style="dim")
-        self._append_model(details, self.app_info.chat_model)
-        details.append("  ·  review ", style="dim")
-        self._append_model(details, self.app_info.review_model)
-        details.append("  ·  ")
-        details.append(sanitize_terminal_line(self.app_info.workspace))
+        if not self._use_prompt_toolkit():
+            details.append("chat ", style="dim")
+            self._append_model(details, self.app_info.chat_model)
+            details.append("  ·  review ", style="dim")
+            self._append_model(details, self.app_info.review_model)
+            details.append("  ·  ")
+            details.append(sanitize_terminal_line(self.app_info.workspace))
         for label, tool_set in (
             ("chat", self.app_info.chat_tools),
             ("review", self.app_info.review_tools),
         ):
-            details.append(f"  ·  {label} ")
+            if details.plain:
+                details.append("  ·  ")
+            details.append(f"{label} ")
             tool_style = "bold yellow" if tool_set.has_shell_access else "green"
             details.append(
                 sanitize_terminal_line(tool_set.profile.upper()),
@@ -759,27 +764,113 @@ class TerminalUI:
         app = get_app_or_none()
         if app is not None and app.renderer.height_is_known:
             return FormattedText()
-        status = self._status_text()
-        return (
-            FormattedText([("class:rprompt", f" {status} ")])
-            if status
-            else FormattedText()
-        )
+        if self._prompt_height() < 2:
+            return FormattedText()
+        status = self._status_value(self._prompt_width())
+        return FormattedText([("class:rprompt", status)]) if status else FormattedText()
 
-    def _bottom_toolbar(self) -> FormattedText:
-        status = self._status_text()
-        value = f" {status} " if status else ""
+    def _prompt_width(self) -> int:
         app = get_app_or_none()
         width = self.console.width
         if app is not None:
             width = app.output.get_size().columns
-        rule = "─" * max(1, width - get_cwidth(value))
+        return max(1, width)
+
+    def _prompt_height(self) -> int:
+        app = get_app_or_none()
+        height = self.console.height
+        if app is not None:
+            height = app.output.get_size().rows
+        return max(1, height)
+
+    def _prompt_message(self) -> FormattedText:
+        width = self._prompt_width()
+        height = self._prompt_height()
+        app = get_app_or_none()
+        height_is_known = app is None or app.renderer.height_is_known
+        if not height_is_known and height >= 2:
+            metadata, gap_width, _value = self._status_line_parts(width)
+            rule = "─" * gap_width
+        elif height_is_known and height >= 3:
+            metadata = ""
+            rule = "─" * width
+        else:
+            return FormattedText([("class:prompt", "> ")])
         return FormattedText(
             [
-                ("class:status.rule", rule),
+                ("class:status.meta", metadata),
+                ("class:composer.rule", rule),
+                ("", "\n"),
+                ("class:prompt", "> "),
+            ]
+        )
+
+    def _bottom_toolbar(self) -> FormattedText:
+        width = self._prompt_width()
+        metadata, gap_width, value = self._status_line_parts(width)
+        gap = " " * gap_width
+        fragments = []
+        if self._prompt_height() >= 4:
+            fragments.extend(
+                [
+                    ("class:status.rule", "─" * width),
+                    ("", "\n"),
+                ]
+            )
+        fragments.extend(
+            [
+                ("class:status.meta", metadata),
+                ("", gap),
                 ("class:status.value", value),
             ]
         )
+        return FormattedText(fragments)
+
+    def _status_line_parts(self, width: int) -> tuple[str, int, str]:
+        """Fit status metadata and value into one terminal row."""
+
+        metadata = f" {self._workspace_label()} · {self._chat_model_label()}"
+        value = self._status_value(width)
+        available_metadata = width - get_cwidth(value)
+        if value and available_metadata > 0:
+            available_metadata -= 1
+        metadata = _middle_ellipsis(metadata, available_metadata)
+        gap_width = max(0, width - get_cwidth(metadata) - get_cwidth(value))
+        return metadata, gap_width, value
+
+    def _status_value(self, width: int) -> str:
+        mode = self._mode_label() if self.vim_mode else ""
+        candidates = tuple(
+            dict.fromkeys(
+                value
+                for value in (self._status_text(), self.context_status, mode)
+                if value
+            )
+        )
+        for value in candidates:
+            padded = f" {value} "
+            if get_cwidth(padded) <= width:
+                return padded
+        for value in candidates:
+            if get_cwidth(value) <= width:
+                return value
+        return _middle_ellipsis(candidates[-1], width) if candidates else ""
+
+    def _workspace_label(self) -> str:
+        workspace = Path(self.app_info.workspace).expanduser()
+        label = str(workspace)
+        try:
+            relative = workspace.relative_to(Path.home())
+        except RuntimeError, ValueError:
+            pass
+        else:
+            label = "~" if relative == Path(".") else f"~/{relative}"
+        return sanitize_terminal_line(label)
+
+    def _chat_model_label(self) -> str:
+        provider = sanitize_terminal_line(self.app_info.chat_model.provider)
+        model = sanitize_terminal_line(self.app_info.chat_model.model)
+        return f"{provider}/{model}"
 
     def _status_text(self) -> str:
         parts = [self.context_status] if self.context_status else []
@@ -803,6 +894,53 @@ class TerminalUI:
             InputMode.REPLACE: "R",
             InputMode.REPLACE_SINGLE: "R",
         }[input_mode]
+
+
+def _middle_ellipsis(value: str, max_width: int) -> str:
+    """Fit one status value while preserving its beginning and ending."""
+
+    if max_width <= 0:
+        return ""
+    if get_cwidth(value) <= max_width:
+        return value
+    if max_width == 1:
+        return "…"
+    content_width = max_width - 1
+    prefix_width = (content_width + 1) // 2
+    suffix_width = content_width - prefix_width
+    return (
+        _display_prefix(value, prefix_width)
+        + "…"
+        + _display_suffix(value, suffix_width)
+    )
+
+
+def _display_prefix(value: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    output: list[str] = []
+    width = 0
+    for cluster in regex.findall(r"\X", value):
+        cluster_width = get_cwidth(cluster)
+        if width + cluster_width > max_width:
+            break
+        output.append(cluster)
+        width += cluster_width
+    return "".join(output)
+
+
+def _display_suffix(value: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    output: list[str] = []
+    width = 0
+    for cluster in reversed(regex.findall(r"\X", value)):
+        cluster_width = get_cwidth(cluster)
+        if width + cluster_width > max_width:
+            break
+        output.append(cluster)
+        width += cluster_width
+    return "".join(reversed(output))
 
 
 def _live_answer_tail(answer: str) -> str:
