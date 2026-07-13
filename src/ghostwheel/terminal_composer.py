@@ -227,10 +227,8 @@ def _key_bindings() -> KeyBindings:
             event.current_buffer.validate_and_handle()
 
     @bindings.add(Keys.ControlJ, filter=composer_focused, eager=True)
-    def _shift_enter_newline(event: KeyPressEvent) -> None:
-        # Ghostty can map Shift+Enter to LF, which prompt_toolkit exposes as
-        # ControlJ. The physical shortcuts are indistinguishable in that mode.
-        event.current_buffer.insert_text("\n")
+    def _ignore_removed_newline_shortcut(_event: KeyPressEvent) -> None:
+        pass
 
     @bindings.add(Keys.ControlC, filter=composer_focused, eager=True)
     def _clear_prompt(event: KeyPressEvent) -> None:

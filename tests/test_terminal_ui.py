@@ -164,10 +164,16 @@ def start_fallback_tty_reader(
     *,
     controlling: bool = True,
     no_flush: bool = False,
+    line_delimiter_slot: str | None = None,
+    line_delimiter: bytes = b";",
 ) -> tuple[subprocess.Popen[bytes], int, int]:
     """Start a fallback reader with a real controlling pseudo-terminal."""
 
     master, slave = os.openpty()
+    if line_delimiter_slot is not None:
+        attributes = termios.tcgetattr(slave)
+        attributes[6][getattr(termios, line_delimiter_slot)] = line_delimiter
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
     child = textwrap.dedent(
         f"""
         import asyncio
@@ -248,9 +254,6 @@ def test_prompt_is_inline_mouse_free_and_distinguishes_submit_from_newline(
                 live=False,
             )
             try:
-                assert await feed_prompt(ui, pipe_input, "first\nsecond\r") == (
-                    "first\nsecond"
-                )
                 assert (
                     await feed_prompt(
                         ui,
@@ -304,6 +307,11 @@ def test_prompt_shortcuts_clear_the_draft_ignore_ctrl_q_and_quit(
                 await wait_for_buffer_text(ui, "unfinished")
                 assert not prompt_task.done()
 
+                pipe_input.send_text("\n")
+                await asyncio.sleep(0.01)
+                assert ui._get_prompt_session().default_buffer.text == "unfinished"
+                assert not prompt_task.done()
+
                 pipe_input.send_text("\x04")
                 with pytest.raises(EOFError):
                     await asyncio.wait_for(prompt_task, 1)
@@ -314,15 +322,9 @@ def test_prompt_shortcuts_clear_the_draft_ignore_ctrl_q_and_quit(
 
 
 @pytest.mark.parametrize("input_mode", [InputMode.NAVIGATION, InputMode.REPLACE])
-@pytest.mark.parametrize(
-    "shift_enter",
-    ["\n", "\x1b[27;2;13~"],
-    ids=["lf", "xterm-modified-cr"],
-)
 def test_shift_enter_inserts_a_newline_in_every_vim_mode(
     tmp_path: Path,
     input_mode: InputMode,
-    shift_enter: str,
 ) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe_input:
@@ -341,7 +343,7 @@ def test_shift_enter_inserts_a_newline_in_every_vim_mode(
                 await wait_for_buffer_text(ui, "abc")
                 ui._get_prompt_session().app.vi_state.input_mode = input_mode
 
-                pipe_input.send_text(shift_enter)
+                pipe_input.send_text("\x1b[27;2;13~")
                 for _attempt in range(100):
                     value = ui._get_prompt_session().default_buffer.text
                     if "\n" in value:
@@ -527,7 +529,7 @@ def test_history_arrows_move_within_multiline_input_before_recall(
 
                 prompt_task = asyncio.create_task(ui.read())
                 await wait_for_prompt(ui, prompt_task)
-                pipe_input.send_text("top\nbottom")
+                pipe_input.send_text("top\x1b[27;2;13~bottom")
                 await wait_for_buffer_text(ui, "top\nbottom")
                 await wait_for_cursor_row(ui, 1)
 
@@ -575,7 +577,7 @@ def test_history_arrows_only_move_vertically_in_vim_navigation(
 
                 prompt_task = asyncio.create_task(ui.read())
                 await wait_for_prompt(ui, prompt_task)
-                pipe_input.send_text("top\nbottom\x1b")
+                pipe_input.send_text("top\x1b[27;2;13~bottom\x1b")
                 await wait_for_input_mode(ui, InputMode.NAVIGATION)
                 await wait_for_cursor_row(ui, 1)
 
@@ -1331,6 +1333,33 @@ def test_fallback_tty_ctrl_d_discards_draft_and_quits_immediately(
         os.write(master, b"discard this\x04")
         output = read_until(master, b"EOF")
         assert b"VALUE:" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+@pytest.mark.parametrize(
+    "line_delimiter_slot",
+    [name for name in ("VEOL", "VEOL2") if hasattr(termios, name)],
+)
+def test_fallback_tty_accepts_configured_canonical_line_delimiters(
+    tmp_path: Path,
+    line_delimiter_slot: str,
+) -> None:
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        line_delimiter_slot=line_delimiter_slot,
+    )
+
+    try:
+        read_until(master, b"READY")
+        os.write(master, b"custom delimiter;")
+        output = read_until(master, b"VALUE:'custom delimiter'")
+        assert b"VALUE:'custom delimiter;'" not in output
         assert process.wait(timeout=2) == 0
     finally:
         if process.poll() is None:

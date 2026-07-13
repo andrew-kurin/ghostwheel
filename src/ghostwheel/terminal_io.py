@@ -22,6 +22,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
 _TERMIOS_LOCAL_FLAGS = 3
+_TERMIOS_CONTROL_CHARACTERS = 6
 _TERMINAL_GUARDED_SIGNALS = (
     signal.SIGHUP,
     signal.SIGQUIT,
@@ -391,6 +392,7 @@ class RedirectedLineReader:
         try:
             if not self._terminal_guard.clear_local_flags(termios.NOFLSH):
                 raise RuntimeError("fallback terminal input could not guard tty state")
+            line_delimiters = self._terminal_line_delimiters(descriptor)
             while True:
                 try:
                     raw_value = await self._read_terminal_chunk(descriptor)
@@ -400,15 +402,51 @@ class RedirectedLineReader:
                 # In canonical mode a read which does not end in a line delimiter
                 # was released by VEOF.  Discard any pending draft so one Ctrl+D
                 # always means quit, even when the kernel line buffer was nonempty.
-                if not raw_value or not raw_value.endswith((b"\n", b"\r")):
+                delimiter = next(
+                    (
+                        candidate
+                        for candidate in line_delimiters
+                        if raw_value.endswith(candidate)
+                    ),
+                    None,
+                )
+                if delimiter is None:
                     raise EOFError
 
                 encoding = getattr(self._input_stream, "encoding", None) or "utf-8"
                 errors = getattr(self._input_stream, "errors", None) or "strict"
-                return raw_value.decode(encoding, errors).rstrip("\r\n")
+                return raw_value[: -len(delimiter)].decode(encoding, errors)
         finally:
             self._terminal_read_active = False
             self._terminal_guard.restore()
+
+    @staticmethod
+    def _terminal_line_delimiters(descriptor: int) -> tuple[bytes, ...]:
+        """Return enabled delimiters which release a canonical terminal read."""
+
+        delimiters = [b"\n"]
+        try:
+            attributes = termios.tcgetattr(descriptor)
+            disabled_character = os.fpathconf(descriptor, "PC_VDISABLE")
+        except OSError, ValueError, termios.error:
+            return tuple(delimiters)
+
+        control_characters = attributes[_TERMIOS_CONTROL_CHARACTERS]
+        for name in ("VEOL", "VEOL2"):
+            index = getattr(termios, name, None)
+            if index is None:
+                continue
+            value = control_characters[index]
+            if isinstance(value, int):
+                character = bytes((value,))
+            elif isinstance(value, bytes) and len(value) == 1:
+                character = value
+            else:
+                continue
+            if character[0] == disabled_character or character in delimiters:
+                continue
+            delimiters.append(character)
+        return tuple(delimiters)
 
     async def _read_terminal_chunk(self, descriptor: int) -> bytes:
         loop = asyncio.get_running_loop()

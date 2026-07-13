@@ -32,14 +32,8 @@ async def _wait_until(predicate: Callable[[], bool]) -> None:
         InputMode.INSERT_MULTIPLE,
     ],
 )
-@pytest.mark.parametrize(
-    "shift_enter",
-    ["\n", "\x1b[27;2;13~"],
-    ids=["mapped-lf", "xterm-modified-cr"],
-)
-def test_shift_enter_encodings_insert_newline_in_every_vim_mode(
+def test_shift_enter_inserts_newline_in_every_vim_mode(
     input_mode: InputMode,
-    shift_enter: str,
 ) -> None:
     async def scenario() -> None:
         with create_pipe_input() as pipe_input:
@@ -55,7 +49,7 @@ def test_shift_enter_encodings_insert_newline_in_every_vim_mode(
             session.default_buffer.insert_text("before")
             session.app.vi_state.input_mode = input_mode
 
-            pipe_input.send_text(shift_enter)
+            pipe_input.send_text("\x1b[27;2;13~")
             await _wait_until(lambda: "\n" in session.default_buffer.text)
 
             assert session.default_buffer.text == "before\n"
@@ -92,6 +86,41 @@ def test_bare_carriage_return_always_submits(input_mode: InputMode) -> None:
             session.default_buffer.insert_text("before")
             session.app.vi_state.input_mode = input_mode
 
+            pipe_input.send_text("\r")
+            assert await asyncio.wait_for(prompt_task, 1) == "before"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "input_mode",
+    [
+        InputMode.INSERT,
+        InputMode.NAVIGATION,
+        InputMode.REPLACE,
+        InputMode.INSERT_MULTIPLE,
+    ],
+)
+def test_control_j_is_inert_in_every_vim_mode(input_mode: InputMode) -> None:
+    async def scenario() -> None:
+        with create_pipe_input() as pipe_input:
+            session: PromptSession[str] = PromptSession(
+                multiline=True,
+                editing_mode=EditingMode.VI,
+                key_bindings=terminal_composer._key_bindings(),
+                input=pipe_input,
+                output=DummyOutput(),
+            )
+            prompt_task = asyncio.create_task(session.prompt_async())
+            await _wait_until(lambda: session.app.is_running)
+            session.default_buffer.insert_text("before")
+            session.app.vi_state.input_mode = input_mode
+
+            pipe_input.send_text("\n")
+            await asyncio.sleep(0.01)
+
+            assert session.default_buffer.text == "before"
+            assert not prompt_task.done()
             pipe_input.send_text("\r")
             assert await asyncio.wait_for(prompt_task, 1) == "before"
 
