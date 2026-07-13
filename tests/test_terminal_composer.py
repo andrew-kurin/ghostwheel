@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -284,4 +285,76 @@ def test_history_read_error_falls_back_to_memory_once(
     assert warning.code == "history_unavailable"
     assert warning.path == history_path
     assert warning.detail == "read denied"
+    assert composer.take_warning() is None
+
+
+def test_history_round_trips_surrogateescaped_terminal_bytes(tmp_path: Path) -> None:
+    history_path = tmp_path / "input-history"
+    value = "review src/bad-\udcff-name.py"
+
+    terminal_composer.InputHistory(history_path).append(value)
+
+    assert b"bad-\xff-name.py" in history_path.read_bytes()
+    assert terminal_composer.InputHistory(history_path).entries == [value]
+
+
+def test_prompt_session_persists_surrogateescaped_terminal_bytes(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        history_path = tmp_path / "input-history"
+        with create_pipe_input() as pipe_input:
+            composer = terminal_composer.TerminalComposer(
+                workspace=tmp_path,
+                history_path=history_path,
+                vim_mode=False,
+                prompt_input=pipe_input,
+                prompt_output=DummyOutput(),
+                bottom_toolbar=lambda: FormattedText(),
+                rprompt=lambda: FormattedText(),
+            )
+            session = composer.get_session(StringIO())
+            prompt_task = asyncio.create_task(session.prompt_async())
+            await _wait_until(lambda: session.app.is_running)
+
+            pipe_input.send_bytes(b"review src/bad-\xff-name.py\r")
+            value = await asyncio.wait_for(prompt_task, 1)
+
+            assert value == "review src/bad-\udcff-name.py"
+            assert composer.get_history().store.entries == [value]
+            assert composer.take_warning() is None
+
+        assert terminal_composer.InputHistory(history_path).entries == [value]
+
+    asyncio.run(scenario())
+
+
+def test_unencodable_history_value_falls_back_to_memory_once(
+    tmp_path: Path,
+) -> None:
+    history_path = tmp_path / "input-history"
+    composer = _composer(history_path)
+    history = composer.get_history()
+    history.store.append("existing prompt")
+    persisted_before_failure = history_path.read_bytes()
+
+    history.store.append("valid first line\nunsupported surrogate: \ud800")
+
+    assert history.store.path is None
+    assert history.store.entries == [
+        "existing prompt",
+        "valid first line\nunsupported surrogate: \ud800",
+    ]
+    assert history_path.read_bytes() == persisted_before_failure
+    assert terminal_composer.InputHistory(history_path).entries == ["existing prompt"]
+    warning = composer.take_warning()
+    assert warning is not None
+    assert warning.code == "history_unavailable"
+    assert warning.path == history_path
+    assert "surrogates not allowed" in (warning.detail or "")
+    assert composer.take_warning() is None
+
+    history.store.append("kept for this session")
+
+    assert history.store.entries[-1] == "kept for this session"
     assert composer.take_warning() is None

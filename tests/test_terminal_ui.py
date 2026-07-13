@@ -186,6 +186,7 @@ def start_fallback_tty_reader(
         import sys
         import termios
         from io import StringIO
+        from types import SimpleNamespace
 
         from rich.console import Console
 
@@ -202,7 +203,12 @@ def start_fallback_tty_reader(
         console_output = sys.stdout if {render_prompt!r} else StringIO()
         ui = TerminalUI(
             Console(file=console_output, color_system=None),
-            session=object(),
+            session=SimpleNamespace(
+                estimated_context_tokens=0,
+                context_window_tokens=0,
+                context_tokens_estimated=True,
+                compaction_enabled=True,
+            ),
             app_info=AppInfo(
                 {str(tmp_path)!r},
                 ModelInfo("provider", "model"),
@@ -687,6 +693,83 @@ def test_redirected_input_uses_the_same_ui_without_terminal_control(
     asyncio.run(scenario())
     assert ui.live_enabled is False
     assert output.getvalue() == ""
+
+
+def test_redirected_dev_null_exits_command_loop_cleanly(tmp_path: Path) -> None:
+    output = StringIO()
+    with open(os.devnull, encoding="utf-8") as input_stream:
+        was_blocking = os.get_blocking(input_stream.fileno())
+        ui = make_ui(
+            workspace=tmp_path,
+            output=output,
+            interactive=False,
+            input_stream=input_stream,
+            live=False,
+        )
+
+        asyncio.run(ui.run(FakeReviews()))
+        assert os.get_blocking(input_stream.fileno()) is was_blocking
+
+    assert "Goodbye!" in output.getvalue()
+
+
+def test_redirected_dev_zero_fails_promptly_without_spinning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zero_device = Path("/dev/zero")
+    if not zero_device.exists():
+        pytest.skip("requires /dev/zero")
+
+    with zero_device.open(encoding="utf-8") as input_stream:
+        descriptor = input_stream.fileno()
+        was_blocking = os.get_blocking(descriptor)
+        original_read = os.read
+        read_calls = 0
+
+        def read_once(read_descriptor: int, size: int) -> bytes:
+            nonlocal read_calls
+            if read_descriptor == descriptor:
+                read_calls += 1
+                if read_calls > 1:
+                    raise AssertionError("non-pollable input was read more than once")
+            return original_read(read_descriptor, size)
+
+        monkeypatch.setattr(terminal_io.os, "read", read_once)
+        ui = make_ui(
+            workspace=tmp_path,
+            interactive=False,
+            input_stream=input_stream,
+            live=False,
+        )
+
+        async def scenario() -> None:
+            loop = asyncio.get_running_loop()
+            original_add_reader = loop.add_reader
+
+            def reject_zero_reader(
+                read_descriptor: int,
+                callback: Callable[..., object],
+                *args: object,
+            ) -> None:
+                if read_descriptor == descriptor:
+                    raise PermissionError("descriptor is not pollable")
+                original_add_reader(read_descriptor, callback, *args)
+
+            monkeypatch.setattr(loop, "add_reader", reject_zero_reader)
+            with pytest.raises(
+                RuntimeError,
+                match="requires a pollable POSIX file descriptor",
+            ):
+                await asyncio.wait_for(ui.read(), 1)
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            ui.close()
+
+        assert read_calls == 1
+        assert os.get_blocking(descriptor) is was_blocking
 
 
 def test_fallback_prompt_requires_tty_input_and_output(tmp_path: Path) -> None:
@@ -1366,6 +1449,7 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
         import asyncio
         import sys
         from io import StringIO
+        from types import SimpleNamespace
 
         from rich.console import Console
 
@@ -1374,7 +1458,12 @@ def test_redirected_read_exits_promptly_on_sigint(tmp_path: Path) -> None:
 
         ui = TerminalUI(
             Console(file=StringIO()),
-            session=object(),
+            session=SimpleNamespace(
+                estimated_context_tokens=0,
+                context_window_tokens=0,
+                context_tokens_estimated=True,
+                compaction_enabled=True,
+            ),
             app_info=AppInfo(
                 {str(tmp_path)!r},
                 ModelInfo("provider", "model"),
@@ -1582,6 +1671,7 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
         f"""
         import signal
         import sys
+        from types import SimpleNamespace
 
         from rich.console import Console
 
@@ -1590,7 +1680,12 @@ def test_sigterm_restores_active_turn_terminal_echo(tmp_path: Path) -> None:
 
         ui = TerminalUI(
             Console(file=sys.stdout),
-            session=object(),
+            session=SimpleNamespace(
+                estimated_context_tokens=0,
+                context_window_tokens=0,
+                context_tokens_estimated=True,
+                compaction_enabled=True,
+            ),
             app_info=AppInfo(
                 {str(tmp_path)!r},
                 ModelInfo("provider", "model"),
@@ -1654,6 +1749,7 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
         import asyncio
         import os
         import sys
+        from types import SimpleNamespace
 
         from rich.console import Console
 
@@ -1662,7 +1758,12 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
 
         ui = TerminalUI(
             Console(file=sys.stdout),
-            session=object(),
+            session=SimpleNamespace(
+                estimated_context_tokens=0,
+                context_window_tokens=0,
+                context_tokens_estimated=True,
+                compaction_enabled=True,
+            ),
             app_info=AppInfo(
                 {str(tmp_path)!r},
                 ModelInfo("provider", "model"),
@@ -1720,8 +1821,10 @@ def test_sigterm_restores_prompt_terminal_modes(tmp_path: Path) -> None:
 
 
 def test_context_and_vim_mode_are_exposed_in_the_ruled_status(tmp_path: Path) -> None:
+    session = FakeSession()
     ui = make_ui(
         workspace=tmp_path,
+        session=session,
         interactive=True,
         prompt_input=None,
         prompt_output=DummyOutput(),
@@ -1736,9 +1839,10 @@ def test_context_and_vim_mode_are_exposed_in_the_ruled_status(tmp_path: Path) ->
     assert "~1.2k/16k · I" in toolbar
     assert ui._get_prompt_session().app.editing_mode is EditingMode.VI
 
-    ui.session.estimated_context_tokens = 948  # type: ignore[attr-defined]
-    ui.session.context_tokens_estimated = False  # type: ignore[attr-defined]
-    assert ui._status_text() == "948/16k · I"
+    session.estimated_context_tokens = 948
+    session.context_tokens_estimated = False
+    session.compaction_enabled = False
+    assert ui._status_text() == "948/16k · off · I"
 
 
 def test_events_require_an_active_turn_and_dynamic_text_stays_literal(
@@ -1873,6 +1977,39 @@ def test_all_dynamic_terminal_output_neutralizes_csi_and_osc(
     assert "beforeafter" in rendered
 
 
+def test_structured_terminal_labels_cannot_forge_additional_rows(
+    tmp_path: Path,
+) -> None:
+    output = StringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        width=160,
+        interactive=False,
+        live=False,
+    )
+    tool_name = "read\n  ✓ bash rm -rf\u2028forged"
+    arguments = repr({"path": "src/app.py\n  ✗ write forged"})
+
+    ui.turn_started("Reviewing\n  ✓ forged status")
+    asyncio.run(ui.handle_event(ToolStarted(tool_name, arguments, "1")))
+    asyncio.run(ui.handle_event(ToolFailed(tool_name, "bad\n  ✓ forged detail", "1")))
+    ui.turn_cancelled()
+
+    rendered = output.getvalue()
+    assert "Reviewing ✓ forged status" in rendered
+    activity_lines = [
+        line.lstrip()
+        for line in rendered.splitlines()
+        if line.lstrip().startswith(("▸", "✓", "✗"))
+    ]
+    assert len(activity_lines) == 2
+    assert activity_lines[0].startswith("▸ read ✓ bash rm -rf forged")
+    assert activity_lines[1].startswith("✗ read ✓ bash rm -rf forged")
+    assert "src/app.py ✗ write forged" in activity_lines[0]
+    assert "bad ✓ forged detail" in activity_lines[1]
+
+
 def test_non_live_success_without_text_events_prints_literal_fallback(
     tmp_path: Path,
 ) -> None:
@@ -1939,7 +2076,9 @@ def test_non_live_tools_start_on_the_line_after_streamed_text_without_gaps(
     assert lines[answer_line + 2].lstrip().startswith("✓ read")
 
 
-def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None:
+def test_line_oriented_help_and_compaction_reflect_available_controls(
+    tmp_path: Path,
+) -> None:
     output = StringIO()
     ui = make_ui(
         workspace=tmp_path,
@@ -1952,15 +2091,74 @@ def test_help_and_compaction_reflect_the_new_terminal_ui(tmp_path: Path) -> None
     ui.history_compacted(12_000, 4_200)
 
     rendered = output.getvalue()
-    assert "Shift+Enter" in rendered
-    assert "Ctrl+C" in rendered
-    assert "Ctrl+D" in rendered
-    assert "Esc" in rendered
+    assert "Line-oriented input" in rendered
+    assert "One prompt per line; end of input exits." in rendered
+    assert "Shift+Enter" not in rendered
+    assert "Ctrl+C" not in rendered
+    assert "Ctrl+D" not in rendered
+    assert "Esc" not in rendered
+    assert "Tab" not in rendered
     assert "Ctrl+J" not in rendered
     assert "Ctrl+Q" not in rendered
     assert "Ctrl+O" not in rendered
     assert "list available tools and active profiles" in rendered
     assert "Context compacted: 12k → ~4.2k." in rendered
+
+
+def test_interactive_help_lists_composer_shortcuts(tmp_path: Path) -> None:
+    output = StringIO()
+    with create_pipe_input() as pipe_input:
+        ui = make_ui(
+            workspace=tmp_path,
+            output=output,
+            interactive=True,
+            prompt_input=pipe_input,
+            prompt_output=DummyOutput(),
+            live=False,
+        )
+        try:
+            ui.help()
+        finally:
+            ui.close()
+
+    rendered = output.getvalue()
+    assert "Composer shortcuts" in rendered
+    assert "Shift+Enter" in rendered
+    assert "Ctrl+C" in rendered
+    assert "Ctrl+D" in rendered
+    assert "Esc" in rendered
+    assert "Tab" in rendered
+    assert "Line-oriented input" not in rendered
+
+
+def test_fallback_tty_help_lists_only_cooked_terminal_controls(tmp_path: Path) -> None:
+    class TTYStringIO(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    output = TTYStringIO()
+    ui = make_ui(
+        workspace=tmp_path,
+        output=output,
+        force_terminal=True,
+        interactive=False,
+        input_stream=TTYStringIO(),
+        live=False,
+    )
+
+    try:
+        ui.help()
+    finally:
+        ui.close()
+
+    rendered = output.getvalue()
+    assert "Line-oriented input" in rendered
+    assert "Enter" in rendered
+    assert "Ctrl+C" in rendered
+    assert "Ctrl+D" in rendered
+    assert "Esc" in rendered
+    assert "Shift+Enter" not in rendered
+    assert "Tab" not in rendered
 
 
 def test_tools_info_lists_mixed_chat_and_review_capabilities(tmp_path: Path) -> None:

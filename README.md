@@ -50,9 +50,10 @@ Run `uv run ghostwheel --help` for all command-line options.
 
 The interactive prompt-toolkit composer supports multiline editing, command and
 review-path completion, and prompt history. Enter submits and Shift+Enter
-inserts a newline when the terminal sends xterm's distinguishable modified-Enter
-sequence (`\x1b[27;2;13~`). Terminals that send ordinary Enter for this
-shortcut need to map Shift+Enter to that sequence. Ctrl+J has no action.
+inserts a newline when the terminal sends either xterm's legacy
+modifyOtherKeys sequence (`\x1b[27;2;13~`) or the CSI-u/Kitty sequence
+(`\x1b[13;2u`). Terminals that send ordinary Enter for this shortcut need to
+map Shift+Enter to one of those sequences. Ctrl+J has no action.
 
 When the interactive composer is active, prompt history is stored in
 `$XDG_STATE_HOME/ghostwheel/input-history` (or

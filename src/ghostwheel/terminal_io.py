@@ -538,13 +538,49 @@ class RedirectedLineReader:
         try:
             loop.add_reader(descriptor, read_ready)
         except (NotImplementedError, OSError) as error:
-            raise RuntimeError(
-                "redirected input requires a pollable POSIX file descriptor"
-            ) from error
+            return self._read_non_pollable_chunk(descriptor, error)
         try:
             return await readable
         finally:
             loop.remove_reader(descriptor)
+
+    @staticmethod
+    def _read_non_pollable_chunk(
+        descriptor: int,
+        registration_error: Exception,
+    ) -> bytes:
+        """Accept immediate EOF from an unsupported descriptor without blocking.
+
+        Selector loops reject some character devices, notably ``/dev/null``,
+        even though an immediate read can report EOF. Non-EOF devices cannot
+        be consumed asynchronously through this fallback and must fail instead
+        of repeatedly filling the line buffer. Pipes and sockets never use this
+        path when their normal event-loop registration succeeds.
+        """
+
+        try:
+            was_blocking = os.get_blocking(descriptor)
+            if was_blocking:
+                os.set_blocking(descriptor, False)
+            try:
+                try:
+                    chunk = os.read(descriptor, 65_536)
+                except BlockingIOError:
+                    raise RuntimeError(
+                        "redirected input requires a pollable POSIX file descriptor"
+                    ) from registration_error
+                if chunk:
+                    raise RuntimeError(
+                        "redirected input requires a pollable POSIX file descriptor"
+                    ) from registration_error
+                return chunk
+            finally:
+                if was_blocking:
+                    os.set_blocking(descriptor, True)
+        except OSError as error:
+            raise RuntimeError(
+                "redirected input requires a pollable POSIX file descriptor"
+            ) from error
 
     def _read_synchronously(self) -> str:
         value = self._input_stream.readline()

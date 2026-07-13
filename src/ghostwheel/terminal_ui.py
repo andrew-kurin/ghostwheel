@@ -34,7 +34,7 @@ from ghostwheel.cancellation import TurnCancellation
 from ghostwheel.controller import (
     CancellationPort,
     ReviewPort,
-    SessionPort,
+    TerminalSessionPort,
     run_command_loop,
 )
 from ghostwheel.events import (
@@ -53,7 +53,11 @@ from ghostwheel.presentation import (
     preview,
     primary_argument,
 )
-from ghostwheel.rendering import render_review, sanitize_terminal_text
+from ghostwheel.rendering import (
+    render_review,
+    sanitize_terminal_line,
+    sanitize_terminal_text,
+)
 from ghostwheel.review import RawReview, ReviewFailed, ReviewOutcome, StructuredReview
 from ghostwheel.runtime_contracts import (
     TurnFailed,
@@ -111,7 +115,7 @@ class TerminalUI:
         self,
         console: Console,
         *,
-        session: SessionPort,
+        session: TerminalSessionPort,
         app_info: AppInfo,
         history_path: Path | None = None,
         vim_mode: bool = True,
@@ -209,7 +213,7 @@ class TerminalUI:
         details.append("  ·  review ", style="dim")
         self._append_model(details, self.app_info.review_model)
         details.append("  ·  ")
-        details.append(sanitize_terminal_text(self.app_info.workspace))
+        details.append(sanitize_terminal_line(self.app_info.workspace))
         for label, tool_set in (
             ("chat", self.app_info.chat_tools),
             ("review", self.app_info.review_tools),
@@ -217,7 +221,7 @@ class TerminalUI:
             details.append(f"  ·  {label} ")
             tool_style = "bold yellow" if tool_set.has_shell_access else "green"
             details.append(
-                sanitize_terminal_text(tool_set.profile.upper()),
+                sanitize_terminal_line(tool_set.profile.upper()),
                 style=tool_style,
             )
             if tool_set.has_shell_access:
@@ -306,7 +310,7 @@ class TerminalUI:
                 self._live.start(refresh=True)
             else:
                 self.console.print(
-                    Text(f"\n{sanitize_terminal_text(label)}", style="dim")
+                    Text(f"\n{sanitize_terminal_line(label)}", style="dim")
                 )
         except BaseException:
             self._reset_turn()
@@ -328,13 +332,22 @@ class TerminalUI:
                 body.append("\n")
             body.append(f"{command:<22}", style="bold cyan")
             body.append(description)
-        body.append("\n\nShortcuts\n", style="bold")
-        body.append("Enter               submit\n", style="dim")
-        body.append("Shift+Enter         insert a newline\n", style="dim")
-        body.append("Ctrl+C              clear the current prompt\n", style="dim")
-        body.append("Ctrl+D              quit\n", style="dim")
-        body.append("Esc                 cancel the active turn\n", style="dim")
-        body.append("Tab                 complete commands and paths", style="dim")
+        if self._use_prompt_toolkit():
+            body.append("\n\nComposer shortcuts\n", style="bold")
+            body.append("Enter               submit\n", style="dim")
+            body.append("Shift+Enter         insert a newline\n", style="dim")
+            body.append("Ctrl+C              clear the current prompt\n", style="dim")
+            body.append("Ctrl+D              quit\n", style="dim")
+            body.append("Esc                 cancel the active turn\n", style="dim")
+            body.append("Tab                 complete commands and paths", style="dim")
+        else:
+            body.append("\n\nLine-oriented input\n", style="bold")
+            body.append("One prompt per line; end of input exits.", style="dim")
+            if self._fallback_prompt_is_visible():
+                body.append("\nEnter               submit", style="dim")
+                body.append("\nCtrl+C              clear the current line", style="dim")
+                body.append("\nCtrl+D              quit", style="dim")
+                body.append("\nEsc                 cancel the active turn", style="dim")
         self.console.print(Panel(body, title="Commands", border_style="cyan"))
 
     def model_info(self) -> None:
@@ -346,8 +359,8 @@ class TerminalUI:
 
     @staticmethod
     def _append_model(body: Text, model: ModelInfo) -> None:
-        provider = sanitize_terminal_text(model.provider)
-        model_name = sanitize_terminal_text(model.model)
+        provider = sanitize_terminal_line(model.provider)
+        model_name = sanitize_terminal_line(model.model)
         body.append(f"{provider}/{model_name}", style="cyan")
 
     def tools_info(self) -> None:
@@ -361,13 +374,13 @@ class TerminalUI:
     def _append_tool_set(body: Text, title: str, tool_set: ToolSetInfo) -> None:
         body.append(title, style="bold")
         body.append("\nTool profile  ", style="bold")
-        body.append(sanitize_terminal_text(tool_set.profile), style="yellow")
+        body.append(sanitize_terminal_line(tool_set.profile), style="yellow")
         body.append(f"\nAvailable tools ({len(tool_set.tools)})", style="bold")
         if tool_set.tools:
             safe_tools = tuple(
                 (
-                    sanitize_terminal_text(tool.name),
-                    sanitize_terminal_text(tool.description),
+                    sanitize_terminal_line(tool.name),
+                    sanitize_terminal_line(tool.description),
                 )
                 for tool in tool_set.tools
             )
@@ -388,11 +401,11 @@ class TerminalUI:
     def unknown_command(self, command: str, suggestion: str | None = None) -> None:
         message = Text.assemble(
             Text("Unknown command: ", style="yellow"),
-            Text(sanitize_terminal_text(command)),
+            Text(sanitize_terminal_line(command)),
         )
         if suggestion:
             message.append(
-                f"\nDid you mean {sanitize_terminal_text(suggestion)}?",
+                f"\nDid you mean {sanitize_terminal_line(suggestion)}?",
                 style="dim",
             )
         message.append("\nType /help to list commands.", style="dim")
@@ -490,16 +503,12 @@ class TerminalUI:
     def context_status(self) -> str:
         """Current model-context status used by the right-side prompt."""
 
-        estimated_tokens = getattr(self.session, "estimated_context_tokens", 0)
-        context_window = getattr(self.session, "context_window_tokens", 0)
+        estimated_tokens = self.session.estimated_context_tokens
+        context_window = self.session.context_window_tokens
         if not context_window:
             return ""
-        estimate_marker = (
-            "~" if getattr(self.session, "context_tokens_estimated", True) else ""
-        )
-        compaction_marker = (
-            "" if getattr(self.session, "compaction_enabled", True) else " · off"
-        )
+        estimate_marker = "~" if self.session.context_tokens_estimated else ""
+        compaction_marker = "" if self.session.compaction_enabled else " · off"
         return (
             f"{estimate_marker}{format_token_count(estimated_tokens)}/"
             f"{format_token_count(context_window)}{compaction_marker}"
@@ -539,7 +548,7 @@ class TerminalUI:
         body = Text(sanitize_terminal_text(warning.message), style="yellow")
         if warning.path is not None:
             body.append(
-                f"\nPath: {sanitize_terminal_text(str(warning.path))}",
+                f"\nPath: {sanitize_terminal_line(str(warning.path))}",
                 style="dim",
             )
         if warning.detail:
@@ -560,7 +569,7 @@ class TerminalUI:
         self.console.print(
             Panel(
                 body,
-                title=sanitize_terminal_text(presentation.title),
+                title=sanitize_terminal_line(presentation.title),
                 border_style="red",
             )
         )
@@ -570,7 +579,7 @@ class TerminalUI:
             Spinner(
                 "dots",
                 Text(
-                    sanitize_terminal_text(self._turn.status),
+                    sanitize_terminal_line(self._turn.status),
                     style="bold cyan",
                     no_wrap=True,
                     overflow="ellipsis",
@@ -656,8 +665,8 @@ class TerminalUI:
             no_wrap=True,
             overflow="ellipsis",
         )
-        line.append(sanitize_terminal_text(activity.name), style=f"bold {style}")
-        argument = sanitize_terminal_text(primary_argument(activity.arguments))
+        line.append(sanitize_terminal_line(activity.name), style=f"bold {style}")
+        argument = sanitize_terminal_line(primary_argument(activity.arguments))
         if argument:
             line.append("  ")
             line.append(preview(argument, 72))

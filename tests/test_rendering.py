@@ -2,7 +2,11 @@ from io import StringIO
 
 from rich.console import Console
 
-from ghostwheel.rendering import render_review, sanitize_terminal_text
+from ghostwheel.rendering import (
+    render_review,
+    sanitize_terminal_line,
+    sanitize_terminal_text,
+)
 from ghostwheel.schemas import Finding, ReviewResult, Severity
 
 
@@ -23,6 +27,12 @@ def test_sanitize_terminal_text_blocks_surrogateescaped_c1_bytes() -> None:
     assert safe_value == "alphabetagammadelta"
     assert b"\x1b" not in encoded
     assert not any(0x80 <= byte <= 0x9F for byte in encoded)
+
+
+def test_sanitize_terminal_line_collapses_all_layout_whitespace() -> None:
+    value = "  read\n\t✓ forged\u2028row\u2029end\x1b[2J  "
+
+    assert sanitize_terminal_line(value) == "read ✓ forged row end"
 
 
 def test_render_review_preserves_line_ranges_and_literal_content() -> None:

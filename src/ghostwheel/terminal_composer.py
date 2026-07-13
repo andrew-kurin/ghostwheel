@@ -92,7 +92,11 @@ class InputHistory:
         self,
         path: Path | None,
         *,
-        on_error: Callable[[Path, OSError | RuntimeError], None] | None = None,
+        on_error: Callable[
+            [Path, OSError | RuntimeError | UnicodeError],
+            None,
+        ]
+        | None = None,
     ) -> None:
         self.path = path
         self._on_error = on_error
@@ -102,7 +106,7 @@ class InputHistory:
             self.entries = self._load()
             if self.path is not None:
                 self._ensure_file()
-        except (OSError, RuntimeError) as error:
+        except (OSError, RuntimeError, UnicodeError) as error:
             self._disable_persistence(error)
 
     def append(self, value: str) -> None:
@@ -112,12 +116,14 @@ class InputHistory:
         if self.path is None:
             return
         try:
+            record = (
+                f"\n# {dt.datetime.now().isoformat()}\n"
+                + "".join(f"+{line}\n" for line in value.split("\n"))
+            ).encode("utf-8", errors="surrogateescape")
             self._ensure_file()
-            with self.path.open("a", encoding="utf-8") as history_file:
-                history_file.write(f"\n# {dt.datetime.now().isoformat()}\n")
-                for line in value.split("\n"):
-                    history_file.write(f"+{line}\n")
-        except OSError as error:
+            with self.path.open("ab") as history_file:
+                history_file.write(record)
+        except (OSError, UnicodeError) as error:
             self._disable_persistence(error)
 
     def _load(self) -> list[str]:
@@ -127,7 +133,7 @@ class InputHistory:
         lines: list[str] = []
         for line in self.path.read_text(
             encoding="utf-8",
-            errors="replace",
+            errors="surrogateescape",
         ).splitlines():
             if line.startswith("+"):
                 lines.append(line[1:])
@@ -149,7 +155,10 @@ class InputHistory:
         os.close(descriptor)
         self.path.chmod(0o600)
 
-    def _disable_persistence(self, error: OSError | RuntimeError) -> None:
+    def _disable_persistence(
+        self,
+        error: OSError | RuntimeError | UnicodeError,
+    ) -> None:
         path = self.path
         if path is None:
             return
@@ -364,7 +373,7 @@ class TerminalComposer:
     def _record_history_error(
         self,
         path: Path,
-        error: OSError | RuntimeError,
+        error: OSError | RuntimeError | UnicodeError,
     ) -> None:
         if self._warning is not None:
             return

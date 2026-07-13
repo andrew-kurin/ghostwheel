@@ -54,6 +54,18 @@ def sanitize_terminal_text(value: str) -> str:
     return "".join(output)
 
 
+def sanitize_terminal_line(value: str) -> str:
+    """Return terminal-safe text collapsed to one display line.
+
+    Labels, paths, and activity fields must not be able to introduce extra
+    rows into a structured terminal presentation.  Normalize every kind of
+    Unicode whitespace after removing terminal controls so separators such as
+    line and paragraph breaks cannot bypass that boundary.
+    """
+
+    return " ".join(sanitize_terminal_text(value).split())
+
+
 def _terminal_codepoint(character: str) -> int:
     """Return the byte represented by surrogateescape, or the Unicode value."""
 
@@ -118,7 +130,7 @@ def _consume_control_string(value: str, index: int, *, osc: bool) -> int:
 
 
 def _finding_location(file: str, line: int | None, line_end: int | None) -> str:
-    location = sanitize_terminal_text(file)
+    location = sanitize_terminal_line(file)
     if line is not None:
         location += f":{line}"
         if line_end is not None and line_end != line:
@@ -143,7 +155,7 @@ def _stacked_findings(review: ReviewResult) -> list[RenderableType]:
             ),
             "\n",
             Text("Category  ", style="bold"),
-            Text(sanitize_terminal_text(finding.category), style="magenta"),
+            Text(sanitize_terminal_line(finding.category), style="magenta"),
             "\n\n",
             Text(sanitize_terminal_text(finding.message)),
         )
@@ -208,7 +220,7 @@ def review_renderables(
         table.add_row(
             Text(icon, style=style),
             Text(location, style="cyan"),
-            Text(sanitize_terminal_text(f.category), style="magenta"),
+            Text(sanitize_terminal_line(f.category), style="magenta"),
             issue,
         )
 
