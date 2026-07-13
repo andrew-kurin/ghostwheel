@@ -34,14 +34,20 @@ def test_release_artifacts_exclude_nested_ignored_local_state(
         PROJECT_ROOT / "src" / "ghostwheel" / (f"local-state-build-test-{uuid4().hex}")
     )
     local_state = local_root / ".cache"
-    sentinel = local_state / "ghostwheel-sdist-sentinel"
+    ignored_python = local_state / "ignored-state.py"
+    external_target = tmp_path / "external-secret.py"
+    external_symlink = local_state / "external-secret.py"
+    ignored_marker = uuid4().hex.encode()
+    external_marker = uuid4().hex.encode()
     sdist_directory = tmp_path / "sdist"
     wheel_directory = tmp_path / "wheel"
 
     try:
         local_state.mkdir(parents=True)
         (local_state / ".gitignore").write_text("*\n", encoding="utf-8")
-        sentinel.write_text("must not be packaged\n", encoding="utf-8")
+        ignored_python.write_bytes(ignored_marker)
+        external_target.write_bytes(external_marker)
+        external_symlink.symlink_to(external_target)
         for artifact, output_directory in (
             ("--sdist", sdist_directory),
             ("--wheel", wheel_directory),
@@ -61,37 +67,78 @@ def test_release_artifacts_exclude_nested_ignored_local_state(
     assert len(source_archives) == 1
     assert len(wheels) == 1
     with tarfile.open(source_archives[0], "r:gz") as archive:
-        source_paths = [member.name for member in archive.getmembers()]
+        source_members = archive.getmembers()
+        source_paths = [member.name for member in source_members]
+        source_contents = b"".join(
+            extracted.read()
+            for member in source_members
+            if member.isfile()
+            and (extracted := archive.extractfile(member)) is not None
+        )
     with zipfile.ZipFile(wheels[0]) as archive:
         wheel_paths = archive.namelist()
+        wheel_contents = b"".join(
+            archive.read(path) for path in wheel_paths if not path.endswith("/")
+        )
 
     assert not any(local_root.name in path for path in source_paths)
     assert not any(local_root.name in path for path in wheel_paths)
+    assert ignored_marker not in source_contents
+    assert ignored_marker not in wheel_contents
+    assert external_marker not in source_contents
+    assert external_marker not in wheel_contents
+    assert all(
+        path.startswith("ghostwheel/") or ".dist-info/" in path for path in wheel_paths
+    )
 
 
-def test_release_artifacts_have_explicit_content_boundaries() -> None:
+def test_release_manifest_uses_only_exact_regular_files() -> None:
     configuration = tomllib.loads(
         (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     )
 
-    targets = configuration["tool"]["hatch"]["build"]["targets"]
-    assert targets["sdist"]["include"] == [
-        "/.env.example",
-        "/.github/workflows/*.yml",
-        "/.gitignore",
-        "/.python-version",
-        "/AGENTS.md",
-        "/ARCHITECTURE.md",
-        "/README.md",
-        "/pyproject.toml",
-        "/src/ghostwheel/**/*.py",
-        "/tests/**/*.py",
-        "/uv.lock",
-    ]
-    assert targets["wheel"] == {
-        "include": ["/src/ghostwheel/**/*.py"],
-        "sources": ["src"],
+    build = configuration["tool"]["hatch"]["build"]
+    manifest = build["include"]
+    assert manifest
+    for entry in manifest:
+        assert entry.startswith("/")
+        assert not set("*?[") & set(entry)
+        source = PROJECT_ROOT / entry.removeprefix("/")
+        assert source.is_file()
+        assert not source.is_symlink()
+
+    wheel = build["targets"]["wheel"]
+    assert wheel["sources"] == ["src"]
+    assert wheel["only-packages"] is True
+    assert wheel["exclude"] == ["/tests/"]
+
+
+def test_release_manifest_matches_tracked_files() -> None:
+    if not (PROJECT_ROOT / ".git").exists():
+        pytest.skip("release-manifest regression requires a Git worktree")
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("release-manifest regression requires git")
+
+    tracked = subprocess.run(
+        [git, "-C", str(PROJECT_ROOT), "ls-files"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.returncode != 0:
+        pytest.skip("release-manifest regression requires a Git worktree")
+
+    configuration = tomllib.loads(
+        (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    manifest = {
+        entry.removeprefix("/")
+        for entry in configuration["tool"]["hatch"]["build"]["include"]
     }
+    tracked_files = set(tracked.stdout.splitlines())
+
+    assert manifest == tracked_files
 
 
 def test_project_uses_one_terminal_ui_stack() -> None:

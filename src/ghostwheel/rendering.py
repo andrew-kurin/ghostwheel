@@ -48,6 +48,13 @@ def sanitize_terminal_text(value: str) -> str:
             index += 1
         elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
             index += 1
+        elif 0xD800 <= ord(value[index]) <= 0xDFFF:
+            # Surrogateescaped C1 bytes have already been interpreted through
+            # ``codepoint`` above. Any surrogate which survives that boundary
+            # cannot be encoded by a normal UTF-8 terminal, so render it as an
+            # explicit replacement character instead of letting Rich crash.
+            output.append("\ufffd")
+            index += 1
         else:
             output.append(value[index])
             index += 1

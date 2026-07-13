@@ -79,10 +79,10 @@ In the chat prompt:
 - Use `/model` for both active models, `/tools` for tool profiles, or `/help`.
 - Use `/quit` to exit.
 
-During an active turn, Esc cancels and returns to the composer. Ctrl+C clears
-the current prompt, and Ctrl+D exits unconditionally. Other text entered while a
-turn is running is discarded so it cannot corrupt the live preview or leak into
-the next prompt.
+In the composer, Ctrl+C clears the current prompt and Ctrl+D exits
+unconditionally. During an active turn, Esc cancels and returns to the composer,
+while Ctrl+D cancels and exits. All other input, including Ctrl+C, is discarded
+so it cannot corrupt the live preview or leak into the next prompt.
 Active turns use a bounded live preview; completed assistant replies are
 committed to scrollback as Markdown. Tool calls remain visible as compact status
 rows with completion time, and review findings switch to stacked cards on narrow

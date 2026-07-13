@@ -29,6 +29,15 @@ def test_sanitize_terminal_text_blocks_surrogateescaped_c1_bytes() -> None:
     assert not any(0x80 <= byte <= 0x9F for byte in encoded)
 
 
+def test_sanitize_terminal_text_replaces_surrogates_that_reach_output() -> None:
+    value = "alpha\ud800high\udc00low\udcffomega"
+
+    safe_value = sanitize_terminal_text(value)
+
+    assert safe_value == "alpha�high�low�omega"
+    assert safe_value.encode("utf-8").decode("utf-8") == safe_value
+
+
 def test_sanitize_terminal_line_collapses_all_layout_whitespace() -> None:
     value = "  read\n\t✓ forged\u2028row\u2029end\x1b[2J  "
 

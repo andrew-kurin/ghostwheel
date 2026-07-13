@@ -164,6 +164,8 @@ def start_fallback_tty_reader(
     tmp_path: Path,
     *,
     controlling: bool = True,
+    eof_character: bytes | None = None,
+    interrupt_character: bytes | None = None,
     no_flush: bool = False,
     render_prompt: bool = False,
     verify_sigint_handler: bool = False,
@@ -173,9 +175,17 @@ def start_fallback_tty_reader(
     """Start a fallback reader with a real controlling pseudo-terminal."""
 
     master, slave = os.openpty()
-    if line_delimiter_slot is not None:
+    if any(
+        value is not None
+        for value in (eof_character, interrupt_character, line_delimiter_slot)
+    ):
         attributes = termios.tcgetattr(slave)
-        attributes[6][getattr(termios, line_delimiter_slot)] = line_delimiter
+        if eof_character is not None:
+            attributes[6][termios.VEOF] = eof_character
+        if interrupt_character is not None:
+            attributes[6][termios.VINTR] = interrupt_character
+        if line_delimiter_slot is not None:
+            attributes[6][getattr(termios, line_delimiter_slot)] = line_delimiter
         termios.tcsetattr(slave, termios.TCSANOW, attributes)
     child = textwrap.dedent(
         f"""
@@ -1539,6 +1549,31 @@ def test_fallback_tty_ctrl_d_discards_draft_and_quits_immediately(
         os.close(slave)
 
 
+def test_fallback_tty_normalizes_remapped_ctrl_d(
+    tmp_path: Path,
+) -> None:
+    inherited_eof = b"\x05"
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        eof_character=inherited_eof,
+    )
+
+    try:
+        read_until(master, b"READY")
+        assert termios.tcgetattr(slave)[6][termios.VEOF] == b"\x04"
+
+        os.write(master, b"discard this\x04")
+        output = read_until(master, b"EOF")
+        assert b"VALUE:" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
 @pytest.mark.parametrize(
     "line_delimiter_slot",
     [name for name in ("VEOL", "VEOL2") if hasattr(termios, name)],
@@ -1630,6 +1665,67 @@ def test_fallback_tty_ctrl_c_clears_draft_without_exiting(tmp_path: Path) -> Non
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_fallback_tty_normalizes_remapped_ctrl_c(
+    tmp_path: Path,
+) -> None:
+    inherited_interrupt = b"\x02"
+    process, master, slave = start_fallback_tty_reader(
+        tmp_path,
+        interrupt_character=inherited_interrupt,
+        no_flush=True,
+    )
+
+    try:
+        read_until(master, b"READY")
+        assert termios.tcgetattr(slave)[6][termios.VINTR] == b"\x03"
+
+        os.write(master, b"discard this\x03keep this\n")
+        output = read_until(master, b"VALUE:'keep this'")
+        assert b"VALUE:'discard this" not in output
+        assert process.wait(timeout=2) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        os.close(master)
+        os.close(slave)
+
+
+def test_cooked_input_guard_restores_inherited_control_characters() -> None:
+    master, slave = os.openpty()
+    try:
+        inherited_eof = b"\x05"
+        inherited_interrupt = b"\x02"
+        attributes = termios.tcgetattr(slave)
+        attributes[3] |= termios.NOFLSH
+        attributes[6][termios.VEOF] = inherited_eof
+        attributes[6][termios.VINTR] = inherited_interrupt
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+
+        with os.fdopen(os.dup(slave), encoding="utf-8") as input_stream:
+            guard = terminal_io.RawTerminalGuard(
+                input_stream,
+                externally_managed_input=False,
+                is_active=lambda: True,
+            )
+            try:
+                assert guard.configure_cooked_input()
+                active_attributes = termios.tcgetattr(slave)
+                assert not active_attributes[3] & termios.NOFLSH
+                assert active_attributes[6][termios.VEOF] == b"\x04"
+                assert active_attributes[6][termios.VINTR] == b"\x03"
+            finally:
+                guard.restore()
+
+        restored_attributes = termios.tcgetattr(slave)
+        assert restored_attributes[3] & termios.NOFLSH
+        assert restored_attributes[6][termios.VEOF] == inherited_eof
+        assert restored_attributes[6][termios.VINTR] == inherited_interrupt
+    finally:
         os.close(master)
         os.close(slave)
 
@@ -1908,7 +2004,8 @@ def test_all_dynamic_terminal_output_neutralizes_csi_and_osc(
     osc = "\x1b]52;c;Y2xpcGJvYXJk\x1b\\"
     surrogate_csi = "\udc9b2J"
     surrogate_osc = "\udc9d52;c;c3Vycm9nYXRl\udc9c"
-    unsafe = f"before{csi}{osc}{surrogate_csi}{surrogate_osc}after"
+    unpaired_surrogates = "\ud800high\udc00low\udcff"
+    unsafe = f"before{csi}{osc}{surrogate_csi}{surrogate_osc}{unpaired_surrogates}after"
     app_info = AppInfo(
         unsafe,
         ModelInfo(unsafe, unsafe),
@@ -1967,14 +2064,14 @@ def test_all_dynamic_terminal_output_neutralizes_csi_and_osc(
     )
 
     rendered = output.getvalue()
-    encoded = rendered.encode("utf-8", errors="surrogateescape")
+    encoded = rendered.encode("utf-8")
     assert "\x1b" not in rendered
     assert "\x9b" not in rendered
     assert "Y2xpcGJvYXJk" not in rendered
     assert "c3Vycm9nYXRl" not in rendered
     assert encoded.decode("utf-8") == rendered
     assert b"\x1b" not in encoded
-    assert "beforeafter" in rendered
+    assert "before�high�low�after" in rendered
 
 
 def test_structured_terminal_labels_cannot_forge_additional_rows(

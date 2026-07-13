@@ -99,8 +99,8 @@ class RawTerminalGuard:
         self._descriptor = descriptor
         self._attributes = attributes
 
-    def clear_local_flags(self, flags: int) -> bool:
-        """Temporarily clear tty local flags with signal-safe restoration."""
+    def configure_cooked_input(self) -> bool:
+        """Temporarily install Ghostwheel's cooked-input control bindings."""
 
         if self._externally_managed_input or self._attributes is not None:
             return False
@@ -109,7 +109,14 @@ class RawTerminalGuard:
             return False
         descriptor, attributes = terminal
         updated_attributes = attributes.copy()
-        updated_attributes[_TERMIOS_LOCAL_FLAGS] &= ~flags
+        updated_attributes[_TERMIOS_LOCAL_FLAGS] &= ~termios.NOFLSH
+        control_characters = attributes[_TERMIOS_CONTROL_CHARACTERS]
+        if not isinstance(control_characters, list):
+            return False
+        updated_control_characters = control_characters.copy()
+        updated_control_characters[termios.VINTR] = b"\x03"
+        updated_control_characters[termios.VEOF] = b"\x04"
+        updated_attributes[_TERMIOS_CONTROL_CHARACTERS] = updated_control_characters
         if updated_attributes == attributes:
             return True
         if not self._install_signal_handlers():
@@ -416,7 +423,7 @@ class RedirectedLineReader:
     ) -> str:
         self._terminal_read_active = True
         try:
-            if not self._terminal_guard.clear_local_flags(termios.NOFLSH):
+            if not self._terminal_guard.configure_cooked_input():
                 raise RuntimeError("fallback terminal input could not guard tty state")
             line_delimiters = self._terminal_line_delimiters(descriptor)
             while True:

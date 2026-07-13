@@ -266,14 +266,19 @@ def test_history_read_error_falls_back_to_memory_once(
 ) -> None:
     history_path = tmp_path / "input-history"
     history_path.touch()
-    original_read_text = Path.read_text
+    original_open = Path.open
 
-    def deny_history_read(path: Path, *args: object, **kwargs: object) -> str:
-        if path == history_path:
+    def deny_history_read(
+        path: Path,
+        mode: str = "r",
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if path == history_path and mode == "rb":
             raise PermissionError("read denied")
-        return original_read_text(path, *args, **kwargs)
+        return original_open(path, mode, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", deny_history_read)
+    monkeypatch.setattr(Path, "open", deny_history_read)
     composer = _composer(history_path)
 
     history = composer.get_history()
@@ -295,6 +300,37 @@ def test_history_round_trips_surrogateescaped_terminal_bytes(tmp_path: Path) -> 
     terminal_composer.InputHistory(history_path).append(value)
 
     assert b"bad-\xff-name.py" in history_path.read_bytes()
+    assert terminal_composer.InputHistory(history_path).entries == [value]
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        "\r",
+        "\v",
+        "\f",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    ],
+    ids=[
+        "carriage-return",
+        "vertical-tab",
+        "form-feed",
+        "next-line",
+        "line-separator",
+        "paragraph-separator",
+    ],
+)
+def test_history_restart_preserves_non_lf_line_separators(
+    tmp_path: Path,
+    separator: str,
+) -> None:
+    history_path = tmp_path / "input-history"
+    value = f"before{separator}after\nsecond line"
+
+    terminal_composer.InputHistory(history_path).append(value)
+
     assert terminal_composer.InputHistory(history_path).entries == [value]
 
 

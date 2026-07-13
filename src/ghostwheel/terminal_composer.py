@@ -131,15 +131,19 @@ class InputHistory:
             return []
         entries: list[str] = []
         lines: list[str] = []
-        for line in self.path.read_text(
-            encoding="utf-8",
-            errors="surrogateescape",
-        ).splitlines():
-            if line.startswith("+"):
-                lines.append(line[1:])
-            elif lines:
-                entries.append("\n".join(lines))
-                lines = []
+        with self.path.open("rb") as history_file:
+            for raw_line in history_file:
+                # History records use LF as their only structural separator.
+                # Decoding the whole file and calling str.splitlines() would
+                # also split valid prompt content such as CR, NEL, and U+2028.
+                if raw_line.endswith(b"\n"):
+                    raw_line = raw_line[:-1]
+                line = raw_line.decode("utf-8", errors="surrogateescape")
+                if line.startswith("+"):
+                    lines.append(line[1:])
+                elif lines:
+                    entries.append("\n".join(lines))
+                    lines = []
         if lines:
             entries.append("\n".join(lines))
         return entries
